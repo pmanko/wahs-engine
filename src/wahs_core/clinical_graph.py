@@ -1374,7 +1374,7 @@ class ClinicalEntityGraph:
 
 _EXTRACTED_CHART_CACHE: Dict[str, ExtractedChart] = {}
 _BUNDLE_CATALOG_LOADERS: List[Callable[[Callable[[Dict[str, Any], str], None]], None]] = []
-_EXECUTED_LOADER_COUNT = 0
+_CACHE_INITIALIZED = False
 
 
 def register_patient_bundle(raw_bundle: Dict[str, Any], key_hint: str = "") -> None:
@@ -1399,16 +1399,19 @@ def register_bundle_catalog_loader(
     loader: Callable[[Callable[[Dict[str, Any], str], None]], None],
 ) -> None:
     """Register a lazy callback invoked if prompt-only enrichment needs offline bundles."""
+    global _CACHE_INITIALIZED
     if loader not in _BUNDLE_CATALOG_LOADERS:
         _BUNDLE_CATALOG_LOADERS.append(loader)
+        _CACHE_INITIALIZED = False
 
 
 def _ensure_patient_chart_cache() -> None:
     """Invoke any registered lazy catalog loaders (zero hardcoded demo bundles in wahs_core)."""
-    global _EXECUTED_LOADER_COUNT
-    while _EXECUTED_LOADER_COUNT < len(_BUNDLE_CATALOG_LOADERS):
-        loader = _BUNDLE_CATALOG_LOADERS[_EXECUTED_LOADER_COUNT]
-        _EXECUTED_LOADER_COUNT += 1
+    global _CACHE_INITIALIZED
+    if _CACHE_INITIALIZED:
+        return
+    _CACHE_INITIALIZED = True
+    for loader in list(_BUNDLE_CATALOG_LOADERS):
         try:
             loader(register_patient_bundle)
         except Exception:
