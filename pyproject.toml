@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wahs-engine"
+version = "0.1.0"
+description = "Standalone OpenAI-compatible clinical FHIR R4 condensation, provenance & fhir-auth middleware for Washington Health Summary (WAHS)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [
+  { name = "UW DIGI & CIRG / OpenClinAI" }
+]
+dependencies = [
+  "fastapi>=0.115.0,<1.0.0",
+  "uvicorn>=0.30.0,<1.0.0",
+  "httpx>=0.27.0,<1.0.0",
+  "pydantic>=2.0.0,<3.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+  "pytest-asyncio>=0.23.0",
+]
+
+[project.scripts]
+wahs-engine = "wahs_engine.app:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["wahs_core*", "wahs_engine*"]
+
+[tool.setuptools.package-data]
+wahs_core = ["kb_data/*.json", "kb_data/*.jsonl"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

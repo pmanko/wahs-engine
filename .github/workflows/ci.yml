@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: wahs-engine-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-and-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify pure-stdlib wahs_core import (zero 3rd-party deps)
+        run: PYTHONPATH=src python -S -c "import site; import wahs_core; assert wahs_core.__version__"
+      - name: Install package + test dependencies
+        run: pip install -e ".[dev]"
+      - name: Run unit, security/timeliness, and OpenAI contract suites
+        run: pytest -q
+
+  docker-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build slim image
+        run: docker build --build-arg WAHS_BUILD_REVISION="${GITHUB_SHA}" -t wahs-engine-ci .
+      - name: Verify non-root container starts and serves /healthz
+        run: |
+          docker run -d --name wahs-smoke -p 8080:8080 wahs-engine-ci
+          for i in $(seq 1 25); do
+            if curl -fsS http://127.0.0.1:8080/healthz >/dev/null 2>&1; then
+              echo "wahs-engine healthy after ${i}s"
+              docker rm -f wahs-smoke >/dev/null
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs wahs-smoke >&2
+          docker rm -f wahs-smoke >/dev/null
+          exit 1
