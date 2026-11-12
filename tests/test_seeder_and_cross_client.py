@@ -82,6 +82,16 @@ def _build_in_memory_hapi_and_jwt_proxy() -> FastAPI:
         store[f"Patient/{pid}"] = saved
         return saved
 
+    @hapi.get("/fhir/Patient/{pid}")
+    async def get_patient(pid: str, request: Request) -> Dict[str, Any]:
+        from fastapi import HTTPException
+
+        sub = _caller_sub(request)
+        pat = store.get(f"Patient/{pid}")
+        if not pat or not _visible_to_sub(pat, sub):
+            raise HTTPException(status_code=404, detail="Not found")
+        return copy.deepcopy(pat)
+
     @hapi.put("/fhir/Patient/{pid}")
     async def update_patient(pid: str, request: Request) -> Dict[str, Any]:
         body = await request.json()

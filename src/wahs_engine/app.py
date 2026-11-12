@@ -13,7 +13,7 @@ import uvicorn
 from .assembler import WAHSBundleAssembler
 from .config import WahsEngineSettings
 from .jwt_claims import VerifiedCallerIdentity, decode_and_bind_jwt, extract_bearer_token
-from .schemas import OpenAIChatCompletionRequest, WahsRequestOptions
+from .schemas import OpenAIChatCompletionRequest, WahsContextPreviewRequest, WahsRequestOptions
 from .upstream import SouthboundOpenAIClient, build_x_wahs_envelope
 
 
@@ -87,7 +87,7 @@ def create_app(
 
     @application.post("/v1/wahs/context/preview")
     async def preview_context(
-        req: OpenAIChatCompletionRequest,
+        req: WahsContextPreviewRequest,
         request: Request,
     ) -> Dict[str, Any]:
         options = req.resolved_wahs_options()

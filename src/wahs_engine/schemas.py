@@ -71,3 +71,22 @@ class OpenAIChatCompletionRequest(BaseModel):
         if isinstance(extra_body, dict) and isinstance(extra_body.get("wahs"), dict):
             return WahsRequestOptions.model_validate(extra_body["wahs"])
         return WahsRequestOptions()
+
+
+class WahsContextPreviewRequest(BaseModel):
+    """Request body for `/v1/wahs/context/preview` (allows empty/omitted `messages`)."""
+
+    model_config = ConfigDict(extra="allow")
+
+    model: Optional[str] = None
+    messages: List[ChatMessage] = Field(default_factory=list)
+    wahs: Optional[WahsRequestOptions] = None
+
+    def resolved_wahs_options(self) -> WahsRequestOptions:
+        if self.wahs is not None:
+            return self.wahs
+        extra = self.model_extra or {}
+        extra_body = extra.get("extra_body")
+        if isinstance(extra_body, dict) and isinstance(extra_body.get("wahs"), dict):
+            return WahsRequestOptions.model_validate(extra_body["wahs"])
+        return WahsRequestOptions()
