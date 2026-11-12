@@ -39,6 +39,12 @@ class WahsRequestOptions(BaseModel):
     fhir_bundle: Optional[Dict[str, Any]] = None
     enable_kb: bool = True
     enable_overflow_tools: bool = True
+    retrieval_strategy: Literal[
+        "condensation_kb",
+        "note_rag",
+        "dynamic_fhir_tools",
+        "chart_only",
+    ] = "condensation_kb"
 
 
 class ChatMessage(BaseModel):
@@ -59,6 +65,7 @@ class OpenAIChatCompletionRequest(BaseModel):
     temperature: float = Field(default=0.1, ge=0.0, le=2.0)
     max_tokens: Optional[int] = Field(default=1024, ge=1, le=16384)
     top_p: Optional[float] = None
+    seed: Optional[int] = None
     stop: Optional[Any] = None
     user: Optional[str] = None
     wahs: Optional[WahsRequestOptions] = None

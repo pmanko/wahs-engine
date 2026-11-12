@@ -17,6 +17,7 @@ from wahs_core import (
     get_lab_history,
     parse_omitted_clinical_items,
     read_clinical_note,
+    retrieve_clinical_note_passages,
     search_chart_entries,
 )
 
@@ -148,6 +149,58 @@ def clean_model_text(content: str) -> str:
     return content.strip()
 
 
+def _register_or_get_citation_index(
+    ctx: AssembledWahsContext,
+    *,
+    resource_uuid: str,
+    resource_type: str = "Resource",
+    display: str = "",
+    date: str = "",
+    source: str = "",
+    section: str = "",
+    member_uuids: Optional[Sequence[str]] = None,
+) -> Optional[int]:
+    ruuid = str(resource_uuid or "").replace("urn:uuid:", "").strip()
+    members = [
+        str(m).replace("urn:uuid:", "").strip()
+        for m in (member_uuids or [])
+        if str(m or "").strip()
+    ]
+    if not ruuid and members:
+        ruuid = members[0]
+    if not ruuid:
+        return None
+
+    candidate_ids = {ruuid, *members}
+    for k_str, entry in ctx.citation_map.items():
+        if not str(k_str).isdigit() or not isinstance(entry, Mapping):
+            continue
+        existing_id = str(entry.get("id") or "").replace("urn:uuid:", "").strip()
+        existing_members = {
+            str(m).replace("urn:uuid:", "").strip()
+            for m in (entry.get("memberIds") or [])
+            if str(m or "").strip()
+        }
+        if existing_id in candidate_ids or (existing_members & candidate_ids):
+            return int(k_str)
+
+    numeric_keys = [int(k) for k in ctx.citation_map if str(k).isdigit()]
+    next_idx = (max(numeric_keys) if numeric_keys else 0) + 1
+    entry_obj: Dict[str, Any] = {
+        "index": next_idx,
+        "resourceType": resource_type or "Resource",
+        "id": ruuid,
+        "source": source or "WA Health Summary",
+        "section": section or "",
+        "date": date or "",
+        "display": display or ruuid,
+    }
+    if members:
+        entry_obj["memberIds"] = members
+    ctx.citation_map[str(next_idx)] = entry_obj
+    return next_idx
+
+
 def build_x_wahs_envelope(
     *,
     ctx: AssembledWahsContext,
@@ -157,9 +210,14 @@ def build_x_wahs_envelope(
     engine_version: str,
     overflow_recovered: int = 0,
     kb_meta: Optional[Dict[str, Any]] = None,
+    note_rag_meta: Optional[Dict[str, Any]] = None,
+    tool_calls_log: Optional[List[Dict[str, Any]]] = None,
+    timings: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     omitted_total, omitted_by_cat = parse_omitted_clinical_items(ctx.condensed.chart_text)
-    return {
+    effective_kb = bool(options.enable_kb) and options.retrieval_strategy != "chart_only"
+    env: Dict[str, Any] = {
+        "retrieval_strategy": options.retrieval_strategy,
         "citation_map": ctx.citation_map,
         "scope_applied": {
             **ctx.scope_applied,
@@ -170,6 +228,7 @@ def build_x_wahs_envelope(
             "tier": ctx.condensed.tier,
             "tier_name": ctx.condensed.tier_name,
             "budget_tokens": ctx.condensed.target_tokens,
+            "requested_budget_tokens": options.target_budget_tokens,
             "actual_tokens": ctx.condensed.actual_tokens,
             "omitted_clinical_items": omitted_total,
             "omitted_by_category": omitted_by_cat,
@@ -188,11 +247,60 @@ def build_x_wahs_envelope(
             "recorded_model": upstream_model,
             "requested_model": requested_model,
             "engine": f"wahs-engine/{engine_version}",
-            "kb_enabled": bool(options.enable_kb),
+            "retrieval_strategy": options.retrieval_strategy,
+            "kb_enabled": effective_kb,
             "kb_enrichment": kb_meta,
             "human_review_required": True,
         },
     }
+    if note_rag_meta is not None:
+        env["note_rag"] = note_rag_meta
+    if tool_calls_log is not None:
+        env["tool_calls"] = tool_calls_log
+    if timings is not None:
+        env["timings"] = timings
+    return env
+
+
+def _annotate_tool_results_with_citations(
+    ctx: AssembledWahsContext,
+    res: Dict[str, Any],
+    *,
+    default_resource_type: str = "Observation",
+) -> None:
+    results = res.get("results")
+    if not isinstance(results, list):
+        return
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        c_idx = _register_or_get_citation_index(
+            ctx,
+            resource_uuid=str(item.get("resource_uuid") or ""),
+            resource_type=str(item.get("resource_type") or default_resource_type),
+            display=str(item.get("display") or item.get("concept") or item.get("text") or ""),
+            date=str(item.get("date") or ""),
+            source=str(item.get("source_org") or "WA Health Summary"),
+            section=str(item.get("section") or item.get("category") or ""),
+            member_uuids=item.get("member_uuids"),
+        )
+        if c_idx is not None:
+            item["citation_index"] = c_idx
+            item["citation_tag"] = f"[{c_idx}]"
+    summary = res.get("summary")
+    if isinstance(summary, dict):
+        for endpoint_key in ("initial", "min", "max", "latest"):
+            pt = summary.get(endpoint_key)
+            if isinstance(pt, dict) and pt.get("resource_uuid"):
+                c_idx = _register_or_get_citation_index(
+                    ctx,
+                    resource_uuid=str(pt["resource_uuid"]),
+                    resource_type="Observation",
+                    display=f"{res.get('analyte_or_loinc') or 'Lab'} {pt.get('value')} {pt.get('unit') or ''}".strip(),
+                    date=str(pt.get("date") or ""),
+                )
+                if c_idx is not None:
+                    pt["citation_tag"] = f"[{c_idx}]"
 
 
 def _execute_local_overflow_tool(
@@ -209,6 +317,7 @@ def _execute_local_overflow_tool(
             sharing_posture=sharing_posture,
             limit=int(fn_args.get("limit") or 10),
         )
+        _annotate_tool_results_with_citations(ctx, res, default_resource_type="Resource")
         return json.dumps(res, default=str), len(res.get("results") or [])
     if fn_name == "get_lab_history":
         res = get_lab_history(
@@ -217,6 +326,7 @@ def _execute_local_overflow_tool(
             limit=int(fn_args.get("limit") or 20),
             sharing_posture=sharing_posture,
         )
+        _annotate_tool_results_with_citations(ctx, res, default_resource_type="Observation")
         return json.dumps(res, default=str), len(res.get("results") or [])
     if fn_name == "read_clinical_note":
         key = str(fn_args.get("note_id_or_query") or "")
@@ -231,6 +341,14 @@ def _execute_local_overflow_tool(
                 query=key,
                 sharing_posture=sharing_posture,
             )
+        # Trim giant full_text duplicates inside JSON tool payload so multiple notes fit cleanly
+        for note_item in res.get("results") or []:
+            if isinstance(note_item, dict):
+                note_item.pop("full_text", None)
+                txt = str(note_item.get("text") or "")
+                if len(txt) > 3200:
+                    note_item["text"] = txt[:3200] + " ...[truncated]"
+        _annotate_tool_results_with_citations(ctx, res, default_resource_type="DocumentReference")
         return json.dumps(res, default=str), len(res.get("results") or [])
     return json.dumps({"error": f"Unknown tool '{fn_name}'"}), 0
 
@@ -240,7 +358,7 @@ def prepare_upstream_messages(
     ctx: AssembledWahsContext,
     req: OpenAIChatCompletionRequest,
     options: WahsRequestOptions,
-) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], int]:
+) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], int, Optional[Dict[str, Any]]]:
     turns: List[Dict[str, Any]] = []
     for m in req.messages:
         role = (m.role or "").strip().lower()
@@ -265,14 +383,21 @@ def prepare_upstream_messages(
             detail="messages must contain at least one non-empty user message.",
         )
 
+    raw_last_user_query = next(
+        (t["content"] for t in reversed(turns) if t["role"] == "user"), ""
+    )
+
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": ctx.system_prompt},
         *turns,
     ]
 
     kb_meta: Optional[Dict[str, Any]] = None
+    note_rag_meta: Optional[Dict[str, Any]] = None
     overflow_recovered = 0
-    if options.enable_kb:
+    effective_kb = bool(options.enable_kb) and options.retrieval_strategy != "chart_only"
+
+    if effective_kb:
         try:
             enrichment = build_wahs_hub_enrichment_block(
                 messages,
@@ -281,6 +406,24 @@ def prepare_upstream_messages(
             )
             kb_meta = enrichment.to_metadata_dict()
             overflow_recovered = int(kb_meta.get("overflow_items_recovered") or 0)
+            for rm in kb_meta.get("recovered_mappings") or []:
+                if isinstance(rm, Mapping) and rm.get("resourceUuid"):
+                    idx_rm = rm.get("index")
+                    if isinstance(idx_rm, int) and str(idx_rm) not in ctx.citation_map:
+                        ctx.citation_map[str(idx_rm)] = {
+                            "index": idx_rm,
+                            "resourceType": rm.get("resourceType") or "Resource",
+                            "id": str(rm.get("resourceUuid")),
+                            "source": "Tier-0 Overflow Recovery",
+                            "section": "",
+                            "date": str(rm.get("date") or ""),
+                            "display": str(rm.get("display") or ""),
+                            **(
+                                {"memberIds": list(rm["memberUuids"])}
+                                if rm.get("memberUuids")
+                                else {}
+                            ),
+                        }
             if enrichment.enrichment_text:
                 messages[-1] = {
                     "role": messages[-1]["role"],
@@ -289,7 +432,71 @@ def prepare_upstream_messages(
         except Exception as exc:
             logger.warning("WAHS KB enrichment skipped: %s", exc)
 
-    return messages, kb_meta, overflow_recovered
+    if options.retrieval_strategy == "note_rag":
+        try:
+            rag_res = retrieve_clinical_note_passages(
+                ctx.extracted,
+                raw_last_user_query,
+                sharing_posture=options.sharing_posture,
+                top_k=5,
+            )
+            passages = rag_res.get("results") or []
+            rag_lines: List[str] = []
+            rag_indices: List[int] = []
+            for p in passages:
+                if not isinstance(p, Mapping):
+                    continue
+                c_idx = _register_or_get_citation_index(
+                    ctx,
+                    resource_uuid=str(p.get("resource_uuid") or ""),
+                    resource_type=str(p.get("resource_type") or "DocumentReference"),
+                    display=str(p.get("display") or "Clinical Note"),
+                    date=str(p.get("date") or ""),
+                    source=str(p.get("source_org") or "Clinical Note"),
+                    section=str(p.get("section") or "clinical_note"),
+                    member_uuids=p.get("member_uuids"),
+                )
+                cite_prefix = f"[{c_idx}] " if c_idx is not None else ""
+                if c_idx is not None and c_idx not in rag_indices:
+                    rag_indices.append(c_idx)
+                rag_lines.append(
+                    f"{cite_prefix}({p.get('date') or 'undated'} | {p.get('display')} | "
+                    f"source={p.get('source_org') or 'Chart'} | bm25={p.get('bm25_score')}): "
+                    f"{p.get('passage_text')}"
+                )
+            note_rag_meta = {
+                "total_chunks_indexed": int(rag_res.get("total_chunks_indexed") or 0),
+                "passages_retrieved": len(passages),
+                "cited_indices": rag_indices,
+                "redacted_for_privacy_count": int(rag_res.get("redacted_for_privacy_count") or 0),
+            }
+            if rag_lines:
+                rag_block = (
+                    "=== SINGLE-PATIENT CLINICAL NOTE & REPORT PASSAGES (BM25 RAG — cite inline as [N]) ===\n"
+                    + "\n".join(rag_lines)
+                )
+                messages[-1] = {
+                    "role": messages[-1]["role"],
+                    "content": f"{messages[-1]['content'].rstrip()}\n\n{rag_block}",
+                }
+        except Exception as exc:
+            logger.warning("WAHS Note RAG skipped: %s", exc)
+
+    if options.retrieval_strategy == "dynamic_fhir_tools":
+        tool_hint = (
+            "=== DYNAMIC FHIR CHART TOOLS ACTIVE ===\n"
+            "The Condensed Clinical Record above is a compact 2k-token IPS safety header. "
+            "Whenever the question asks about prior hospital admissions, clinical notes, procedures, "
+            "microbiology/pathology reports, or specific longitudinal lab dates not shown in full above, "
+            "call `search_chart_entries`, `read_clinical_note`, or `get_lab_history` first, then synthesize "
+            "your final patient-friendly answer citing each item's `[N]` (`citation_tag`) inline."
+        )
+        messages[-1] = {
+            "role": messages[-1]["role"],
+            "content": f"{messages[-1]['content'].rstrip()}\n\n{tool_hint}",
+        }
+
+    return messages, kb_meta, overflow_recovered, note_rag_meta
 
 
 class SouthboundOpenAIClient:
@@ -341,12 +548,15 @@ class SouthboundOpenAIClient:
         ctx: AssembledWahsContext,
         req: OpenAIChatCompletionRequest,
         options: WahsRequestOptions,
+        assemble_ms: float = 0.0,
     ) -> Dict[str, Any]:
+        prep_t0 = time.perf_counter()
         requested_model = (req.model or self.settings.default_model).strip()
         upstream_model = self.settings.resolve_upstream_model(requested_model)
-        messages, kb_meta, overflow_recovered = prepare_upstream_messages(
+        messages, kb_meta, overflow_recovered, note_rag_meta = prepare_upstream_messages(
             ctx=ctx, req=req, options=options
         )
+        engine_prep_ms = round(assemble_ms + (time.perf_counter() - prep_t0) * 1000.0, 2)
         omitted_total, _ = parse_omitted_clinical_items(ctx.condensed.chart_text)
 
         payload: Dict[str, Any] = {
@@ -357,11 +567,40 @@ class SouthboundOpenAIClient:
             "stream": False,
             "chat_template_kwargs": {"enable_thinking": False},
         }
-        if options.enable_overflow_tools and omitted_total > 0:
+        if req.seed is not None:
+            payload["seed"] = req.seed
+
+        allow_tools = options.retrieval_strategy == "dynamic_fhir_tools" or (
+            options.enable_overflow_tools
+            and omitted_total > 0
+            and options.retrieval_strategy != "chart_only"
+        )
+        if allow_tools:
             payload["tools"] = _OVERFLOW_TOOLS_SPEC
+
+        tool_calls_log: List[Dict[str, Any]] = []
+        prompt_ms_total = 0.0
+        predicted_ms_total = 0.0
+        prompt_n_total = 0
+        predicted_n_total = 0
+        cache_n_total = 0
+        llm_rounds = 0
+        supports_template_kwargs = True
+
+        def _accumulate_timings(resp_body: Mapping[str, Any]) -> None:
+            nonlocal prompt_ms_total, predicted_ms_total, prompt_n_total, predicted_n_total, cache_n_total, llm_rounds
+            llm_rounds += 1
+            t_obj = resp_body.get("timings")
+            if isinstance(t_obj, Mapping):
+                prompt_ms_total += float(t_obj.get("prompt_ms") or 0.0)
+                predicted_ms_total += float(t_obj.get("predicted_ms") or 0.0)
+                prompt_n_total += int(t_obj.get("prompt_n") or 0)
+                predicted_n_total += int(t_obj.get("predicted_n") or 0)
+                cache_n_total += int(t_obj.get("cache_n") or 0)
 
         owns_client = self._external_client is None
         client = self._external_client or httpx.AsyncClient(timeout=self.settings.llm_timeout_seconds)
+        llm_t0 = time.perf_counter()
         try:
             resp = await client.post(
                 self.settings.upstream_chat_completions_url,
@@ -369,11 +608,12 @@ class SouthboundOpenAIClient:
                 json=payload,
             )
             if resp.status_code in {400, 422} and (
-                "tools" in payload or "chat_template_kwargs" in payload
+                "tools" in payload or "chat_template_kwargs" in payload or "seed" in payload
             ):
                 # Graceful fallback for strict OpenAI servers that reject optional extensions
                 payload.pop("tools", None)
                 payload.pop("chat_template_kwargs", None)
+                supports_template_kwargs = False
                 resp = await client.post(
                     self.settings.upstream_chat_completions_url,
                     headers=self._headers(),
@@ -381,14 +621,19 @@ class SouthboundOpenAIClient:
                 )
             resp.raise_for_status()
             body = resp.json()
+            if isinstance(body, Mapping):
+                _accumulate_timings(body)
 
-            # Single-round read-only Tier-0 overflow tool execution if model requested a lookup
-            choice0 = ((body.get("choices") or [{}])[0]) if isinstance(body, Mapping) else {}
-            msg0 = choice0.get("message") if isinstance(choice0, Mapping) else {}
-            tool_calls = (msg0.get("tool_calls") or []) if isinstance(msg0, Mapping) else []
-            if tool_calls and options.enable_overflow_tools:
-                followup_msgs = [*messages, dict(msg0)]
-                for tc in tool_calls[:3]:
+            max_tool_rounds = 2 if options.retrieval_strategy == "dynamic_fhir_tools" else 1
+            followup_msgs = list(messages)
+            for round_idx in range(max_tool_rounds):
+                choice0 = ((body.get("choices") or [{}])[0]) if isinstance(body, Mapping) else {}
+                msg0 = choice0.get("message") if isinstance(choice0, Mapping) else {}
+                tool_calls = (msg0.get("tool_calls") or []) if isinstance(msg0, Mapping) else []
+                if not tool_calls or not allow_tools:
+                    break
+                followup_msgs.append(dict(msg0))
+                for tc in tool_calls[:4]:
                     fn = (tc.get("function") or {}) if isinstance(tc, Mapping) else {}
                     fn_name = str(fn.get("name") or "")
                     try:
@@ -399,31 +644,71 @@ class SouthboundOpenAIClient:
                         ctx, fn_name, fn_args, sharing_posture=options.sharing_posture
                     )
                     overflow_recovered += rec_count
+                    tool_calls_log.append(
+                        {
+                            "round": round_idx + 1,
+                            "name": fn_name,
+                            "arguments": fn_args,
+                            "results_returned": rec_count,
+                        }
+                    )
                     followup_msgs.append(
                         {
                             "role": "tool",
-                            "tool_call_id": str(tc.get("id") or "call_1"),
+                            "tool_call_id": str(tc.get("id") or f"call_{round_idx + 1}"),
                             "name": fn_name,
                             "content": tool_out,
                         }
                     )
-                second_payload = {
+                next_payload: Dict[str, Any] = {
                     "model": upstream_model,
                     "messages": followup_msgs,
                     "temperature": req.temperature,
                     "max_tokens": req.max_tokens or 1024,
                     "stream": False,
                 }
-                resp2 = await client.post(
+                if supports_template_kwargs:
+                    next_payload["chat_template_kwargs"] = {"enable_thinking": False}
+                if req.seed is not None:
+                    next_payload["seed"] = req.seed
+                if round_idx + 1 < max_tool_rounds:
+                    next_payload["tools"] = _OVERFLOW_TOOLS_SPEC
+                resp_next = await client.post(
                     self.settings.upstream_chat_completions_url,
                     headers=self._headers(),
-                    json=second_payload,
+                    json=next_payload,
                 )
-                resp2.raise_for_status()
-                body = resp2.json()
+                resp_next.raise_for_status()
+                body = resp_next.json()
+                if isinstance(body, Mapping):
+                    _accumulate_timings(body)
         finally:
             if owns_client:
                 await client.aclose()
+
+        upstream_llm_ms = round((time.perf_counter() - llm_t0) * 1000.0, 2)
+        total_latency_ms = round(engine_prep_ms + upstream_llm_ms, 2)
+        timings_envelope: Dict[str, Any] = {
+            "engine_prep_ms": engine_prep_ms,
+            "upstream_llm_ms": upstream_llm_ms,
+            "total_latency_ms": total_latency_ms,
+            "llm_rounds": llm_rounds,
+            "prompt_n": prompt_n_total,
+            "prompt_ms": round(prompt_ms_total, 2),
+            "prompt_per_second": (
+                round(prompt_n_total / (prompt_ms_total / 1000.0), 2)
+                if prompt_ms_total > 0
+                else 0.0
+            ),
+            "predicted_n": predicted_n_total,
+            "predicted_ms": round(predicted_ms_total, 2),
+            "predicted_per_second": (
+                round(predicted_n_total / (predicted_ms_total / 1000.0), 2)
+                if predicted_ms_total > 0
+                else 0.0
+            ),
+            "cache_n": cache_n_total,
+        }
 
         raw_text = (
             (((body.get("choices") or [{}])[0]).get("message") or {}).get("content") or ""
@@ -437,6 +722,9 @@ class SouthboundOpenAIClient:
             engine_version=self.settings.engine_version,
             overflow_recovered=overflow_recovered,
             kb_meta=kb_meta,
+            note_rag_meta=note_rag_meta,
+            tool_calls_log=tool_calls_log if (allow_tools or tool_calls_log) else None,
+            timings=timings_envelope,
         )
         return {
             "id": body.get("id") or f"chatcmpl-wahs-{uuid.uuid4().hex[:12]}",
@@ -460,12 +748,15 @@ class SouthboundOpenAIClient:
         ctx: AssembledWahsContext,
         req: OpenAIChatCompletionRequest,
         options: WahsRequestOptions,
+        assemble_ms: float = 0.0,
     ) -> AsyncIterator[str]:
+        prep_t0 = time.perf_counter()
         requested_model = (req.model or self.settings.default_model).strip()
         upstream_model = self.settings.resolve_upstream_model(requested_model)
-        messages, kb_meta, overflow_recovered = prepare_upstream_messages(
+        messages, kb_meta, overflow_recovered, note_rag_meta = prepare_upstream_messages(
             ctx=ctx, req=req, options=options
         )
+        engine_prep_ms = round(assemble_ms + (time.perf_counter() - prep_t0) * 1000.0, 2)
         completion_id = f"chatcmpl-wahs-{uuid.uuid4().hex[:12]}"
         created = int(time.time())
 
@@ -477,6 +768,8 @@ class SouthboundOpenAIClient:
             "stream": True,
             "chat_template_kwargs": {"enable_thinking": False},
         }
+        if req.seed is not None:
+            payload["seed"] = req.seed
 
         # Standard initial assistant role chunk (`@ai-sdk/openai-compatible` compatible)
         role_chunk = {
@@ -491,6 +784,7 @@ class SouthboundOpenAIClient:
         stripper = _StreamingThinkStripper()
         owns_client = self._external_client is None
         client = self._external_client or httpx.AsyncClient(timeout=self.settings.llm_timeout_seconds)
+        llm_t0 = time.perf_counter()
         try:
             active_payload = dict(payload)
             for attempt in range(2):
@@ -549,6 +843,7 @@ class SouthboundOpenAIClient:
             if owns_client:
                 await client.aclose()
 
+        upstream_llm_ms = round((time.perf_counter() - llm_t0) * 1000.0, 2)
         x_wahs = build_x_wahs_envelope(
             ctx=ctx,
             requested_model=requested_model,
@@ -557,6 +852,12 @@ class SouthboundOpenAIClient:
             engine_version=self.settings.engine_version,
             overflow_recovered=overflow_recovered,
             kb_meta=kb_meta,
+            note_rag_meta=note_rag_meta,
+            timings={
+                "engine_prep_ms": engine_prep_ms,
+                "upstream_llm_ms": upstream_llm_ms,
+                "total_latency_ms": round(engine_prep_ms + upstream_llm_ms, 2),
+            },
         )
         final_chunk = {
             "id": completion_id,

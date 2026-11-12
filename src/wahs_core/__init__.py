@@ -68,6 +68,7 @@ from .wahs_skills import (
 from .wahs_tools import (
     get_lab_history,
     read_clinical_note,
+    retrieve_clinical_note_passages,
     search_chart_entries,
 )
 
@@ -122,6 +123,7 @@ __all__ = [
     "resolve_immunization_code",
     "resolve_lab_code",
     "resolve_medication_code",
+    "retrieve_clinical_note_passages",
     "run_acip_immunization_skill",
     "run_chart_hygiene_and_reconciliation_skills",
     "run_condition_stage_reconciliation_skill",

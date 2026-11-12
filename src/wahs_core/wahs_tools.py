@@ -10,8 +10,9 @@ uncondensed `Tier 0/1` `ExtractedChart` in memory while strictly enforcing
 
 from __future__ import annotations
 
+import math
 import re
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from .extractors import ClinicalItem, ExtractedChart, extract_bundle
 from .normalizers import classify_sensitivity
@@ -248,4 +249,213 @@ def read_clinical_note(
         "total_matches": len(notes),
         "redacted_for_privacy_count": redacted_count,
         "results": notes,
+    }
+
+
+_RAG_STOPWORDS = {
+    "the",
+    "and",
+    "for",
+    "with",
+    "that",
+    "this",
+    "from",
+    "what",
+    "when",
+    "where",
+    "which",
+    "why",
+    "how",
+    "are",
+    "was",
+    "were",
+    "have",
+    "has",
+    "had",
+    "been",
+    "please",
+    "provide",
+    "review",
+    "summarize",
+    "summary",
+    "state",
+    "identify",
+    "report",
+    "chart",
+    "patient",
+    "record",
+    "records",
+    "cited",
+    "parts",
+    "below",
+    "covering",
+    "three",
+    "my",
+    "me",
+    "your",
+}
+
+
+def _tokenize_for_bm25(text: str) -> List[str]:
+    raw = re.findall(r"#?\d+(?:\.\d+)?|[a-z0-9][a-z0-9.\-]*", (text or "").lower())
+    return [tok for tok in raw if (len(tok) >= 2 or tok.isdigit()) and tok not in _RAG_STOPWORDS]
+
+
+def _chunk_note_words(
+    text: str,
+    *,
+    chunk_words: int = 160,
+    overlap_words: int = 35,
+) -> List[str]:
+    words = (text or "").split()
+    if not words:
+        return []
+    step = max(25, chunk_words - overlap_words)
+    if len(words) <= chunk_words:
+        return [" ".join(words)]
+    chunks: List[str] = []
+    for start in range(0, len(words), step):
+        window = words[start : start + chunk_words]
+        if not window:
+            break
+        chunks.append(" ".join(window))
+        if start + chunk_words >= len(words):
+            break
+    return chunks
+
+
+def retrieve_clinical_note_passages(
+    bundle_or_extracted: Union[Mapping[str, Any], ExtractedChart],
+    query: str,
+    *,
+    sharing_posture: str = "patient_self",
+    chunk_words: int = 160,
+    overlap_words: int = 35,
+    top_k: int = 5,
+) -> Dict[str, Any]:
+    """Retrieve top-k BM25-ranked single-patient clinical note & report passages.
+
+    Indexes deduplicated full-text `DocumentReference` and `DiagnosticReport`
+    entries within the single authorized patient chart while enforcing
+    `sharing_posture` (`external_share` redacts `SDOH/PRIVACY-SENSITIVE` items).
+    """
+    extracted = _ensure_extracted(bundle_or_extracted)
+    q_tokens = _tokenize_for_bm25(query)
+    q_unique = list(dict.fromkeys(q_tokens))
+
+    candidate_chunks: List[Dict[str, Any]] = []
+    doc_tokens_list: List[List[str]] = []
+    redacted_count = 0
+
+    for item in extracted.items:
+        is_note_or_report = (
+            item.section in {"clinical_note", "note"}
+            or item.resource_type in {"DocumentReference", "DiagnosticReport"}
+        )
+        if not is_note_or_report:
+            continue
+        if _is_privacy_redacted(item, sharing_posture):
+            redacted_count += 1
+            continue
+
+        raw_decoded = str(
+            item.metadata.get("raw_decoded_text")
+            or item.metadata.get("full_text")
+            or item.text
+            or ""
+        ).strip()
+        full_body = raw_decoded or item.text
+        if not full_body:
+            continue
+
+        item_date = item.clinical_date or item.date or ""
+        header = f"{item.display} ({item_date or 'undated'}, {item.source_org or 'Clinical Record'})"
+        passages = _chunk_note_words(
+            full_body,
+            chunk_words=max(40, int(chunk_words)),
+            overlap_words=max(0, int(overlap_words)),
+        )
+        for p_idx, passage in enumerate(passages):
+            combined = f"{header}: {passage}"
+            toks = _tokenize_for_bm25(combined)
+            if not toks:
+                continue
+            candidate_chunks.append(
+                {
+                    "resource_type": item.resource_type,
+                    "resource_uuid": item.resource_uuid,
+                    "member_uuids": list(item.member_uuids),
+                    "section": item.section,
+                    "date": item_date,
+                    "display": item.display,
+                    "source_org": item.source_org or "",
+                    "chunk_index": p_idx,
+                    "passage_text": passage,
+                }
+            )
+            doc_tokens_list.append(toks)
+
+    if not candidate_chunks:
+        return {
+            "tool": "retrieve_clinical_note_passages",
+            "query": query,
+            "sharing_posture": sharing_posture,
+            "total_chunks_indexed": 0,
+            "redacted_for_privacy_count": redacted_count,
+            "results": [],
+        }
+
+    n_docs = len(doc_tokens_list)
+    avgdl = sum(len(t) for t in doc_tokens_list) / max(1, n_docs)
+    df: Dict[str, int] = {qt: 0 for qt in q_unique}
+    for toks in doc_tokens_list:
+        tset = set(toks)
+        for qt in q_unique:
+            if qt in tset:
+                df[qt] += 1
+
+    k1 = 1.5
+    b = 0.75
+    scored: List[Tuple[float, str, int]] = []
+    for idx, toks in enumerate(doc_tokens_list):
+        if not q_unique:
+            scored.append((1.0, candidate_chunks[idx]["date"], idx))
+            continue
+        tf_map: Dict[str, int] = {}
+        for tok in toks:
+            if tok in df:
+                tf_map[tok] = tf_map.get(tok, 0) + 1
+        if not tf_map:
+            continue
+        dl = len(toks)
+        bm25_score = 0.0
+        for qt, tf in tf_map.items():
+            doc_freq = df.get(qt, 0)
+            idf = math.log(1.0 + (n_docs - doc_freq + 0.5) / (doc_freq + 0.5))
+            denom = tf + k1 * (1.0 - b + b * (dl / max(1.0, avgdl)))
+            bm25_score += idf * ((tf * (k1 + 1.0)) / max(1e-9, denom))
+        if bm25_score > 0.0:
+            scored.append((bm25_score, candidate_chunks[idx]["date"], idx))
+
+    scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    selected: List[Dict[str, Any]] = []
+    per_resource_cap: Dict[str, int] = {}
+    for bm25_val, _dt, c_idx in scored:
+        cand = dict(candidate_chunks[c_idx])
+        ru = cand["resource_uuid"]
+        if per_resource_cap.get(ru, 0) >= 2:
+            continue
+        per_resource_cap[ru] = per_resource_cap.get(ru, 0) + 1
+        cand["bm25_score"] = round(bm25_val, 4)
+        selected.append(cand)
+        if len(selected) >= max(1, int(top_k)):
+            break
+
+    return {
+        "tool": "retrieve_clinical_note_passages",
+        "query": query,
+        "sharing_posture": sharing_posture,
+        "total_chunks_indexed": n_docs,
+        "redacted_for_privacy_count": redacted_count,
+        "results": selected,
     }

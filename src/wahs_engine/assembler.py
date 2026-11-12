@@ -682,11 +682,16 @@ class WAHSBundleAssembler:
                     "ips": ips_version_marker,
                 }
             )
+            effective_budget = (
+                min(options.target_budget_tokens, 2048)
+                if options.retrieval_strategy == "dynamic_fhir_tools"
+                else options.target_budget_tokens
+            )
             scope_hash = _canonical_sha256(
                 {
                     "scope": scope.model_dump(),
                     "overlays": options.overlay_resources,
-                    "budget": options.target_budget_tokens,
+                    "budget": effective_budget,
                     "posture": options.sharing_posture,
                 }
             )
@@ -696,6 +701,7 @@ class WAHSBundleAssembler:
             cached_ctx = self._prefix_cache.get(prefix_key)
             if cached_ctx is not None:
                 hit_copy = copy.copy(cached_ctx)
+                hit_copy.citation_map = copy.deepcopy(cached_ctx.citation_map)
                 hit_copy.cache_hit = True
                 return hit_copy
 
@@ -781,11 +787,16 @@ class WAHSBundleAssembler:
         dataset_fetches: int,
     ) -> AssembledWahsContext:
         scope = options.chart_scope
+        effective_budget = (
+            min(options.target_budget_tokens, 2048)
+            if options.retrieval_strategy == "dynamic_fhir_tools"
+            else options.target_budget_tokens
+        )
         scope_hash = _canonical_sha256(
             {
                 "scope": scope.model_dump(),
                 "overlays": options.overlay_resources,
-                "budget": options.target_budget_tokens,
+                "budget": effective_budget,
                 "posture": options.sharing_posture,
             }
         )
@@ -793,6 +804,7 @@ class WAHSBundleAssembler:
         cached = self._prefix_cache.get(prefix_key)
         if cached is not None:
             hit_copy = copy.copy(cached)
+            hit_copy.citation_map = copy.deepcopy(cached.citation_map)
             hit_copy.cache_hit = True
             return hit_copy
 
@@ -879,7 +891,7 @@ class WAHSBundleAssembler:
         extracted = extract_bundle(guarded_bundle)
         condensed = condense_bundle_to_budget(
             extracted,
-            target_tokens=options.target_budget_tokens,
+            target_tokens=effective_budget,
             sharing_posture=options.sharing_posture,
         )
 

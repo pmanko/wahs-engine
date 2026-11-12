@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Request, Response
@@ -117,13 +118,15 @@ def create_app(
         request: Request,
         response: Response,
     ) -> Any:
+        t0 = time.perf_counter()
         options = req.resolved_wahs_options()
         identity = _resolve_caller_identity(request, options, cfg)
         ctx = await assembler.assemble(options=options, identity=identity)
+        assemble_ms = round((time.perf_counter() - t0) * 1000.0, 2)
 
         if req.stream:
             return StreamingResponse(
-                southbound.stream(ctx=ctx, req=req, options=options),
+                southbound.stream(ctx=ctx, req=req, options=options, assemble_ms=assemble_ms),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -132,7 +135,9 @@ def create_app(
                 },
             )
 
-        result = await southbound.complete(ctx=ctx, req=req, options=options)
+        result = await southbound.complete(
+            ctx=ctx, req=req, options=options, assemble_ms=assemble_ms
+        )
         response.headers["X-WAHS-Prefix-Hash"] = ctx.prefix_cache_key_hash
         return result
 
