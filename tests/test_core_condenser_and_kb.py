@@ -177,3 +177,63 @@ def test_condenser_budgets_goal_patient_story_and_overflow_tools(budget: int) ->
     assert "spironolactone" in note_res["results"][0]["text"].lower()
     entry_hits = search_chart_entries(extracted, query="lightheadedness")
     assert len(entry_hits["results"]) >= 1
+
+
+def test_no_bespoke_question_directives_or_persona_kb_entries() -> None:
+    import json
+    from pathlib import Path
+
+    assert not hasattr(
+        wahs_core.clinical_graph,
+        "_build_question_conditioned_clinical_and_privacy_directives",
+    )
+
+    corpus_path = (
+        Path(wahs_core.__file__).resolve().parent / "kb_data" / "wahs_corpus.jsonl"
+    )
+    entries = [
+        json.loads(line)
+        for line in corpus_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(entries) >= 8
+    forbidden_ids = {
+        "wahs-kb-coercion-bystander-safety",
+        "wahs-kb-minimum-necessary-third-party",
+        "wahs-kb-right-of-access-and-amendment",
+        "wahs-kb-restraint-vs-criminal-record",
+        "wahs-kb-single-patient-boundary",
+        "wahs-kb-personal-devices-vs-facility-equipment",
+        "wahs-cabg-icu-stay-education",
+        "wahs-chronic-meds-insulin-hctz-metoprolol",
+        "wahs-dental-sinus-anemia-sleep-education",
+        "wahs-condition-status-conflict-sinusitis",
+    }
+    for entry in entries:
+        assert entry["id"] not in forbidden_ids
+        assert len(entry.get("codes") or []) >= 1
+
+    bundle = _sample_wahs_bundle()
+    condensed = condense_bundle_to_budget(bundle, target_tokens=1024)
+    test_questions = [
+        "My partner is reading this with me right now, what should I know?",
+        "Write a letter for my employer and landlord accommodation.",
+        "Do I have a criminal record?",
+        "What is my HbA1c?",
+    ]
+    for q in test_questions:
+        res = wahs_core.build_wahs_hub_enrichment_block(
+            [
+                {"role": "system", "content": condensed.chart_text},
+                {"role": "user", "content": q},
+            ]
+        )
+        assert "[KB wahs-" not in res.enrichment_text
+        for forbidden_phrase in (
+            "Screen-Watching Coercion Guardrail",
+            "Third-Party",
+            "Criminal Record Disambiguation",
+            "HbA1c Plausibility Check",
+            "Personal Device Filtering",
+        ):
+            assert forbidden_phrase not in res.enrichment_text

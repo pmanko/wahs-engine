@@ -1908,19 +1908,6 @@ def _condense_lossless_structural(
                 ),
                 reverse=True,
             )
-        elif sec_name in {"procedure_major", "encounter_acuity"}:
-            sec_items.sort(
-                key=lambda x: (
-                    1
-                    if any(
-                        w in x.display.lower()
-                        for w in ("bypass", "cabg", "graft", "stent", "valve", "intensive care", "icu", "surgery")
-                    )
-                    else 0,
-                    _date_sort_key(x.date),
-                ),
-                reverse=True,
-            )
         else:
             sec_items.sort(key=lambda x: _date_sort_key(x.date), reverse=True)
         for idx_in_sec, x in enumerate(sec_items):
