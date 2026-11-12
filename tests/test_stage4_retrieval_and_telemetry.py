@@ -310,3 +310,137 @@ def test_note_rag_and_dynamic_fhir_tools_with_seed_and_timings() -> None:
     assert x_tools["timings"]["llm_rounds"] == 2
     assert x_tools["timings"]["prompt_ms"] == pytest.approx(300.0)
     assert x_tools["timings"]["predicted_ms"] == pytest.approx(180.0)
+
+
+def test_external_share_blocks_tier0_overflow_recovery_across_all_strategies() -> None:
+    """Regression test: when `sharing_posture == 'external_share'` and condensation drops items
+    (`omitted_clinical_items > 0`), Tier-0 overflow recovery (`build_wahs_hub_enrichment_block`)
+    and KB lookup must NOT re-inject redacted `SDOH/PRIVACY-SENSITIVE` active Conditions or notes.
+    """
+    bundle = _sample_long_note_bundle()
+    # Add active SDOH/IPV and social isolation Conditions plus historical labs so omitted_clinical_items > 0 at small budget
+    bundle["entry"].extend(
+        [
+            {
+                "resource": {
+                    "resourceType": "Condition",
+                    "id": "smart-cond-sdoh-ipv",
+                    "clinicalStatus": {"coding": [{"code": "active"}]},
+                    "code": {
+                        "coding": [
+                            {
+                                "system": "http://snomed.info/sct",
+                                "code": "706893006",
+                                "display": "Victim of intimate partner abuse (finding)",
+                            }
+                        ],
+                        "text": "Victim of intimate partner abuse",
+                    },
+                    "subject": {"reference": "Patient/pat-long-1"},
+                    "onsetDateTime": "2025-05-02",
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Condition",
+                    "id": "margaret-cond-sdoh-iso",
+                    "clinicalStatus": {"coding": [{"code": "active"}]},
+                    "code": {
+                        "coding": [
+                            {
+                                "system": "http://snomed.info/sct",
+                                "code": "55600006",
+                                "display": "Social isolation (finding)",
+                            }
+                        ],
+                        "text": "Social isolation",
+                    },
+                    "subject": {"reference": "Patient/pat-long-1"},
+                    "onsetDateTime": "2025-08-19",
+                }
+            },
+            *[
+                {
+                    "resource": {
+                        "resourceType": "Observation",
+                        "id": f"obs-hist-{idx}",
+                        "status": "final",
+                        "category": [{"coding": [{"code": "laboratory"}]}],
+                        "code": {"coding": [{"system": "http://loinc.org", "code": "2160-0", "display": "Creatinine"}]},
+                        "subject": {"reference": "Patient/pat-long-1"},
+                        "effectiveDateTime": f"2022-0{(idx % 9) + 1}-10",
+                        "valueQuantity": {"value": 1.1 + idx * 0.01, "unit": "mg/dL"},
+                    }
+                }
+                for idx in range(25)
+            ],
+        ]
+    )
+
+    captured_payloads: List[Dict[str, Any]] = []
+
+    def mock_llm_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        captured_payloads.append(body)
+        return httpx.Response(
+            200,
+            json={
+                "id": "cmpl-ext-1",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": "External referral summary limited to active medical care [1].",
+                        },
+                    }
+                ],
+                "timings": {"prompt_n": 240, "prompt_ms": 90.0, "predicted_n": 18, "predicted_ms": 50.0},
+            },
+        )
+
+    settings = WahsEngineSettings(
+        allow_local_bundle_mode=True,
+        llm_base_url="http://mock-llm/v1",
+        default_model="gemma-e4b",
+    )
+    llm_client = httpx.AsyncClient(transport=httpx.MockTransport(mock_llm_handler))
+    client = TestClient(create_app(settings=settings, llm_http_client=llm_client))
+
+    forbidden = (
+        "smart-cond-sdoh-ipv",
+        "margaret-cond-sdoh-iso",
+        "doc-sdoh-ipv",
+        "intimate partner abuse",
+        "intimate partner violence",
+        "social isolation",
+    )
+    for strat in ("condensation_kb", "note_rag", "dynamic_fhir_tools"):
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gemma-e4b",
+                "seed": 42,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Generate an external referral summary of active medical conditions and hospitalizations.",
+                    }
+                ],
+                "wahs": {
+                    "fhir_bundle": bundle,
+                    "target_budget_tokens": 512,
+                    "sharing_posture": "external_share",
+                    "retrieval_strategy": strat,
+                },
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        sent_blob = json.dumps(captured_payloads[-1]).lower()
+        resp_blob = json.dumps(body).lower()
+        for term in forbidden:
+            assert term not in sent_blob, f"{strat} leaked {term!r} into upstream LLM prompt"
+            assert term not in resp_blob, f"{strat} leaked {term!r} into response / citation_map"
+

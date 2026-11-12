@@ -403,6 +403,7 @@ def prepare_upstream_messages(
                 messages,
                 extracted=ctx.extracted,
                 max_tokens=800,
+                sharing_posture=options.sharing_posture,
             )
             kb_meta = enrichment.to_metadata_dict()
             overflow_recovered = int(kb_meta.get("overflow_items_recovered") or 0)

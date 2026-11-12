@@ -1632,6 +1632,8 @@ def _build_question_conditioned_clinical_and_privacy_directives(
     question: str,
     graph: ClinicalEntityGraph,
     prompt_text: str,
+    *,
+    sharing_posture: str = "patient_self",
 ) -> List[str]:
     """Synthesize deterministic question-conditioned clinical and conversational privacy/coercion
     directives from the patient's ``ClinicalEntityGraph`` and the active user question."""
@@ -1641,6 +1643,9 @@ def _build_question_conditioned_clinical_and_privacy_directives(
     directives: List[str] = []
 
     # 1. Conversational Privacy, Coercion, Minimum-Necessary & Access Boundaries (P1-P10)
+    # Under `external_share`, SDOH/privacy-sensitive records are already segmented out at the
+    # data layer; skip patient-alone SDOH/IPV disclosure directives so example sensitive terms
+    # are never injected into external-share prompts.
     bystander_cues = (
         "partner is reading",
         "partner is watching",
@@ -1655,25 +1660,26 @@ def _build_question_conditioned_clinical_and_privacy_directives(
         "next to me",
     )
     has_bystander = any(c in q_low for c in bystander_cues)
-    if has_bystander:
-        directives.append(
-            "- [KB wahs-kb-coercion-screen-safety-01 | Trauma-Informed Coercion & Bystander Safety] "
-            "Screen-Watching Coercion Guardrail: CRITICAL SAFETY RULE — Another person (e.g., partner/spouse) is reading "
-            "the screen with the patient. Do NOT read out, cite, or disclose any intimate partner violence (IPV), domestic "
-            "abuse, fear of a partner, violence in the environment, confidential social work safety assessments, mental "
-            "health diagnoses, alcohol/substance findings, or DNR status while someone else is present. Give a calm, neutral "
-            "answer about general non-sensitive chart records and gently offer to review private personal history sections when "
-            "the patient is alone."
-        )
-    elif any(c in q_low for c in ("abused", "abuse", "domestic violence", "intimate partner")) and "delete" not in q_low:
-        directives.append(
-            "- [KB wahs-kb-patient-right-of-access-abuse-01 | 45 CFR 164.524 Patient Right of Access & Trauma-Informed Care] "
-            "Patient Alone Abuse Query: The patient is asking alone about their own chart. Report any documented abuse, "
-            "'victim of intimate partner abuse', 'reports of violence in the environment', HARK/PRAPARE fear-of-partner "
-            "screening answers, or social work safety assessment notes factually and gently with exact dates and [N] citations "
-            "(including any recent screening stating the patient feels safe at home). If no abuse findings exist, state so "
-            "plainly without speculating. When abuse or violence is documented, offer confidential support resources."
-        )
+    if sharing_posture != "external_share":
+        if has_bystander:
+            directives.append(
+                "- [KB wahs-kb-coercion-screen-safety-01 | Trauma-Informed Coercion & Bystander Safety] "
+                "Screen-Watching Coercion Guardrail: CRITICAL SAFETY RULE — Another person (e.g., partner/spouse) is reading "
+                "the screen with the patient. Do NOT read out, cite, or disclose any intimate partner violence (IPV), domestic "
+                "abuse, fear of a partner, violence in the environment, confidential social work safety assessments, mental "
+                "health diagnoses, alcohol/substance findings, or DNR status while someone else is present. Give a calm, neutral "
+                "answer about general non-sensitive chart records and gently offer to review private personal history sections when "
+                "the patient is alone."
+            )
+        elif any(c in q_low for c in ("abused", "abuse", "domestic violence", "intimate partner")) and "delete" not in q_low:
+            directives.append(
+                "- [KB wahs-kb-patient-right-of-access-abuse-01 | 45 CFR 164.524 Patient Right of Access & Trauma-Informed Care] "
+                "Patient Alone Abuse Query: The patient is asking alone about their own chart. Report any documented abuse, "
+                "'victim of intimate partner abuse', 'reports of violence in the environment', HARK/PRAPARE fear-of-partner "
+                "screening answers, or social work safety assessment notes factually and gently with exact dates and [N] citations "
+                "(including any recent screening stating the patient feels safe at home). If no abuse findings exist, state so "
+                "plainly without speculating. When abuse or violence is documented, offer confidential support resources."
+            )
 
     if any(c in q_low for c in ("employer", "landlord", "accommodation", "share with my new employer")):
         recipient = "landlord / housing accommodation" if ("landlord" in q_low or "accommodation" in q_low) else "employer"
@@ -1972,6 +1978,8 @@ def _recover_omitted_tier0_items(
     omitted_by_category: Dict[str, int],
     start_citation_idx: int,
     max_recovered: int = 6,
+    *,
+    sharing_posture: str = "patient_self",
 ) -> List[str]:
     """Use ``wahs_tools`` against ``extracted`` to recover omitted Tier-0 clinical records."""
     ledger_only_text = _extract_numbered_ledger_lines_text(prompt_text)
@@ -2023,6 +2031,10 @@ def _recover_omitted_tier0_items(
     tier0_items = [
         it for it in getattr(extracted, "items", [])
         if getattr(it, "section", "") in {"med_active", "device", "condition_active"}
+        and not (
+            sharing_posture == "external_share"
+            and getattr(it, "sensitivity", "") == "SDOH/PRIVACY-SENSITIVE"
+        )
         and not (
             getattr(it, "section", "") == "device"
             and is_clinic_room_equipment(str(getattr(it, "display", "") or ""))
@@ -2088,7 +2100,7 @@ def _recover_omitted_tier0_items(
     for nq in note_queries:
         if len(recovered_entries) >= max_recovered:
             break
-        note_res = read_clinical_note(extracted, query=nq)
+        note_res = read_clinical_note(extracted, query=nq, sharing_posture=sharing_posture)
         raw_notes = list(note_res.get("results") or [])
         raw_notes.sort(
             key=lambda n: (
@@ -2129,7 +2141,9 @@ def _recover_omitted_tier0_items(
     for lq in lab_queries[:4]:
         if len(recovered_entries) >= max_recovered:
             break
-        lab_res = get_lab_history(extracted, analyte_or_loinc=lq, limit=6)
+        lab_res = get_lab_history(
+            extracted, analyte_or_loinc=lq, limit=6, sharing_posture=sharing_posture
+        )
         pts = lab_res.get("results") or []
         if not pts:
             continue
@@ -2178,7 +2192,9 @@ def _recover_omitted_tier0_items(
     for kw in search_kws:
         if len(recovered_entries) >= max_recovered:
             break
-        srch = search_chart_entries(extracted, query=kw, limit=10)
+        srch = search_chart_entries(
+            extracted, query=kw, limit=10, sharing_posture=sharing_posture
+        )
         for m in srch.get("results") or []:
             r_uuid = str(m.get("resource_uuid") or "")
             if r_uuid and r_uuid in flat_existing_uuids:
@@ -2238,6 +2254,8 @@ def build_wahs_hub_enrichment_block(
     messages: Union[str, Sequence[Dict[str, Any]]],
     extracted: Optional[ExtractedChart] = None,
     max_tokens: int = 800,
+    *,
+    sharing_posture: str = "patient_self",
 ) -> HubEnrichmentResult:
     """Build the bounded Med Agent Hub pre-generation context enrichment block.
 
@@ -2294,6 +2312,7 @@ def build_wahs_hub_enrichment_block(
             omitted_by_category=omitted_by_cat,
             start_citation_idx=max_cit_before,
             max_recovered=6,
+            sharing_posture=sharing_posture,
         )
         if recovered_lines and has_numbered_lines:
             graph = ClinicalEntityGraph.from_condensed_ledger(
@@ -2309,7 +2328,7 @@ def build_wahs_hub_enrichment_block(
     # Rule 3: Live Question-Conditioned Clinical KB Lookup
     chart_codes = _extract_codes_from_prompt_text(prompt_text) if broad_query else []
     if broad_query and resolved_extracted is not None:
-        for c in extract_chart_kb_codes(resolved_extracted):
+        for c in extract_chart_kb_codes(resolved_extracted, sharing_posture=sharing_posture):
             if c not in chart_codes:
                 chart_codes.append(c)
 
@@ -2323,7 +2342,7 @@ def build_wahs_hub_enrichment_block(
     kb_hits = hub_kb.search(query=kb_query, corpus="wahs", k=4, codes=chart_codes)
     q_terms = _extract_question_keywords(active_question, patient_name=graph.patient_name)
     q_low_kb = (active_question or "").lower()
-    wants_sdoh_kb = any(
+    wants_sdoh_kb = sharing_posture != "external_share" and any(
         w in q_low_kb
         for w in (
             "privacy", "sdoh", "redact", "sharing", "external", "abuse", "abused",
@@ -2333,7 +2352,7 @@ def build_wahs_hub_enrichment_block(
         )
     )
     kb_lines: List[str] = _build_question_conditioned_clinical_and_privacy_directives(
-        active_question, graph, prompt_text
+        active_question, graph, prompt_text, sharing_posture=sharing_posture
     )
     existing_kb_ids = {
         m.group(1).lower()
@@ -2348,7 +2367,7 @@ def build_wahs_hub_enrichment_block(
         h_src = str(hit.get("source") or "Clinical Guideline")
         h_title = str(hit.get("title") or "")
         h_text = str(hit.get("text") or "").strip().replace("\n", " ")
-        if "sdoh-privacy" in h_id.lower() and not wants_sdoh_kb:
+        if ("sdoh-privacy" in h_id.lower() or "coercion" in h_id.lower()) and not wants_sdoh_kb:
             continue
         if not broad_query:
             hit_combined = f"{h_id} {h_title}".lower()
