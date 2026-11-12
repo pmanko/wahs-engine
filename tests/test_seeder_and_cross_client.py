@@ -20,7 +20,11 @@ from wahs_engine.assembler import (
     SOURCE_NAME_SYSTEM,
 )
 from wahs_engine.config import WahsEngineSettings
-from wahs_engine.seeder import OBSERVATION_CATEGORY_SYSTEM, seed_persona_to_hapi
+from wahs_engine.seeder import (
+    OBSERVATION_CATEGORY_SYSTEM,
+    SEED_DATASET_IDENTIFIER_SYSTEM,
+    seed_persona_to_hapi,
+)
 
 
 def _make_jwt(sub: str) -> str:
@@ -33,7 +37,8 @@ def _build_in_memory_hapi_and_jwt_proxy() -> FastAPI:
     """In-memory HAPI FHIR R4 + CIRG `jwt-proxy` enforcing Keycloak `sub` security labels."""
     hapi = FastAPI()
     store: Dict[str, Dict[str, Any]] = {}
-    state = {"seq": 0, "tick": 0}
+    state = {"seq": 0, "tick": 0, "tx_posts": 0}
+    hapi.state.tx_state = state
 
     def _next_ts() -> str:
         state["tick"] += 1
@@ -120,10 +125,21 @@ def _build_in_memory_hapi_and_jwt_proxy() -> FastAPI:
                     entries.append({"resource": copy.deepcopy(r)})
         return {"resourceType": "Bundle", "type": "searchset", "entry": entries}
 
+    @hapi.get("/fhir/{rt}/{rid}")
+    async def get_resource(rt: str, rid: str, request: Request) -> Dict[str, Any]:
+        from fastapi import HTTPException
+
+        sub = _caller_sub(request)
+        res = store.get(f"{rt}/{rid}")
+        if not res or not _visible_to_sub(res, sub):
+            raise HTTPException(status_code=404, detail="Not found")
+        return copy.deepcopy(res)
+
     @hapi.post("/fhir")
     async def post_transaction(request: Request) -> Dict[str, Any]:
         body = await request.json()
         sub = _caller_sub(request)
+        state["tx_posts"] += 1
         urn_map: Dict[str, str] = {}
         staged = []
         for entry in body.get("entry") or []:
@@ -359,3 +375,233 @@ async def test_seeder_and_cross_client_write_invalidates_only_updated_dataset_ca
                 },
             )
             assert r_demo.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_seeder_preserves_intra_bundle_references_and_is_idempotent_across_reruns(tmp_path: Any) -> None:
+    """Verifies PR #1 review fixes:
+    1. `--bundle-file` imports rewrite intra-bundle references (`fullUrl`, `ResourceType/id`, `urn:uuid:id`)
+       consistently without breaking `MedicationRequest -> Medication` / `Encounter` or `DiagnosticReport -> Observation`.
+    2. Re-running `seed_persona_to_hapi` reuses existing datasets (`clinical_resources_seeded == 0`), preserves
+       updated cross-client links & external SHL links on `MasterPatient.link[]`, and adopts unlinked partial stubs.
+    """
+    bundle_path = tmp_path / "imported_visit.json"
+    bundle_path.write_text(
+        json.dumps(
+            {
+                "resourceType": "Bundle",
+                "type": "collection",
+                "entry": [
+                    {
+                        "fullUrl": "urn:uuid:imp-pat-1",
+                        "resource": {
+                            "resourceType": "Patient",
+                            "id": "imp-pat-1",
+                            "name": [{"given": ["Alex"], "family": "Johnson"}],
+                        },
+                    },
+                    {
+                        "fullUrl": "urn:uuid:imp-med-1",
+                        "resource": {
+                            "resourceType": "Medication",
+                            "id": "imp-med-1",
+                            "code": {"text": "Cefpodoxime 200 MG Oral Tablet"},
+                        },
+                    },
+                    {
+                        "fullUrl": "urn:uuid:imp-enc-1",
+                        "resource": {
+                            "resourceType": "Encounter",
+                            "id": "imp-enc-1",
+                            "status": "finished",
+                            "class": {"code": "AMB"},
+                            "subject": {"reference": "urn:uuid:imp-pat-1"},
+                        },
+                    },
+                    {
+                        "fullUrl": "urn:uuid:imp-mreq-1",
+                        "resource": {
+                            "resourceType": "MedicationRequest",
+                            "id": "imp-mreq-1",
+                            "status": "active",
+                            "intent": "order",
+                            "subject": {"reference": "Patient/imp-pat-1"},
+                            "medicationReference": {"reference": "urn:uuid:imp-med-1"},
+                            "encounter": {"reference": "Encounter/imp-enc-1"},
+                        },
+                    },
+                    {
+                        "fullUrl": "urn:uuid:imp-obs-1",
+                        "resource": {
+                            "resourceType": "Observation",
+                            "id": "imp-obs-1",
+                            "status": "final",
+                            "code": {"text": "WBC"},
+                            "encounter": {"reference": "urn:uuid:imp-enc-1"},
+                        },
+                    },
+                    {
+                        "fullUrl": "urn:uuid:imp-dr-1",
+                        "resource": {
+                            "resourceType": "DiagnosticReport",
+                            "id": "imp-dr-1",
+                            "status": "final",
+                            "code": {"text": "CBC Panel"},
+                            "result": [{"reference": "Observation/imp-obs-1"}],
+                        },
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    hapi_app = _build_in_memory_hapi_and_jwt_proxy()
+    alex_jwt = _make_jwt("kc-alex-sub-idemp")
+    alex_headers = {"Authorization": f"Bearer {alex_jwt}"}
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=hapi_app), base_url="http://fhir-auth:8080"
+    ) as fhir_client:
+        seed1 = await seed_persona_to_hapi(
+            fhir_base_url="http://fhir-auth:8080/fhir",
+            keycloak_sub="kc-alex-sub-idemp",
+            persona="alex",
+            bearer_token=alex_jwt,
+            extra_bundle_files=[bundle_path],
+            http_client=fhir_client,
+        )
+        assert len(seed1["dataset_references"]) == 5
+        imported_pat_ref = seed1["dataset_references"][-1]
+        imp_pid = imported_pat_ref.split("/", 1)[1]
+
+        imp_ev = await fhir_client.get(f"/fhir/Patient/{imp_pid}/$everything", headers=alex_headers)
+        assert imp_ev.status_code == 200
+        # `$everything` matches patient-compartment resources; fetch Medication directly from the stored MedicationRequest ref!
+        mreq = next(
+            e["resource"]
+            for e in imp_ev.json()["entry"]
+            if e["resource"]["resourceType"] == "MedicationRequest"
+        )
+        med_ref = mreq["medicationReference"]["reference"]
+        enc_ref = mreq["encounter"]["reference"]
+        assert med_ref.startswith("Medication/")
+        assert enc_ref.startswith("Encounter/")
+
+        med_res = await fhir_client.get(f"/fhir/{med_ref}", headers=alex_headers)
+        assert med_res.status_code == 200
+        assert med_res.json()["code"]["text"] == "Cefpodoxime 200 MG Oral Tablet"
+        assert "subject" not in med_res.json()
+
+        enc_res = await fhir_client.get(f"/fhir/{enc_ref}", headers=alex_headers)
+        assert enc_res.status_code == 200
+        assert enc_res.json()["subject"]["reference"] == imported_pat_ref
+
+        dr = next(
+            e["resource"]
+            for e in imp_ev.json()["entry"]
+            if e["resource"]["resourceType"] == "DiagnosticReport"
+        )
+        obs_ref = dr["result"][0]["reference"]
+        assert obs_ref.startswith("Observation/")
+        obs_res = await fhir_client.get(f"/fhir/{obs_ref}", headers=alex_headers)
+        assert obs_res.status_code == 200
+        assert obs_res.json()["encounter"]["reference"] == enc_ref
+
+        # Simulate a cross-client updated My Story dataset AND an external SHL/IPS dataset link on MasterPatient
+        updated_story_pat = await fhir_client.post(
+            "/fhir/Patient",
+            headers=alex_headers,
+            json={
+                "resourceType": "Patient",
+                "meta": {
+                    "source": "http://localhost:4000",
+                    "tag": [
+                        {"system": CATEGORY_SYSTEM, "code": "patient-story"},
+                        {"system": METHOD_SYSTEM, "code": "patient-story-form"},
+                        {"system": SOURCE_NAME_SYSTEM, "code": "My Story"},
+                    ],
+                },
+                "name": [{"given": ["Alex"], "family": "Johnson"}],
+            },
+        )
+        assert updated_story_pat.status_code == 200
+        updated_story_ref = f"Patient/{updated_story_pat.json()['id']}"
+
+        shl_pat = await fhir_client.post(
+            "/fhir/Patient",
+            headers=alex_headers,
+            json={
+                "resourceType": "Patient",
+                "meta": {
+                    "source": "https://shl.example.org/bundle-9",
+                    "tag": [
+                        {"system": CATEGORY_SYSTEM, "code": "ips-shlink"},
+                        {"system": METHOD_SYSTEM, "code": "shlink-qr"},
+                        {"system": SOURCE_NAME_SYSTEM, "code": "SHL Import"},
+                    ],
+                },
+                "name": [{"given": ["Alex"], "family": "Johnson"}],
+            },
+        )
+        assert shl_pat.status_code == 200
+        shl_ref = f"Patient/{shl_pat.json()['id']}"
+
+        master_id = seed1["master_patient_id"]
+        master_cur = (await fhir_client.get(f"/fhir/Patient/{master_id}", headers=alex_headers)).json()
+        new_links = [
+            {"other": {"reference": ref}, "type": "seealso"}
+            for ref in [*seed1["dataset_references"][:3], updated_story_ref, imported_pat_ref, shl_ref]
+        ]
+        master_cur["link"] = new_links
+        put_resp = await fhir_client.put(f"/fhir/Patient/{master_id}", headers=alex_headers, json=master_cur)
+        assert put_resp.status_code == 200
+
+        tx_before_rerun = hapi_app.state.tx_state["tx_posts"]
+        seed2 = await seed_persona_to_hapi(
+            fhir_base_url="http://fhir-auth:8080/fhir",
+            keycloak_sub="kc-alex-sub-idemp",
+            persona="alex",
+            bearer_token=alex_jwt,
+            extra_bundle_files=[bundle_path],
+            http_client=fhir_client,
+        )
+        assert hapi_app.state.tx_state["tx_posts"] == tx_before_rerun
+        assert seed2["clinical_resources_seeded"] == 0
+        assert updated_story_ref in seed2["dataset_references"]
+
+        master_after = (await fhir_client.get(f"/fhir/Patient/{master_id}", headers=alex_headers)).json()
+        after_refs = [lnk["other"]["reference"] for lnk in master_after["link"]]
+        assert updated_story_ref in after_refs
+        assert shl_ref in after_refs
+        assert len(after_refs) == 6
+
+        # Simulate partial failure recovery: pre-create an unlinked Leo Pulmonary stub carrying SEED_DATASET_IDENTIFIER_SYSTEM
+        leo_jwt = _make_jwt("kc-leo-stub-sub")
+        leo_headers = {"Authorization": f"Bearer {leo_jwt}"}
+        leo_stub = await fhir_client.post(
+            "/fhir/Patient",
+            headers=leo_headers,
+            json={
+                "resourceType": "Patient",
+                "identifier": [
+                    {
+                        "system": SEED_DATASET_IDENTIFIER_SYSTEM,
+                        "value": "kc-leo-stub-sub::provider-health-record::provider-health-record-sof::https://fhir.seattlechildrens.example.org/r4",
+                    }
+                ],
+                "name": [{"given": ["Leo"], "family": "Johnson"}],
+            },
+        )
+        assert leo_stub.status_code == 200
+        leo_stub_ref = f"Patient/{leo_stub.json()['id']}"
+
+        leo_seed = await seed_persona_to_hapi(
+            fhir_base_url="http://fhir-auth:8080/fhir",
+            keycloak_sub="kc-leo-stub-sub",
+            persona="leo",
+            bearer_token=leo_jwt,
+            http_client=fhir_client,
+        )
+        assert leo_seed["dataset_references"][0] == leo_stub_ref
+        assert len(leo_seed["dataset_references"]) == 3

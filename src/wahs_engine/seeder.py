@@ -15,7 +15,7 @@ import asyncio
 import copy
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import uuid
 
 import httpx
@@ -30,6 +30,53 @@ from .assembler import (
 )
 
 OBSERVATION_CATEGORY_SYSTEM = f"{WAHS_SYSTEM_BASE}/CodeSystem/observation-category"
+SEED_DATASET_IDENTIFIER_SYSTEM = f"{WAHS_SYSTEM_BASE}/CodeSystem/wahealthsummary-dataset-key"
+_NON_PATIENT_COMPARTMENT_TYPES = {
+    "Medication",
+    "Organization",
+    "Practitioner",
+    "PractitionerRole",
+    "Location",
+}
+
+
+def _extract_dataset_tuple(pat_res: Mapping[str, Any]) -> Optional[Tuple[str, str, str]]:
+    meta = pat_res.get("meta") if isinstance(pat_res.get("meta"), Mapping) else {}
+    src_uri = str(meta.get("source") or "").strip()
+    cat = ""
+    meth = ""
+    for tag in meta.get("tag") or []:
+        if not isinstance(tag, Mapping):
+            continue
+        sys_u = str(tag.get("system") or "").strip()
+        code = str(tag.get("code") or "").strip()
+        if sys_u == CATEGORY_SYSTEM and not cat:
+            cat = code
+        elif sys_u == METHOD_SYSTEM and not meth:
+            meth = code
+    if cat or meth or src_uri:
+        return (cat, meth, src_uri)
+    return None
+
+
+def _rewrite_references(node: Any, ref_map: Mapping[str, str]) -> Any:
+    if isinstance(node, list):
+        return [_rewrite_references(item, ref_map) for item in node]
+    if isinstance(node, Mapping):
+        out: Dict[str, Any] = {}
+        for k, v in node.items():
+            if k == "reference" and isinstance(v, str):
+                raw_ref = v.strip()
+                mapped = ref_map.get(raw_ref)
+                if mapped is None and "/" in raw_ref:
+                    parts = raw_ref.rsplit("/", 2)
+                    if len(parts) == 3:
+                        mapped = ref_map.get(f"{parts[1]}/{parts[2]}")
+                out[k] = mapped if mapped is not None else v
+            else:
+                out[k] = _rewrite_references(v, ref_map)
+        return out
+    return node
 
 
 def _stamp_security_label(resource: Dict[str, Any], keycloak_sub: str) -> Dict[str, Any]:
@@ -461,6 +508,7 @@ async def seed_persona_to_hapi(
     bearer_token: str = "",
     extra_bundle_files: Sequence[Path] = (),
     http_client: Optional[httpx.AsyncClient] = None,
+    reseed: bool = False,
 ) -> Dict[str, Any]:
     """Idempotently seed a multi-source WAHS star-graph (`MasterPatient` + linked datasets) into HAPI R4."""
     base = fhir_base_url.rstrip("/")
@@ -470,21 +518,33 @@ async def seed_persona_to_hapi(
     datasets = list(spec["datasets"])
     for bpath in extra_bundle_files:
         raw_bundle = json.loads(Path(bpath).read_text(encoding="utf-8"))
-        ext_resources = [
-            e["resource"]
-            for e in (raw_bundle.get("entry") or [])
-            if isinstance(e, Mapping)
-            and isinstance(e.get("resource"), Mapping)
-            and e["resource"].get("resourceType") != "Patient"
-        ]
-        if ext_resources:
+        patient_refs: List[str] = []
+        ext_entries: List[Dict[str, Any]] = []
+        for e in raw_bundle.get("entry") or []:
+            if not isinstance(e, Mapping) or not isinstance(e.get("resource"), Mapping):
+                continue
+            res_map = e["resource"]
+            rt = str(res_map.get("resourceType") or "")
+            full_url = str(e.get("fullUrl") or "").strip()
+            rid = str(res_map.get("id") or "").strip()
+            if rt == "Patient":
+                if full_url:
+                    patient_refs.append(full_url)
+                if rid:
+                    patient_refs.append(f"Patient/{rid}")
+                    patient_refs.append(f"urn:uuid:{rid}")
+                continue
+            ext_entries.append({"fullUrl": full_url, "resource": dict(res_map)})
+        if ext_entries:
             datasets.append(
                 {
                     "category": "provider-health-record",
                     "method": "provider-health-record-file",
                     "source_uri": f"urn:wahealthsummary:bundle:{Path(bpath).stem}",
                     "source_name": Path(bpath).stem.replace("_", " ").title(),
-                    "resources": ext_resources,
+                    "entries": ext_entries,
+                    "patient_refs": patient_refs,
+                    "resources": [item["resource"] for item in ext_entries],
                 }
             )
 
@@ -509,14 +569,59 @@ async def seed_persona_to_hapi(
         existing_entries = search_resp.json().get("entry") or []
         existing_master = existing_entries[0]["resource"] if existing_entries else None
 
-        created_dataset_refs: List[str] = []
+        existing_links: List[Dict[str, Any]] = (
+            list(existing_master.get("link") or []) if existing_master else []
+        )
+        existing_linked_by_tuple: Dict[Tuple[str, str, str], str] = {}
+        link_tuple_by_ref: Dict[str, Tuple[str, str, str]] = {}
+        for lnk in existing_links:
+            other = lnk.get("other") if isinstance(lnk, Mapping) else None
+            ref = str((other.get("reference") if isinstance(other, Mapping) else "") or "").strip()
+            if not ref.startswith("Patient/"):
+                continue
+            pid = ref.split("/", 1)[1].strip()
+            if not pid:
+                continue
+            get_pat = await client.get(f"{base}/Patient/{pid}", headers=headers)
+            if get_pat.status_code == 404:
+                continue
+            get_pat.raise_for_status()
+            linked_pat = get_pat.json()
+            ds_tup = _extract_dataset_tuple(linked_pat)
+            if ds_tup is not None:
+                existing_linked_by_tuple.setdefault(ds_tup, ref)
+                link_tuple_by_ref[ref] = ds_tup
+
+        resolved_dataset_refs: List[str] = []
         total_resources = 0
 
         for ds in datasets:
+            ds_tuple = (ds["category"], ds["method"], ds["source_uri"])
+            ds_ident_val = f"{keycloak_sub}::{ds['category']}::{ds['method']}::{ds['source_uri']}"
+
+            if not reseed:
+                existing_ref = existing_linked_by_tuple.get(ds_tuple)
+                if existing_ref:
+                    resolved_dataset_refs.append(existing_ref)
+                    continue
+                stub_resp = await client.get(
+                    f"{base}/Patient",
+                    params={"identifier": f"{SEED_DATASET_IDENTIFIER_SYSTEM}|{ds_ident_val}"},
+                    headers=headers,
+                )
+                stub_resp.raise_for_status()
+                stub_entries = stub_resp.json().get("entry") or []
+                if stub_entries:
+                    stub_id = str((stub_entries[0].get("resource") or {}).get("id") or "").strip()
+                    if stub_id:
+                        resolved_dataset_refs.append(f"Patient/{stub_id}")
+                        continue
+
             pat_urn = f"urn:uuid:{uuid.uuid4()}"
             ds_patient = _stamp_security_label(
                 {
                     "resourceType": "Patient",
+                    "identifier": [{"system": SEED_DATASET_IDENTIFIER_SYSTEM, "value": ds_ident_val}],
                     "meta": {
                         "source": ds["source_uri"],
                         "tag": [
@@ -540,16 +645,43 @@ async def seed_persona_to_hapi(
                 }
             ]
 
-            for raw_res in ds["resources"]:
-                res = _stamp_security_label(dict(raw_res), keycloak_sub)
+            raw_entries = ds.get("entries") or [
+                {"fullUrl": "", "resource": r} for r in ds["resources"]
+            ]
+            ref_map: Dict[str, str] = {
+                p_ref: pat_urn for p_ref in (ds.get("patient_refs") or []) if p_ref
+            }
+            staged_entries: List[Tuple[str, Dict[str, Any]]] = []
+            for entry_item in raw_entries:
+                raw_res = copy.deepcopy(dict(entry_item["resource"]))
+                rt = str(raw_res["resourceType"])
+                orig_id = str(raw_res.pop("id", "") or "").strip()
+                orig_full_url = str(entry_item.get("fullUrl") or "").strip()
+                entry_urn = f"urn:uuid:{uuid.uuid4()}"
+                if orig_full_url:
+                    ref_map[orig_full_url] = entry_urn
+                if orig_id:
+                    ref_map[f"{rt}/{orig_id}"] = entry_urn
+                    ref_map[f"urn:uuid:{orig_id}"] = entry_urn
+                staged_entries.append((entry_urn, raw_res))
+
+            for entry_urn, raw_res in staged_entries:
+                rewritten = _rewrite_references(raw_res, ref_map)
+                res = _stamp_security_label(rewritten, keycloak_sub)
                 rt = str(res["resourceType"])
-                if rt in {"AllergyIntolerance", "Immunization"}:
+                if rt in _NON_PATIENT_COMPARTMENT_TYPES:
+                    pass
+                elif rt in {"AllergyIntolerance", "Immunization", "Claim", "ExplanationOfBenefit"} or (
+                    "patient" in res and "subject" not in res
+                ):
                     res["patient"] = {"reference": pat_urn}
+                elif rt == "Coverage" or ("beneficiary" in res and "subject" not in res):
+                    res["beneficiary"] = {"reference": pat_urn}
                 else:
                     res["subject"] = {"reference": pat_urn}
                 tx_entries.append(
                     {
-                        "fullUrl": f"urn:uuid:{uuid.uuid4()}",
+                        "fullUrl": entry_urn,
                         "resource": res,
                         "request": {"method": "POST", "url": rt},
                     }
@@ -572,8 +704,23 @@ async def seed_persona_to_hapi(
             )
             if not pat_loc:
                 raise RuntimeError(f"HAPI transaction did not return Patient location for {ds['source_name']}")
-            created_dataset_refs.append(pat_loc)
+            resolved_dataset_refs.append(pat_loc)
             total_resources += len(tx_entries) - 1
+
+        seeded_tuples = {(ds["category"], ds["method"], ds["source_uri"]) for ds in datasets}
+        merged_links: List[Dict[str, Any]] = [
+            {"other": {"reference": ref}, "type": "seealso"} for ref in resolved_dataset_refs
+        ]
+        seen_refs = set(resolved_dataset_refs)
+        for lnk in existing_links:
+            other = lnk.get("other") if isinstance(lnk, Mapping) else None
+            ref = str((other.get("reference") if isinstance(other, Mapping) else "") or "").strip()
+            if not ref or ref in seen_refs:
+                continue
+            if reseed and link_tuple_by_ref.get(ref) in seeded_tuples:
+                continue
+            merged_links.append(copy.deepcopy(dict(lnk)))
+            seen_refs.add(ref)
 
         master_payload = _stamp_security_label(
             {
@@ -583,17 +730,20 @@ async def seed_persona_to_hapi(
                 "gender": demo["gender"],
                 "birthDate": demo["birthDate"],
                 "telecom": [{"system": "email", "value": demo["email"]}],
-                "link": [{"other": {"reference": ref}, "type": "seealso"} for ref in created_dataset_refs],
+                "link": merged_links,
             },
             keycloak_sub,
         )
 
         if existing_master and existing_master.get("id"):
-            mid = existing_master["id"]
-            master_payload["id"] = mid
-            put_resp = await client.put(f"{base}/Patient/{mid}", headers=headers, json=master_payload)
-            put_resp.raise_for_status()
-            saved_master = put_resp.json()
+            if existing_links == merged_links:
+                saved_master = existing_master
+            else:
+                mid = existing_master["id"]
+                master_payload["id"] = mid
+                put_resp = await client.put(f"{base}/Patient/{mid}", headers=headers, json=master_payload)
+                put_resp.raise_for_status()
+                saved_master = put_resp.json()
         else:
             post_resp = await client.post(f"{base}/Patient", headers=headers, json=master_payload)
             post_resp.raise_for_status()
@@ -603,7 +753,7 @@ async def seed_persona_to_hapi(
             "persona": persona,
             "keycloak_sub": keycloak_sub,
             "master_patient_id": saved_master.get("id"),
-            "dataset_references": created_dataset_refs,
+            "dataset_references": resolved_dataset_refs,
             "clinical_resources_seeded": total_resources,
         }
     finally:
@@ -647,6 +797,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         default=[],
         help="Optional extra Synthea/Connectathon FHIR Bundle JSON file(s) to attach to Alex",
     )
+    parser.add_argument(
+        "--reseed",
+        action="store_true",
+        help="Re-create seeded datasets instead of reusing existing datasets on MasterPatient",
+    )
     args = parser.parse_args(argv)
 
     async def _run() -> List[Dict[str, Any]]:
@@ -660,6 +815,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     persona="alex",
                     bearer_token=args.bearer_token,
                     extra_bundle_files=extra_paths,
+                    reseed=args.reseed,
                 )
             )
         if args.persona in {"leo", "both"}:
@@ -669,6 +825,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     keycloak_sub=args.leo_sub,
                     persona="leo",
                     bearer_token=args.bearer_token,
+                    reseed=args.reseed,
                 )
             )
         return results
