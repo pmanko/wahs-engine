@@ -427,6 +427,19 @@ def _extract_ips_referenced_keys(ips_bundle: Mapping[str, Any]) -> Set[str]:
     return keys
 
 
+def _clone_context_for_request(
+    ctx: AssembledWahsContext,
+    *,
+    cache_hit: bool,
+) -> AssembledWahsContext:
+    """Return a per-request shallow clone with deep-copied mutable citation & notice state."""
+    cloned = copy.copy(ctx)
+    cloned.citation_map = copy.deepcopy(ctx.citation_map)
+    cloned.privacy_notices = list(ctx.privacy_notices)
+    cloned.cache_hit = cache_hit
+    return cloned
+
+
 class WAHSBundleAssembler:
     """Assembles, scopes, caches, and condenses multi-dataset WAHS patient charts via `fhir-auth`."""
 
@@ -700,10 +713,7 @@ class WAHSBundleAssembler:
             prefix_key = (identity.sub, datasets_fp, scope_hash)
             cached_ctx = self._prefix_cache.get(prefix_key)
             if cached_ctx is not None:
-                hit_copy = copy.copy(cached_ctx)
-                hit_copy.citation_map = copy.deepcopy(cached_ctx.citation_map)
-                hit_copy.cache_hit = True
-                return hit_copy
+                return _clone_context_for_request(cached_ctx, cache_hit=True)
 
             # 6. Fetch paginated `$everything` only for uncached / updated datasets
             pooled_entries: List[Dict[str, Any]] = [{"resource": master_pat}]
@@ -767,7 +777,6 @@ class WAHSBundleAssembler:
                 dataset_cache_hits=ds_hits,
                 dataset_fetches=ds_fetches,
             )
-            self._prefix_cache.put(prefix_key, assembled)
             return assembled
         finally:
             if owns_client:
@@ -803,10 +812,7 @@ class WAHSBundleAssembler:
         prefix_key = (verified_sub, datasets_fingerprint, scope_hash)
         cached = self._prefix_cache.get(prefix_key)
         if cached is not None:
-            hit_copy = copy.copy(cached)
-            hit_copy.citation_map = copy.deepcopy(cached.citation_map)
-            hit_copy.cache_hit = True
-            return hit_copy
+            return _clone_context_for_request(cached, cache_hit=True)
 
         overlay_fhir_entries, draft_block, draft_citations = _format_overlay_items(
             options.overlay_resources, authorized_patient_id
@@ -976,5 +982,5 @@ class WAHSBundleAssembler:
             dataset_cache_hits=dataset_cache_hits,
             dataset_fetches=dataset_fetches,
         )
-        self._prefix_cache.put(prefix_key, ctx)
-        return ctx
+        self._prefix_cache.put(prefix_key, _clone_context_for_request(ctx, cache_hit=False))
+        return _clone_context_for_request(ctx, cache_hit=False)

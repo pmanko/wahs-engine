@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import re
@@ -63,11 +64,13 @@ _OVERFLOW_TOOLS_SPEC: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "read_clinical_note",
-            "description": "Read the full deduplicated text of a clinical note (DocumentReference) by UUID or keyword.",
+            "description": "Read the deduplicated text of a clinical note (DocumentReference) by UUID or keyword, with optional offset/max_chars pagination.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "note_id_or_query": {"type": "string"},
+                    "offset": {"type": "integer"},
+                    "max_chars": {"type": "integer"},
                 },
                 "required": ["note_id_or_query"],
             },
@@ -330,26 +333,48 @@ def _execute_local_overflow_tool(
         return json.dumps(res, default=str), len(res.get("results") or [])
     if fn_name == "read_clinical_note":
         key = str(fn_args.get("note_id_or_query") or "")
+        offset = max(0, int(fn_args.get("offset") or 0))
         res = read_clinical_note(
             ctx.extracted,
             resource_uuid=key,
             sharing_posture=sharing_posture,
         )
-        if not res.get("results") and key:
+        matched_by_uuid = bool(res.get("results"))
+        if not matched_by_uuid and key:
             res = read_clinical_note(
                 ctx.extracted,
                 query=key,
                 sharing_posture=sharing_posture,
             )
-        # Trim giant full_text duplicates inside JSON tool payload so multiple notes fit cleanly
-        for note_item in res.get("results") or []:
-            if isinstance(note_item, dict):
-                note_item.pop("full_text", None)
-                txt = str(note_item.get("text") or "")
-                if len(txt) > 3200:
-                    note_item["text"] = txt[:3200] + " ...[truncated]"
+        results_list = [r for r in (res.get("results") or []) if isinstance(r, dict)]
+        raw_max_chars = fn_args.get("max_chars")
+        if raw_max_chars is not None:
+            max_chars = max(256, min(int(raw_max_chars), 24000))
+        else:
+            max_chars = 12000 if (matched_by_uuid and len(results_list) == 1) else 3200
+        # Drop duplicate full_text field and paginate via offset/max_chars when needed
+        for note_item in results_list:
+            note_item.pop("full_text", None)
+            txt = str(note_item.get("text") or "")
+            total_len = len(txt)
+            note_item["offset"] = min(offset, total_len)
+            note_item["total_chars"] = total_len
+            if offset >= total_len and total_len > 0:
+                note_item["text"] = ""
+                note_item["has_more"] = False
+            elif total_len - offset > max_chars:
+                end_pos = offset + max_chars
+                note_item["text"] = (
+                    txt[offset:end_pos]
+                    + f" ...[truncated at {end_pos}/{total_len} chars; call read_clinical_note with offset={end_pos} to continue]"
+                )
+                note_item["has_more"] = True
+                note_item["next_offset"] = end_pos
+            else:
+                note_item["text"] = txt[offset:]
+                note_item["has_more"] = False
         _annotate_tool_results_with_citations(ctx, res, default_resource_type="DocumentReference")
-        return json.dumps(res, default=str), len(res.get("results") or [])
+        return json.dumps(res, default=str), len(results_list)
     return json.dumps({"error": f"Unknown tool '{fn_name}'"}), 0
 
 
@@ -552,6 +577,8 @@ class SouthboundOpenAIClient:
         assemble_ms: float = 0.0,
     ) -> Dict[str, Any]:
         prep_t0 = time.perf_counter()
+        ctx = copy.copy(ctx)
+        ctx.citation_map = copy.deepcopy(ctx.citation_map)
         requested_model = (req.model or self.settings.default_model).strip()
         upstream_model = self.settings.resolve_upstream_model(requested_model)
         messages, kb_meta, overflow_recovered, note_rag_meta = prepare_upstream_messages(
@@ -625,7 +652,7 @@ class SouthboundOpenAIClient:
             if isinstance(body, Mapping):
                 _accumulate_timings(body)
 
-            max_tool_rounds = 2 if options.retrieval_strategy == "dynamic_fhir_tools" else 1
+            max_tool_rounds = 3 if options.retrieval_strategy == "dynamic_fhir_tools" else 1
             followup_msgs = list(messages)
             for round_idx in range(max_tool_rounds):
                 choice0 = ((body.get("choices") or [{}])[0]) if isinstance(body, Mapping) else {}
@@ -751,6 +778,55 @@ class SouthboundOpenAIClient:
         options: WahsRequestOptions,
         assemble_ms: float = 0.0,
     ) -> AsyncIterator[str]:
+        ctx = copy.copy(ctx)
+        ctx.citation_map = copy.deepcopy(ctx.citation_map)
+
+        if options.retrieval_strategy == "dynamic_fhir_tools":
+            completed = await self.complete(
+                ctx=ctx,
+                req=req.model_copy(update={"stream": False}),
+                options=options,
+                assemble_ms=assemble_ms,
+            )
+            completion_id = str(completed.get("id") or f"chatcmpl-wahs-{uuid.uuid4().hex[:12]}")
+            created = int(completed.get("created") or time.time())
+            requested_model = str(
+                completed.get("model") or (req.model or self.settings.default_model).strip()
+            )
+            content_text = str(
+                (((completed.get("choices") or [{}])[0]).get("message") or {}).get("content") or ""
+            )
+            role_chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": requested_model,
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
+            }
+            yield f"data: {json.dumps(role_chunk)}\n\n"
+            if content_text:
+                content_chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": requested_model,
+                    "choices": [{"index": 0, "delta": {"content": content_text}, "finish_reason": None}],
+                }
+                yield f"data: {json.dumps(content_chunk)}\n\n"
+            final_chunk: Dict[str, Any] = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": requested_model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "x_wahs": completed["x_wahs"],
+            }
+            if completed.get("usage"):
+                final_chunk["usage"] = completed["usage"]
+            yield f"data: {json.dumps(final_chunk)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
         prep_t0 = time.perf_counter()
         requested_model = (req.model or self.settings.default_model).strip()
         upstream_model = self.settings.resolve_upstream_model(requested_model)
