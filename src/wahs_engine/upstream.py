@@ -355,6 +355,7 @@ class SouthboundOpenAIClient:
             "temperature": req.temperature,
             "max_tokens": req.max_tokens or 1024,
             "stream": False,
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         if options.enable_overflow_tools and omitted_total > 0:
             payload["tools"] = _OVERFLOW_TOOLS_SPEC
@@ -367,9 +368,12 @@ class SouthboundOpenAIClient:
                 headers=self._headers(),
                 json=payload,
             )
-            if resp.status_code >= 400 and "tools" in payload:
-                # Graceful fallback for OpenAI-compatible servers/models that do not support `tools`
+            if resp.status_code in {400, 422} and (
+                "tools" in payload or "chat_template_kwargs" in payload
+            ):
+                # Graceful fallback for strict OpenAI servers that reject optional extensions
                 payload.pop("tools", None)
+                payload.pop("chat_template_kwargs", None)
                 resp = await client.post(
                     self.settings.upstream_chat_completions_url,
                     headers=self._headers(),
@@ -471,6 +475,7 @@ class SouthboundOpenAIClient:
             "temperature": req.temperature,
             "max_tokens": req.max_tokens or 1024,
             "stream": True,
+            "chat_template_kwargs": {"enable_thinking": False},
         }
 
         # Standard initial assistant role chunk (`@ai-sdk/openai-compatible` compatible)
@@ -487,42 +492,48 @@ class SouthboundOpenAIClient:
         owns_client = self._external_client is None
         client = self._external_client or httpx.AsyncClient(timeout=self.settings.llm_timeout_seconds)
         try:
-            async with client.stream(
-                "POST",
-                self.settings.upstream_chat_completions_url,
-                headers=self._headers(),
-                json=payload,
-            ) as resp:
-                resp.raise_for_status()
-                async for raw_line in resp.aiter_lines():
-                    line = raw_line.strip()
-                    if not line or not line.startswith("data:"):
+            active_payload = dict(payload)
+            for attempt in range(2):
+                async with client.stream(
+                    "POST",
+                    self.settings.upstream_chat_completions_url,
+                    headers=self._headers(),
+                    json=active_payload,
+                ) as resp:
+                    if resp.status_code in {400, 422} and attempt == 0 and "chat_template_kwargs" in active_payload:
+                        active_payload.pop("chat_template_kwargs", None)
                         continue
-                    data_str = line[5:].strip()
-                    if data_str == "[DONE]":
-                        break
-                    try:
-                        chunk_obj = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
-                    choice = ((chunk_obj.get("choices") or [{}])[0]) if isinstance(chunk_obj, Mapping) else {}
-                    delta = (choice.get("delta") or {}) if isinstance(choice, Mapping) else {}
-                    piece = stripper.feed(str(delta.get("content") or ""))
-                    if piece:
-                        out_chunk = {
-                            "id": completion_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": requested_model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {"content": piece},
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-                        yield f"data: {json.dumps(out_chunk)}\n\n"
+                    resp.raise_for_status()
+                    async for raw_line in resp.aiter_lines():
+                        line = raw_line.strip()
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data_str = line[5:].strip()
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            chunk_obj = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+                        choice = ((chunk_obj.get("choices") or [{}])[0]) if isinstance(chunk_obj, Mapping) else {}
+                        delta = (choice.get("delta") or {}) if isinstance(choice, Mapping) else {}
+                        piece = stripper.feed(str(delta.get("content") or ""))
+                        if piece:
+                            out_chunk = {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": requested_model,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"content": piece},
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                            yield f"data: {json.dumps(out_chunk)}\n\n"
+                    break
 
             tail = stripper.flush()
             if tail:
