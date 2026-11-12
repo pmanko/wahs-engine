@@ -27,6 +27,7 @@ dev = [
 
 [project.scripts]
 wahs-engine = "wahs_engine.app:main"
+wahs-seed-hapi = "wahs_engine.seeder:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

@@ -23,7 +23,11 @@ def _resolve_caller_identity(
     settings: WahsEngineSettings,
 ) -> Optional[VerifiedCallerIdentity]:
     raw_token = extract_bearer_token(request.headers)
-    if not raw_token:
+    if not raw_token or (
+        raw_token == "local-demo-token"
+        and settings.allow_local_bundle_mode
+        and options.fhir_bundle is not None
+    ):
         if settings.allow_local_bundle_mode and options.fhir_bundle is not None:
             return None
         # Trigger standard 401 via decode_and_bind_jwt
