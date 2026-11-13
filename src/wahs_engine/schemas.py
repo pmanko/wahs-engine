@@ -30,7 +30,7 @@ class WahsRequestOptions(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    target_budget_tokens: int = Field(default=8192, ge=512, le=131072)
+    target_budget_tokens: Optional[int] = Field(default=None, ge=512)
     sharing_posture: Literal["patient_self", "external_share"] = "patient_self"
     chart_scope: ChartScope = Field(default_factory=ChartScope)
     overlay_resources: List[Dict[str, Any]] = Field(default_factory=list)
@@ -39,6 +39,8 @@ class WahsRequestOptions(BaseModel):
     fhir_bundle: Optional[Dict[str, Any]] = None
     enable_kb: bool = True
     enable_overflow_tools: bool = True
+    refresh: bool = False
+    allow_partial_external_share: bool = False
     retrieval_strategy: Literal[
         "condensation_kb",
         "note_rag",

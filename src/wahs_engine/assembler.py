@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 from collections import OrderedDict
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 import hashlib
 import json
 import re
+import time
 from typing import Any, Dict, Generic, List, Mapping, Optional, Sequence, Set, Tuple, TypeVar
 from urllib.parse import urlsplit
 import uuid
@@ -24,9 +26,10 @@ from wahs_core import (
     extract_bundle,
 )
 
-from .config import WahsEngineSettings
+from .config import ModelSpec, WahsEngineSettings
 from .jwt_claims import VerifiedCallerIdentity
 from .schemas import ChartScope, WahsRequestOptions
+from .tokenizers_registry import get_exact_token_counter
 
 # Official CIRG WAHS CodeSystem URIs (matching `uwcirg/shl-ips` & `uwcirg/jwt-proxy`)
 WAHS_SYSTEM_BASE = "http://fhir.wahealthsummary.cirg.uw.edu"
@@ -76,24 +79,100 @@ V = TypeVar("V")
 
 
 class _BoundedLRUCache(Generic[K, V]):
-    def __init__(self, max_entries: int) -> None:
+    def __init__(self, max_entries: int, ttl_seconds: float = 1800.0) -> None:
         self._max = max(1, max_entries)
-        self._data: OrderedDict[K, V] = OrderedDict()
+        self._ttl = max(0.0, float(ttl_seconds))
+        self._data: OrderedDict[K, Tuple[float, V]] = OrderedDict()
 
     def get(self, key: K) -> Optional[V]:
         if key not in self._data:
             return None
+        expires_at, value = self._data[key]
+        if self._ttl > 0.0 and time.monotonic() >= expires_at:
+            del self._data[key]
+            return None
         self._data.move_to_end(key)
-        return self._data[key]
+        return value
 
     def put(self, key: K, value: V) -> None:
-        self._data[key] = value
+        expires_at = (time.monotonic() + self._ttl) if self._ttl > 0.0 else float("inf")
+        self._data[key] = (expires_at, value)
         self._data.move_to_end(key)
         while len(self._data) > self._max:
             self._data.popitem(last=False)
 
     def __len__(self) -> int:
         return len(self._data)
+
+
+def _parse_fhir_instant(ts: str) -> Tuple[int, float, str]:
+    """Parse an ISO-8601 / FHIR instant into a comparable UTC epoch tuple."""
+    raw = str(ts or "").strip()
+    if not raw:
+        return (0, 0.0, "")
+    norm = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+    try:
+        dt = datetime.fromisoformat(norm)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return (1, dt.timestamp(), raw)
+    except ValueError:
+        return (0, 0.0, raw)
+
+
+def derive_effective_chart_budget(
+    spec: ModelSpec,
+    options: WahsRequestOptions,
+    *,
+    system_prompt_header: str = WAHS_SYSTEM_PROMPT,
+) -> Tuple[int, Optional[str]]:
+    """Derive exact model-window-aware chart token budget (`at-most` semantics for request overrides)."""
+    counter = get_exact_token_counter(spec.tokenizer_family)
+    base_framing = counter(system_prompt_header) + 96
+    if (options.enable_kb and options.retrieval_strategy != "chart_only") or options.retrieval_strategy == "note_rag":
+        base_framing += 800
+    if options.enable_overflow_tools or options.retrieval_strategy == "dynamic_fhir_tools":
+        base_framing += 420
+
+    output_reserve = max(spec.default_max_output_tokens, min(4096, int(spec.context_window * 0.125)))
+    conversation_reserve = max(1024, min(16384, int(spec.context_window * 0.15)))
+    window_derived = spec.context_window - base_framing - output_reserve - conversation_reserve
+    if window_derived < 512:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Configured model context_window={spec.context_window} cannot fit required framing and "
+                f"reserves ({base_framing + output_reserve + conversation_reserve} tokens)."
+            ),
+        )
+
+    ceiling_cap = window_derived
+    clamp_reason = "context_window_derived"
+    if spec.chart_budget_ceiling is not None and spec.chart_budget_ceiling < ceiling_cap:
+        ceiling_cap = spec.chart_budget_ceiling
+        clamp_reason = "chart_budget_ceiling"
+
+    budget = ceiling_cap
+    if options.retrieval_strategy == "dynamic_fhir_tools" and budget > 2048:
+        budget = 2048
+        clamp_reason = "dynamic_fhir_tools_header"
+
+    if options.target_budget_tokens is not None:
+        req_b = int(options.target_budget_tokens)
+        if req_b <= budget:
+            budget = req_b
+            clamp_reason = "caller_target_budget_tokens"
+        else:
+            if options.retrieval_strategy == "dynamic_fhir_tools" and budget == 2048:
+                clamp_reason = "dynamic_fhir_tools_header"
+            elif spec.chart_budget_ceiling is not None and ceiling_cap == spec.chart_budget_ceiling and ceiling_cap < window_derived:
+                clamp_reason = "clamped_to_chart_budget_ceiling"
+            else:
+                clamp_reason = "clamped_to_context_window"
+
+    return budget, clamp_reason
 
 
 @dataclass(frozen=True)
@@ -105,6 +184,7 @@ class DatasetDescriptor:
     source: str
     source_name: str
     is_placeholder_patient: bool
+    has_version_stamp: bool = True
 
 
 @dataclass
@@ -127,6 +207,14 @@ class AssembledWahsContext:
     cache_hit: bool = False
     dataset_cache_hits: int = 0
     dataset_fetches: int = 0
+    budget_requested: Optional[int] = None
+    budget_effective: int = 0
+    context_window: int = 32768
+    chart_budget_ceiling: Optional[int] = 16384
+    clamp_reason: Optional[str] = None
+    tokenizer_family: str = "gemma4"
+    partial_fetch: bool = False
+    partial_datasets: List[Dict[str, Any]] = field(default_factory=list)
 
 
 def _canonical_sha256(obj: Any) -> str:
@@ -436,6 +524,7 @@ def _clone_context_for_request(
     cloned = copy.copy(ctx)
     cloned.citation_map = copy.deepcopy(ctx.citation_map)
     cloned.privacy_notices = list(ctx.privacy_notices)
+    cloned.partial_datasets = [dict(d) for d in ctx.partial_datasets]
     cloned.cache_hit = cache_hit
     return cloned
 
@@ -451,10 +540,10 @@ class WAHSBundleAssembler:
         self.settings = settings
         self._external_client = http_client
         self._dataset_cache: _BoundedLRUCache[Tuple[str, str, str], List[Dict[str, Any]]] = (
-            _BoundedLRUCache(settings.dataset_cache_max_entries)
+            _BoundedLRUCache(settings.dataset_cache_max_entries, ttl_seconds=settings.cache_ttl_seconds)
         )
         self._prefix_cache: _BoundedLRUCache[Tuple[str, str, str], AssembledWahsContext] = (
-            _BoundedLRUCache(settings.prefix_cache_max_entries)
+            _BoundedLRUCache(settings.prefix_cache_max_entries, ttl_seconds=settings.cache_ttl_seconds)
         )
 
     def _validate_overlay_budget(self, overlay_resources: Sequence[Mapping[str, Any]]) -> None:
@@ -506,15 +595,20 @@ class WAHSBundleAssembler:
         base_url: str,
         dataset_id: str,
         access_token: str,
-    ) -> List[Dict[str, Any]]:
+    ) -> Tuple[List[Dict[str, Any]], bool, Optional[str]]:
         url = f"{base_url}/Patient/{dataset_id}/$everything"
         params: Optional[Dict[str, str]] = {"_count": str(self.settings.everything_page_size)}
         collected: List[Dict[str, Any]] = []
         seen: Set[str] = set()
+        max_res = max(1, int(self.settings.max_everything_resources))
+        is_partial = False
+        partial_reason: Optional[str] = None
 
-        for _page in range(self.settings.max_everything_pages):
+        for _page in range(max(1, int(self.settings.max_everything_pages))):
             bundle = await self._fhir_get_json(client, url, access_token, params=params)
-            for entry in bundle.get("entry") or []:
+            entries = bundle.get("entry") or []
+            reached_res_cap_mid_page = False
+            for idx_e, entry in enumerate(entries):
                 res = entry.get("resource") if isinstance(entry, Mapping) else None
                 if not isinstance(res, dict):
                     continue
@@ -522,6 +616,11 @@ class WAHSBundleAssembler:
                 rid = str(res.get("id") or "")
                 dedup_key = f"{rt}/{rid}" if rid else uuid.uuid4().hex
                 if dedup_key not in seen:
+                    if len(collected) >= max_res:
+                        reached_res_cap_mid_page = True
+                        is_partial = True
+                        partial_reason = "max_everything_resources"
+                        break
                     seen.add(dedup_key)
                     collected.append(res)
 
@@ -530,21 +629,37 @@ class WAHSBundleAssembler:
                 if isinstance(link, Mapping) and link.get("relation") == "next":
                     next_url = str(link.get("url") or "").strip()
                     break
+
+            if reached_res_cap_mid_page:
+                break
+            if len(collected) >= max_res and next_url:
+                is_partial = True
+                partial_reason = "max_everything_resources"
+                break
             if not next_url:
                 break
             url = _rewrite_next_link_to_fhir_auth(base_url, next_url)
             params = None
+        else:
+            if next_url:
+                is_partial = True
+                partial_reason = "max_everything_pages"
 
-        return collected
+        return collected, is_partial, partial_reason
 
     async def assemble(
         self,
         *,
         options: WahsRequestOptions,
         identity: Optional[VerifiedCallerIdentity],
+        requested_model: Optional[str] = None,
+        force_refresh: bool = False,
     ) -> AssembledWahsContext:
         self._validate_overlay_budget(options.overlay_resources)
         scope = options.chart_scope
+        spec = self.settings.resolve_model_spec(requested_model)
+        budget_effective, clamp_reason = derive_effective_chart_budget(spec, options)
+        effective_refresh = bool(options.refresh or force_refresh)
 
         # Mode A: Explicit local/harness inline FHIR Bundle (strictly gated by WAHS_ALLOW_LOCAL_BUNDLE_MODE)
         if options.fhir_bundle is not None:
@@ -574,8 +689,15 @@ class WAHSBundleAssembler:
                 datasets_included=[{"dataset_id": pat_id, "source": "Inline Bundle", "category": "local"}],
                 datasets_fingerprint=datasets_fp,
                 options=options,
+                spec=spec,
+                budget_effective=budget_effective,
+                clamp_reason=clamp_reason,
                 dataset_cache_hits=0,
                 dataset_fetches=0,
+                cacheable=True,
+                force_refresh=effective_refresh,
+                partial_fetch=False,
+                partial_datasets=[],
             )
 
         # Mode B: Production zero-privilege `fhir-auth` star-graph assembly
@@ -588,7 +710,8 @@ class WAHSBundleAssembler:
         base = self.settings.fhir_auth_base_url.rstrip("/")
         owns_client = self._external_client is None
         client = self._external_client or httpx.AsyncClient(timeout=self.settings.fhir_timeout_seconds)
-        try:
+
+        async def _run_live_assembly() -> AssembledWahsContext:
             # 1. Live MasterPatient fetch through `fhir-auth` (cryptographically verifies JWT + security label!)
             if options.master_patient_id:
                 if not _SAFE_ID_RE.match(options.master_patient_id):
@@ -635,14 +758,20 @@ class WAHSBundleAssembler:
             # 3. Fetch dataset Patient stubs in parallel via `fhir-auth` to read live `meta.lastUpdated` & WAHS tags
             raw_descriptors: List[DatasetDescriptor] = []
             if linked_ids:
-                stub_tasks = [
-                    self._fhir_get_json(client, f"{base}/Patient/{ds_id}", identity.raw_token)
-                    for ds_id in linked_ids
-                ]
-                stub_results = await asyncio.gather(*stub_tasks)
+                stub_sem = asyncio.Semaphore(max(1, int(self.settings.everything_concurrency)))
+
+                async def _get_stub(ds_id: str) -> Dict[str, Any]:
+                    async with stub_sem:
+                        return await self._fhir_get_json(
+                            client, f"{base}/Patient/{ds_id}", identity.raw_token
+                        )
+
+                stub_results = await asyncio.gather(*(_get_stub(ds_id) for ds_id in linked_ids))
                 for ds_id, ds_pat in zip(linked_ids, stub_results):
                     meta = ds_pat.get("meta") if isinstance(ds_pat.get("meta"), Mapping) else {}
-                    last_upd = str(meta.get("lastUpdated") or meta.get("versionId") or "v1")
+                    raw_stamp = str(meta.get("lastUpdated") or meta.get("versionId") or "").strip()
+                    has_stamp = bool(raw_stamp)
+                    last_upd = raw_stamp if has_stamp else f"ephemeral-{uuid.uuid4().hex}"
                     cat, meth, src, src_name, is_ph = _extract_patient_tags(ds_pat)
                     raw_descriptors.append(
                         DatasetDescriptor(
@@ -653,15 +782,20 @@ class WAHSBundleAssembler:
                             source=src,
                             source_name=src_name,
                             is_placeholder_patient=is_ph,
+                            has_version_stamp=has_stamp,
                         )
                     )
 
-            # 4. Deduplicate collections sharing `(category, method, source)` keeping newest `last_updated`
+            # 4. Deduplicate collections sharing `(category, method, source)` keeping newest parsed UTC instant
             grouped: Dict[Tuple[str, str, str], List[DatasetDescriptor]] = {}
             for desc in raw_descriptors:
                 grouped.setdefault((desc.category, desc.method, desc.source), []).append(desc)
             deduped_descriptors: List[DatasetDescriptor] = [
-                 sorted(group, key=lambda d: d.last_updated, reverse=True)[0]
+                sorted(
+                    group,
+                    key=lambda d: (_parse_fhir_instant(d.last_updated), d.dataset_id),
+                    reverse=True,
+                )[0]
                 for group in grouped.values()
             ]
 
@@ -672,6 +806,7 @@ class WAHSBundleAssembler:
 
             ips_allowed_keys: Optional[Set[str]] = None
             ips_version_marker = ""
+            ips_has_stamp = True
             if scope.ips_bundle_id:
                 if not _SAFE_ID_RE.match(scope.ips_bundle_id):
                     raise HTTPException(status_code=400, detail="Invalid ips_bundle_id format.")
@@ -680,14 +815,21 @@ class WAHSBundleAssembler:
                 )
                 ips_allowed_keys = _extract_ips_referenced_keys(ips_bundle)
                 ips_meta = ips_bundle.get("meta") if isinstance(ips_bundle.get("meta"), Mapping) else {}
-                ips_version_marker = str(ips_meta.get("lastUpdated") or scope.ips_bundle_id)
+                raw_ips_ver = str(ips_meta.get("lastUpdated") or ips_meta.get("versionId") or "").strip()
+                ips_has_stamp = bool(raw_ips_ver)
+                ips_version_marker = raw_ips_ver if ips_has_stamp else f"ephemeral-{uuid.uuid4().hex}"
 
-            master_last_updated = str(
-                ((master_pat.get("meta") or {}) if isinstance(master_pat.get("meta"), Mapping) else {}).get(
-                    "lastUpdated"
-                )
-                or "v1"
+            master_meta = master_pat.get("meta") if isinstance(master_pat.get("meta"), Mapping) else {}
+            raw_master_ver = str(master_meta.get("lastUpdated") or master_meta.get("versionId") or "").strip()
+            master_has_stamp = bool(raw_master_ver)
+            master_last_updated = raw_master_ver if master_has_stamp else f"ephemeral-{uuid.uuid4().hex}"
+
+            cacheable = (
+                master_has_stamp
+                and ips_has_stamp
+                and all(d.has_version_stamp for d in included_descriptors)
             )
+
             datasets_fp = _canonical_sha256(
                 {
                     "master": (master_id, master_last_updated),
@@ -695,51 +837,66 @@ class WAHSBundleAssembler:
                     "ips": ips_version_marker,
                 }
             )
-            effective_budget = (
-                min(options.target_budget_tokens, 2048)
-                if options.retrieval_strategy == "dynamic_fhir_tools"
-                else options.target_budget_tokens
-            )
             scope_hash = _canonical_sha256(
                 {
                     "scope": scope.model_dump(),
                     "overlays": options.overlay_resources,
-                    "budget": effective_budget,
+                    "budget": budget_effective,
                     "posture": options.sharing_posture,
+                    "tokenizer_family": spec.tokenizer_family,
                 }
             )
 
-            # Check prefix cache BEFORE fetching `$everything` if all dataset `last_updated` fingerprints match!
+            # Check prefix cache BEFORE fetching `$everything` when all timestamps are present & refresh not forced
             prefix_key = (identity.sub, datasets_fp, scope_hash)
-            cached_ctx = self._prefix_cache.get(prefix_key)
-            if cached_ctx is not None:
-                return _clone_context_for_request(cached_ctx, cache_hit=True)
+            if cacheable and not effective_refresh:
+                cached_ctx = self._prefix_cache.get(prefix_key)
+                if cached_ctx is not None:
+                    return _clone_context_for_request(cached_ctx, cache_hit=True)
 
-            # 6. Fetch paginated `$everything` only for uncached / updated datasets
+            # 6. Fetch paginated `$everything` concurrently with semaphore bound for uncached / stale datasets
             pooled_entries: List[Dict[str, Any]] = [{"resource": master_pat}]
             seen_resource_keys: Set[str] = {f"Patient/{master_id}"}
             allowed_refs: Set[str] = {master_id, *(d.dataset_id for d in deduped_descriptors)}
-            ds_hits = 0
-            ds_fetches = 0
+            fetch_sem = asyncio.Semaphore(max(1, int(self.settings.everything_concurrency)))
 
-            for desc in included_descriptors:
+            async def _fetch_dataset(
+                desc: DatasetDescriptor,
+            ) -> Tuple[DatasetDescriptor, List[Dict[str, Any]], bool, Optional[str], int, int]:
                 ds_cache_key = (identity.sub, desc.dataset_id, desc.last_updated)
-                cached_resources = self._dataset_cache.get(ds_cache_key)
-                if cached_resources is not None:
-                    ds_hits += 1
-                    ds_resources = cached_resources
-                else:
-                    ds_fetches += 1
-                    raw_ds_resources = await self._fetch_paginated_everything(
+                if cacheable and desc.has_version_stamp and not effective_refresh:
+                    cached_resources = self._dataset_cache.get(ds_cache_key)
+                    if cached_resources is not None:
+                        return desc, cached_resources, False, None, 1, 0
+
+                async with fetch_sem:
+                    raw_ds_resources, is_partial, partial_reason = await self._fetch_paginated_everything(
                         client, base, desc.dataset_id, identity.raw_token
                     )
-                    ds_resources = [
-                        _stamp_resource_source_tag(r, desc)
-                        for r in raw_ds_resources
-                        if not (r.get("resourceType") == "Patient" and r.get("id") in allowed_refs)
-                    ]
+                ds_resources = [
+                    _stamp_resource_source_tag(r, desc)
+                    for r in raw_ds_resources
+                    if not (r.get("resourceType") == "Patient" and r.get("id") in allowed_refs)
+                ]
+                if not is_partial and desc.has_version_stamp:
                     self._dataset_cache.put(ds_cache_key, ds_resources)
+                return desc, ds_resources, is_partial, partial_reason, 0, 1
 
+            ds_results = await asyncio.gather(*(_fetch_dataset(desc) for desc in included_descriptors))
+            ds_hits = sum(item[4] for item in ds_results)
+            ds_fetches = sum(item[5] for item in ds_results)
+            partial_datasets: List[Dict[str, Any]] = []
+
+            for desc, ds_resources, is_partial, partial_reason, _, _ in ds_results:
+                if is_partial:
+                    partial_datasets.append(
+                        {
+                            "dataset_id": desc.dataset_id,
+                            "source": desc.source_name,
+                            "reason": partial_reason or "truncated",
+                            "collected_resources": len(ds_resources),
+                        }
+                    )
                 for res in ds_resources:
                     rt = str(res.get("resourceType") or "")
                     rid = str(res.get("id") or "")
@@ -751,13 +908,27 @@ class WAHSBundleAssembler:
                         seen_resource_keys.add(rkey)
                         pooled_entries.append({"resource": res})
 
+            partial_fetch = bool(partial_datasets)
+            if (
+                partial_fetch
+                and options.sharing_posture == "external_share"
+                and not options.allow_partial_external_share
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "External share rejected because patient chart fetch was truncated "
+                        "(allow_partial_external_share=false)."
+                    ),
+                )
+
             pooled_bundle = {
                 "resourceType": "Bundle",
                 "id": f"wahs-pooled-{master_id}",
                 "type": "collection",
                 "entry": pooled_entries,
             }
-            assembled = self._scope_and_condense_bundle(
+            return self._scope_and_condense_bundle(
                 raw_bundle=pooled_bundle,
                 verified_sub=identity.sub,
                 authorized_patient_id=master_id,
@@ -774,10 +945,30 @@ class WAHSBundleAssembler:
                 ],
                 datasets_fingerprint=datasets_fp,
                 options=options,
+                spec=spec,
+                budget_effective=budget_effective,
+                clamp_reason=clamp_reason,
                 dataset_cache_hits=ds_hits,
                 dataset_fetches=ds_fetches,
+                cacheable=(cacheable and not partial_fetch),
+                force_refresh=effective_refresh,
+                partial_fetch=partial_fetch,
+                partial_datasets=partial_datasets,
             )
-            return assembled
+
+        try:
+            return await asyncio.wait_for(
+                _run_live_assembly(),
+                timeout=max(1.0, float(self.settings.assembly_timeout_seconds)),
+            )
+        except asyncio.TimeoutError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    f"FHIR chart assembly timed out after "
+                    f"{self.settings.assembly_timeout_seconds:.1f}s."
+                ),
+            ) from exc
         finally:
             if owns_client:
                 await client.aclose()
@@ -792,27 +983,31 @@ class WAHSBundleAssembler:
         datasets_included: List[Dict[str, str]],
         datasets_fingerprint: str,
         options: WahsRequestOptions,
+        spec: ModelSpec,
+        budget_effective: int,
+        clamp_reason: Optional[str],
         dataset_cache_hits: int,
         dataset_fetches: int,
+        cacheable: bool = True,
+        force_refresh: bool = False,
+        partial_fetch: bool = False,
+        partial_datasets: Optional[List[Dict[str, Any]]] = None,
     ) -> AssembledWahsContext:
         scope = options.chart_scope
-        effective_budget = (
-            min(options.target_budget_tokens, 2048)
-            if options.retrieval_strategy == "dynamic_fhir_tools"
-            else options.target_budget_tokens
-        )
         scope_hash = _canonical_sha256(
             {
                 "scope": scope.model_dump(),
                 "overlays": options.overlay_resources,
-                "budget": effective_budget,
+                "budget": budget_effective,
                 "posture": options.sharing_posture,
+                "tokenizer_family": spec.tokenizer_family,
             }
         )
         prefix_key = (verified_sub, datasets_fingerprint, scope_hash)
-        cached = self._prefix_cache.get(prefix_key)
-        if cached is not None:
-            return _clone_context_for_request(cached, cache_hit=True)
+        if cacheable and not force_refresh and not partial_fetch:
+            cached = self._prefix_cache.get(prefix_key)
+            if cached is not None:
+                return _clone_context_for_request(cached, cache_hit=True)
 
         overlay_fhir_entries, draft_block, draft_citations = _format_overlay_items(
             options.overlay_resources, authorized_patient_id
@@ -894,12 +1089,49 @@ class WAHSBundleAssembler:
             allowed_patient_refs=allowed_patient_refs,
         )
 
-        extracted = extract_bundle(guarded_bundle)
-        condensed = condense_bundle_to_budget(
-            extracted,
-            target_tokens=effective_budget,
-            sharing_posture=options.sharing_posture,
+        exact_counter = get_exact_token_counter(spec.tokenizer_family)
+        partial_list = list(partial_datasets or [])
+        partial_warning = (
+            "[PARTIAL RECORD WARNING: Dataset pagination/resource ceiling reached before full retrieval; record may be incomplete.]"
+            if partial_fetch
+            else ""
         )
+        warning_reserve = (exact_counter(partial_warning) + 4) if partial_fetch else 0
+        condense_target = max(512, budget_effective - warning_reserve)
+
+        extracted = extract_bundle(guarded_bundle)
+        try:
+            condensed = condense_bundle_to_budget(
+                extracted,
+                target_tokens=condense_target,
+                sharing_posture=options.sharing_posture,
+                token_counter=exact_counter,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        if partial_fetch:
+            updated_manifest = dict(condensed.completeness_manifest)
+            updated_manifest["partial_fetch"] = True
+            updated_manifest["partial_datasets"] = partial_list
+            updated_chart_text = f"{condensed.chart_text.rstrip()}\n{partial_warning}"
+            updated_tokens = exact_counter(updated_chart_text)
+            updated_stats = dict(condensed.compression_stats)
+            updated_stats["actual_tokens"] = updated_tokens
+            updated_stats["target_tokens"] = budget_effective
+            updated_stats["budget_utilization"] = round(updated_tokens / budget_effective, 3)
+            condensed = replace(
+                condensed,
+                target_tokens=budget_effective,
+                actual_tokens=updated_tokens,
+                chart_text=updated_chart_text,
+                completeness_manifest=updated_manifest,
+                compression_stats=updated_stats,
+            )
+        else:
+            updated_manifest = dict(condensed.completeness_manifest)
+            updated_manifest.setdefault("partial_fetch", False)
+            condensed = replace(condensed, completeness_manifest=updated_manifest)
 
         # Build rich `[N] -> source pill` citation map
         source_by_uuid: Dict[str, Tuple[str, str]] = {}
@@ -949,6 +1181,12 @@ class WAHSBundleAssembler:
                 f"{len(sensitive_items)} SDOH/privacy-sensitive item(s) present in record; review before external sharing."
             )
 
+        if partial_fetch:
+            ds_names = ", ".join(str(p.get("source") or p.get("dataset_id") or "") for p in partial_list)
+            privacy_notices.append(
+                f"Partial record warning: FHIR fetch reached configured limit on {ds_names or 'one or more datasets'}; answer completeness cannot be guaranteed."
+            )
+
         system_prompt = (
             f"{WAHS_SYSTEM_PROMPT}\n\n"
             f"=== ACTIVE PATIENT: {extracted.patient_name} (DOB: {extracted.birth_date or 'unknown'}) ===\n"
@@ -981,6 +1219,15 @@ class WAHSBundleAssembler:
             cache_hit=False,
             dataset_cache_hits=dataset_cache_hits,
             dataset_fetches=dataset_fetches,
+            budget_requested=options.target_budget_tokens,
+            budget_effective=budget_effective,
+            context_window=spec.context_window,
+            chart_budget_ceiling=spec.chart_budget_ceiling,
+            clamp_reason=clamp_reason,
+            tokenizer_family=spec.tokenizer_family,
+            partial_fetch=partial_fetch,
+            partial_datasets=partial_list,
         )
-        self._prefix_cache.put(prefix_key, _clone_context_for_request(ctx, cache_hit=False))
+        if cacheable and not partial_fetch:
+            self._prefix_cache.put(prefix_key, _clone_context_for_request(ctx, cache_hit=False))
         return _clone_context_for_request(ctx, cache_hit=False)

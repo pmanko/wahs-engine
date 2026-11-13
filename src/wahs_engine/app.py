@@ -93,8 +93,15 @@ def create_app(
     ) -> Dict[str, Any]:
         options = req.resolved_wahs_options()
         identity = _resolve_caller_identity(request, options, cfg)
-        ctx = await assembler.assemble(options=options, identity=identity)
         requested_model = (req.model or cfg.default_model).strip()
+        spec = cfg.resolve_model_spec(requested_model)
+        force_refresh = "no-cache" in request.headers.get("cache-control", "").lower()
+        ctx = await assembler.assemble(
+            options=options,
+            identity=identity,
+            requested_model=requested_model,
+            force_refresh=force_refresh,
+        )
         return {
             "patient_id": ctx.patient_id,
             "patient_name": ctx.patient_name,
@@ -105,7 +112,7 @@ def create_app(
             "x_wahs": build_x_wahs_envelope(
                 ctx=ctx,
                 requested_model=requested_model,
-                upstream_model=cfg.resolve_upstream_model(requested_model),
+                upstream_model=spec.upstream_model,
                 options=options,
                 engine_version=cfg.engine_version,
             ),
@@ -121,7 +128,14 @@ def create_app(
         t0 = time.perf_counter()
         options = req.resolved_wahs_options()
         identity = _resolve_caller_identity(request, options, cfg)
-        ctx = await assembler.assemble(options=options, identity=identity)
+        requested_model = (req.model or cfg.default_model).strip()
+        force_refresh = "no-cache" in request.headers.get("cache-control", "").lower()
+        ctx = await assembler.assemble(
+            options=options,
+            identity=identity,
+            requested_model=requested_model,
+            force_refresh=force_refresh,
+        )
         assemble_ms = round((time.perf_counter() - t0) * 1000.0, 2)
 
         if req.stream:

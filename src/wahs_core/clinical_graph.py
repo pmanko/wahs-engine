@@ -1710,6 +1710,7 @@ def build_wahs_hub_enrichment_block(
     max_tokens: int = 800,
     *,
     sharing_posture: str = "patient_self",
+    token_counter: Optional[Callable[[str], int]] = None,
 ) -> HubEnrichmentResult:
     """Build the bounded Med Agent Hub pre-generation context enrichment block.
 
@@ -1865,12 +1866,13 @@ def build_wahs_hub_enrichment_block(
             sections.append("- Standard clinical reconciliation rules apply.")
         return "\n".join(sections)
 
+    count_tokens = token_counter or estimate_tokens_local
     cur_rec = list(recovered_lines)
     cur_sub = list(subgraph_lines)
     cur_kb = list(kb_lines)
 
     block_text = _render_block(cur_rec, cur_sub, cur_kb)
-    while estimate_tokens_local(block_text) > max_tokens:
+    while count_tokens(block_text) > max_tokens:
         if len(cur_sub) > 3:
             cur_sub.pop()
         elif len(cur_kb) > 1:
@@ -1884,13 +1886,22 @@ def build_wahs_hub_enrichment_block(
         elif len(cur_rec) > 1:
             cur_rec.pop()
         else:
-            # Hard character truncation safeguard
-            max_chars = max(256, max_tokens * 3)
-            block_text = block_text[:max_chars].rsplit("\n", 1)[0]
+            # Hard character truncation safeguard that respects custom exact token_counter
+            lo, hi = 0, len(block_text)
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                cand = block_text[:mid].rsplit("\n", 1)[0] if mid < len(block_text) else block_text
+                if count_tokens(cand) <= max_tokens:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            block_text = block_text[:lo].rsplit("\n", 1)[0] if lo > 0 else ""
+            if count_tokens(block_text) > max_tokens and lo > 0:
+                block_text = block_text[:lo]
             break
         block_text = _render_block(cur_rec, cur_sub, cur_kb)
 
-    final_tokens = estimate_tokens_local(block_text)
+    final_tokens = count_tokens(block_text)
     max_cit_after = max_cit_before + len(cur_rec)
     rec_mappings: List[Dict[str, Any]] = []
     rec_line_re = re.compile(
