@@ -47,32 +47,31 @@ jobs:
             sleep 1
           done
 
-          docker run --rm --network none --user 65532:65532 \
+          docker run --rm -i --network none --user 65532:65532 \
             -e WAHS_ALLOW_LOCAL_BUNDLE_MODE=true \
             wahs-engine-ci \
-            python -c '
-import json
-from fastapi.testclient import TestClient
-from wahs_engine.app import create_app
+            python - <<'PY'
+          from fastapi.testclient import TestClient
+          from wahs_engine.app import create_app
 
-bundle = {
-    "resourceType": "Bundle",
-    "type": "collection",
-    "entry": [
-        {"resource": {"resourceType": "Patient", "id": "p-netnone", "name": [{"given": ["Aria"], "family": "Ng"}], "birthDate": "1974-08-21"}},
-        {"resource": {"resourceType": "MedicationRequest", "id": "m-netnone", "status": "active", "authoredOn": "2026-10-01", "medicationCodeableConcept": {"text": "Warfarin 5 MG Oral Tablet"}}},
-    ],
-}
-with TestClient(create_app()) as client:
-    assert client.get("/healthz").status_code == 200
-    for model_id, expected_tok in (("wahs-12b-kb", "gemma4"), ("gpt-4o", "o200k_base")):
-        resp = client.post("/v1/wahs/context/preview", json={"model": model_id, "wahs": {"fhir_bundle": bundle}})
-        assert resp.status_code == 200, resp.text
-        cond = resp.json()["x_wahs"]["condensation"]
-        assert cond["tokenizer_family"] == expected_tok, cond
-        assert cond["actual_tokens"] > 0
-print("air-gapped --network none tokenizer smoke OK")
-'
+          bundle = {
+              "resourceType": "Bundle",
+              "type": "collection",
+              "entry": [
+                  {"resource": {"resourceType": "Patient", "id": "p-netnone", "name": [{"given": ["Aria"], "family": "Ng"}], "birthDate": "1974-08-21"}},
+                  {"resource": {"resourceType": "MedicationRequest", "id": "m-netnone", "status": "active", "authoredOn": "2026-10-01", "medicationCodeableConcept": {"text": "Warfarin 5 MG Oral Tablet"}}},
+              ],
+          }
+          with TestClient(create_app()) as client:
+              assert client.get("/healthz").status_code == 200
+              for model_id, expected_tok in (("wahs-12b-kb", "gemma4"), ("gpt-4o", "o200k_base")):
+                  resp = client.post("/v1/wahs/context/preview", json={"model": model_id, "wahs": {"fhir_bundle": bundle}})
+                  assert resp.status_code == 200, resp.text
+                  cond = resp.json()["x_wahs"]["condensation"]
+                  assert cond["tokenizer_family"] == expected_tok, cond
+                  assert cond["actual_tokens"] > 0
+          print("air-gapped --network none tokenizer smoke OK")
+          PY
 
   live-hapi-jwt-proxy-integration:
     runs-on: ubuntu-latest
