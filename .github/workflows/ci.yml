@@ -30,17 +30,106 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build slim image
         run: docker build --build-arg WAHS_BUILD_REVISION="${GITHUB_SHA}" -t wahs-engine-ci .
-      - name: Verify non-root container starts and serves /healthz
+      - name: Verify non-root container starts and serves /healthz + air-gapped offline tokenizers (--network none)
         run: |
           docker run -d --name wahs-smoke -p 8080:8080 wahs-engine-ci
           for i in $(seq 1 25); do
             if curl -fsS http://127.0.0.1:8080/healthz >/dev/null 2>&1; then
               echo "wahs-engine healthy after ${i}s"
               docker rm -f wahs-smoke >/dev/null
-              exit 0
+              break
+            fi
+            if [ "$i" -eq 25 ]; then
+              docker logs wahs-smoke >&2
+              docker rm -f wahs-smoke >/dev/null
+              exit 1
             fi
             sleep 1
           done
-          docker logs wahs-smoke >&2
-          docker rm -f wahs-smoke >/dev/null
-          exit 1
+
+          docker run --rm -i --network none --user 65532:65532 \
+            -e WAHS_ALLOW_LOCAL_BUNDLE_MODE=true \
+            wahs-engine-ci \
+            python - <<'PY'
+          from fastapi.testclient import TestClient
+          from wahs_engine.app import create_app
+
+          bundle = {
+              "resourceType": "Bundle",
+              "type": "collection",
+              "entry": [
+                  {"resource": {"resourceType": "Patient", "id": "p-netnone", "name": [{"given": ["Aria"], "family": "Ng"}], "birthDate": "1974-08-21"}},
+                  {"resource": {"resourceType": "MedicationRequest", "id": "m-netnone", "status": "active", "authoredOn": "2026-10-01", "medicationCodeableConcept": {"text": "Warfarin 5 MG Oral Tablet"}}},
+              ],
+          }
+          with TestClient(create_app()) as client:
+              assert client.get("/healthz").status_code == 200
+              for model_id, expected_tok in (("wahs-12b-kb", "gemma4"), ("gpt-4o", "o200k_base")):
+                  resp = client.post("/v1/wahs/context/preview", json={"model": model_id, "wahs": {"fhir_bundle": bundle}})
+                  assert resp.status_code == 200, resp.text
+                  cond = resp.json()["x_wahs"]["condensation"]
+                  assert cond["tokenizer_family"] == expected_tok, cond
+                  assert cond["actual_tokens"] > 0
+          print("air-gapped --network none tokenizer smoke OK")
+          PY
+
+  live-hapi-jwt-proxy-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install package + test dependencies
+        run: pip install -e ".[dev]"
+      - name: Start HAPI FHIR v8.0.0 and uwcirg/jwt-proxy
+        run: |
+          docker network create wahs-ci-net
+          docker run -d --name wahs-ci-hapi --network wahs-ci-net --network-alias fhir-internal \
+            -p 127.0.0.1:18989:8080 \
+            -e hapi.fhir.allow_external_references=true \
+            -e hapi.fhir.default_encoding=json \
+            hapiproject/hapi:v8.0.0
+          for i in $(seq 1 90); do
+            if curl -fsS http://127.0.0.1:18989/fhir/metadata >/dev/null 2>&1; then
+              echo "HAPI ready after ${i}s"
+              break
+            fi
+            if [ "$i" -eq 90 ]; then
+              docker logs wahs-ci-hapi >&2
+              exit 1
+            fi
+            sleep 2
+          done
+          docker run -d --name wahs-ci-jwt-proxy --network wahs-ci-net \
+            --add-host=host.docker.internal:host-gateway \
+            -p 127.0.0.1:18990:8008 \
+            -e PORT=8008 \
+            -e UPSTREAM_SERVER=http://fhir-internal:8080 \
+            -e JWKS_URL=http://host.docker.internal:18991/.well-known/jwks.json \
+            -e POLICIES_DIR=/opt/app/jwt_proxy/policies \
+            -e PASSTHRU_AUTH_HEADERS=false \
+            ghcr.io/uwcirg/jwt-proxy:latest
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:18990/fhir/metadata || true)
+            if [ "$code" != "000" ]; then
+              echo "jwt-proxy responding HTTP ${code} after ${i}s"
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              docker logs wahs-ci-jwt-proxy >&2
+              exit 1
+            fi
+            sleep 1
+          done
+      - name: Run live HAPI + jwt-proxy integration suite
+        env:
+          WAHS_LIVE_HAPI_INTERNAL_URL: http://127.0.0.1:18989/fhir
+          WAHS_LIVE_FHIR_AUTH_URL: http://127.0.0.1:18990/fhir
+          WAHS_LIVE_JWKS_PORT: "18991"
+        run: pytest -s -v tests/test_live_hapi_jwt_proxy_integration.py
+      - name: Tear down integration containers
+        if: always()
+        run: |
+          docker rm -f wahs-ci-jwt-proxy wahs-ci-hapi >/dev/null 2>&1 || true
+          docker network rm wahs-ci-net >/dev/null 2>&1 || true

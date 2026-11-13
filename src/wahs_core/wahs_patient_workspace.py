@@ -312,7 +312,7 @@ def build_patient_skills_and_condensation_matrix(
                 ),
             }
             built_by_budget[b_tok] = cell_payload
-            if omitted_total == 0 and c_res.tier == 0:
+            if omitted_total == 0 and c_res.tier in (0, 1) and not c_res.completeness_manifest.get("excerpted_notes_count"):
                 canonical_zero_omitted_budget = b_tok
                 canonical_zero_omitted_cell = cell_payload
 

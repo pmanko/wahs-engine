@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Request, Response
@@ -13,7 +14,7 @@ import uvicorn
 from .assembler import WAHSBundleAssembler
 from .config import WahsEngineSettings
 from .jwt_claims import VerifiedCallerIdentity, decode_and_bind_jwt, extract_bearer_token
-from .schemas import OpenAIChatCompletionRequest, WahsRequestOptions
+from .schemas import OpenAIChatCompletionRequest, WahsContextPreviewRequest, WahsRequestOptions
 from .upstream import SouthboundOpenAIClient, build_x_wahs_envelope
 
 
@@ -23,7 +24,11 @@ def _resolve_caller_identity(
     settings: WahsEngineSettings,
 ) -> Optional[VerifiedCallerIdentity]:
     raw_token = extract_bearer_token(request.headers)
-    if not raw_token:
+    if not raw_token or (
+        raw_token == "local-demo-token"
+        and settings.allow_local_bundle_mode
+        and options.fhir_bundle is not None
+    ):
         if settings.allow_local_bundle_mode and options.fhir_bundle is not None:
             return None
         # Trigger standard 401 via decode_and_bind_jwt
@@ -83,13 +88,20 @@ def create_app(
 
     @application.post("/v1/wahs/context/preview")
     async def preview_context(
-        req: OpenAIChatCompletionRequest,
+        req: WahsContextPreviewRequest,
         request: Request,
     ) -> Dict[str, Any]:
         options = req.resolved_wahs_options()
         identity = _resolve_caller_identity(request, options, cfg)
-        ctx = await assembler.assemble(options=options, identity=identity)
         requested_model = (req.model or cfg.default_model).strip()
+        spec = cfg.resolve_model_spec(requested_model)
+        force_refresh = "no-cache" in request.headers.get("cache-control", "").lower()
+        ctx = await assembler.assemble(
+            options=options,
+            identity=identity,
+            requested_model=requested_model,
+            force_refresh=force_refresh,
+        )
         return {
             "patient_id": ctx.patient_id,
             "patient_name": ctx.patient_name,
@@ -100,7 +112,7 @@ def create_app(
             "x_wahs": build_x_wahs_envelope(
                 ctx=ctx,
                 requested_model=requested_model,
-                upstream_model=cfg.resolve_upstream_model(requested_model),
+                upstream_model=spec.upstream_model,
                 options=options,
                 engine_version=cfg.engine_version,
             ),
@@ -113,13 +125,22 @@ def create_app(
         request: Request,
         response: Response,
     ) -> Any:
+        t0 = time.perf_counter()
         options = req.resolved_wahs_options()
         identity = _resolve_caller_identity(request, options, cfg)
-        ctx = await assembler.assemble(options=options, identity=identity)
+        requested_model = (req.model or cfg.default_model).strip()
+        force_refresh = "no-cache" in request.headers.get("cache-control", "").lower()
+        ctx = await assembler.assemble(
+            options=options,
+            identity=identity,
+            requested_model=requested_model,
+            force_refresh=force_refresh,
+        )
+        assemble_ms = round((time.perf_counter() - t0) * 1000.0, 2)
 
         if req.stream:
             return StreamingResponse(
-                southbound.stream(ctx=ctx, req=req, options=options),
+                southbound.stream(ctx=ctx, req=req, options=options, assemble_ms=assemble_ms),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -128,7 +149,9 @@ def create_app(
                 },
             )
 
-        result = await southbound.complete(ctx=ctx, req=req, options=options)
+        result = await southbound.complete(
+            ctx=ctx, req=req, options=options, assemble_ms=assemble_ms
+        )
         response.headers["X-WAHS-Prefix-Hash"] = ctx.prefix_cache_key_hash
         return result
 

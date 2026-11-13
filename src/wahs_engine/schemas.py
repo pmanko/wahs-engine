@@ -30,7 +30,7 @@ class WahsRequestOptions(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    target_budget_tokens: int = Field(default=8192, ge=512, le=131072)
+    target_budget_tokens: Optional[int] = Field(default=None, ge=512)
     sharing_posture: Literal["patient_self", "external_share"] = "patient_self"
     chart_scope: ChartScope = Field(default_factory=ChartScope)
     overlay_resources: List[Dict[str, Any]] = Field(default_factory=list)
@@ -39,6 +39,14 @@ class WahsRequestOptions(BaseModel):
     fhir_bundle: Optional[Dict[str, Any]] = None
     enable_kb: bool = True
     enable_overflow_tools: bool = True
+    refresh: bool = False
+    allow_partial_external_share: bool = False
+    retrieval_strategy: Literal[
+        "condensation_kb",
+        "note_rag",
+        "dynamic_fhir_tools",
+        "chart_only",
+    ] = "condensation_kb"
 
 
 class ChatMessage(BaseModel):
@@ -59,8 +67,28 @@ class OpenAIChatCompletionRequest(BaseModel):
     temperature: float = Field(default=0.1, ge=0.0, le=2.0)
     max_tokens: Optional[int] = Field(default=1024, ge=1, le=16384)
     top_p: Optional[float] = None
+    seed: Optional[int] = None
     stop: Optional[Any] = None
     user: Optional[str] = None
+    wahs: Optional[WahsRequestOptions] = None
+
+    def resolved_wahs_options(self) -> WahsRequestOptions:
+        if self.wahs is not None:
+            return self.wahs
+        extra = self.model_extra or {}
+        extra_body = extra.get("extra_body")
+        if isinstance(extra_body, dict) and isinstance(extra_body.get("wahs"), dict):
+            return WahsRequestOptions.model_validate(extra_body["wahs"])
+        return WahsRequestOptions()
+
+
+class WahsContextPreviewRequest(BaseModel):
+    """Request body for `/v1/wahs/context/preview` (allows empty/omitted `messages`)."""
+
+    model_config = ConfigDict(extra="allow")
+
+    model: Optional[str] = None
+    messages: List[ChatMessage] = Field(default_factory=list)
     wahs: Optional[WahsRequestOptions] = None
 
     def resolved_wahs_options(self) -> WahsRequestOptions:
