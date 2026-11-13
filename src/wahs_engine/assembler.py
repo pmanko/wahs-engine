@@ -137,7 +137,7 @@ def derive_effective_chart_budget(
         base_framing += 420
 
     output_reserve = max(spec.default_max_output_tokens, min(4096, int(spec.context_window * 0.125)))
-    conversation_reserve = max(1024, min(16384, int(spec.context_window * 0.15)))
+    conversation_reserve = max(256, min(16384, int(spec.context_window * 0.15)))
     window_derived = spec.context_window - base_framing - output_reserve - conversation_reserve
     if window_derived < 512:
         raise HTTPException(
@@ -515,10 +515,15 @@ def _extract_ips_referenced_keys(ips_bundle: Mapping[str, Any]) -> Set[str]:
     return keys
 
 
+_SENTINEL = object()
+
+
 def _clone_context_for_request(
     ctx: AssembledWahsContext,
     *,
     cache_hit: bool,
+    budget_requested: Any = _SENTINEL,
+    clamp_reason: Any = _SENTINEL,
 ) -> AssembledWahsContext:
     """Return a per-request shallow clone with deep-copied mutable citation & notice state."""
     cloned = copy.copy(ctx)
@@ -526,6 +531,10 @@ def _clone_context_for_request(
     cloned.privacy_notices = list(ctx.privacy_notices)
     cloned.partial_datasets = [dict(d) for d in ctx.partial_datasets]
     cloned.cache_hit = cache_hit
+    if budget_requested is not _SENTINEL:
+        cloned.budget_requested = budget_requested
+    if clamp_reason is not _SENTINEL:
+        cloned.clamp_reason = clamp_reason
     return cloned
 
 
@@ -852,7 +861,12 @@ class WAHSBundleAssembler:
             if cacheable and not effective_refresh:
                 cached_ctx = self._prefix_cache.get(prefix_key)
                 if cached_ctx is not None:
-                    return _clone_context_for_request(cached_ctx, cache_hit=True)
+                    return _clone_context_for_request(
+                        cached_ctx,
+                        cache_hit=True,
+                        budget_requested=options.target_budget_tokens,
+                        clamp_reason=clamp_reason,
+                    )
 
             # 6. Fetch paginated `$everything` concurrently with semaphore bound for uncached / stale datasets
             pooled_entries: List[Dict[str, Any]] = [{"resource": master_pat}]
@@ -1007,7 +1021,12 @@ class WAHSBundleAssembler:
         if cacheable and not force_refresh and not partial_fetch:
             cached = self._prefix_cache.get(prefix_key)
             if cached is not None:
-                return _clone_context_for_request(cached, cache_hit=True)
+                return _clone_context_for_request(
+                    cached,
+                    cache_hit=True,
+                    budget_requested=options.target_budget_tokens,
+                    clamp_reason=clamp_reason,
+                )
 
         overlay_fhir_entries, draft_block, draft_citations = _format_overlay_items(
             options.overlay_resources, authorized_patient_id

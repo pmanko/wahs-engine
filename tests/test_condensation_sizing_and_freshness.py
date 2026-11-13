@@ -248,8 +248,9 @@ async def test_model_derived_sizing_at_most_clamp_and_history_trim_and_422() -> 
             ),
             "tiny-ctx": ModelSpec(
                 upstream_model="tiny-local",
-                context_window=2048,
+                context_window=3072,
                 chart_budget_ceiling=2048,
+                default_max_output_tokens=256,
                 tokenizer_family="gemma4",
                 provider_flavor="llamacpp",
                 disable_thinking=True,
@@ -317,13 +318,15 @@ async def test_model_derived_sizing_at_most_clamp_and_history_trim_and_422() -> 
             # 4. Multi-turn history trimming on tiny-ctx keeps messages[0] byte-identical
             long_turns = []
             for idx in range(6):
-                long_turns.append({"role": "user", "content": f"Turn {idx} question " + ("details " * 60)})
-                long_turns.append({"role": "assistant", "content": f"Turn {idx} answer " + ("notes " * 60)})
+                long_turns.append({"role": "user", "content": f"Turn {idx} question " + ("details " * 250)})
+                long_turns.append({"role": "assistant", "content": f"Turn {idx} answer " + ("notes " * 250)})
             long_turns.append({"role": "user", "content": "Final question?"})
-            sys_before = client.post(
+            prev_tiny_resp = client.post(
                 "/v1/wahs/context/preview",
                 json={"model": "tiny-ctx", "wahs": {"fhir_bundle": bundle}},
-            ).json()["chart_text"]
+            )
+            assert prev_tiny_resp.status_code == 200, prev_tiny_resp.text
+            sys_before = prev_tiny_resp.json()["chart_text"]
             trim_resp = client.post(
                 "/v1/chat/completions",
                 json={
@@ -442,10 +445,14 @@ async def test_partial_fetch_detection_missing_timestamp_ttl_and_instant_sort() 
                                         "security": [{"system": SECURITY_SYSTEM, "code": "user-fresh"}],
                                     },
                                     "name": [{"given": ["Fresh"], "family": "Tester"}],
-                                    "link": [
-                                        {"other": {"reference": "Patient/ds-tz-old"}, "type": "seealso"},
-                                        {"other": {"reference": "Patient/ds-tz-new"}, "type": "seealso"},
-                                    ],
+                                    "link": (
+                                        [{"other": {"reference": "Patient/ds-tz-new"}, "type": "seealso"}]
+                                        if self.omit_story_timestamp
+                                        else [
+                                            {"other": {"reference": "Patient/ds-tz-old"}, "type": "seealso"},
+                                            {"other": {"reference": "Patient/ds-tz-new"}, "type": "seealso"},
+                                        ]
+                                    ),
                                 }
                             }
                         ],
@@ -546,7 +553,7 @@ async def test_partial_fetch_detection_missing_timestamp_ttl_and_instant_sort() 
         ctx_p = await asm_partial.assemble(options=WahsRequestOptions(), identity=ident)
         assert ctx_p.datasets_included[0]["dataset_id"] == "ds-tz-new"
         assert ctx_p.partial_fetch is True
-        assert ctx_p.completeness_manifest["partial_fetch"] is True
+        assert ctx_p.condensed.completeness_manifest["partial_fetch"] is True
         assert "[PARTIAL RECORD WARNING:" in ctx_p.condensed.chart_text
         assert len(asm_partial._dataset_cache) == 0
         assert len(asm_partial._prefix_cache) == 0
