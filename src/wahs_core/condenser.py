@@ -2651,7 +2651,7 @@ def _rank_optional_items_deterministic(
             hay = f"{it.display} {it.text}".lower()
             q_hits = sum(1 for t in q_terms if t in hay)
             pass_tier = 0 if idx < quota else 1
-            tagged.append(((-q_hits, pass_tier, s_rank, idx), it))
+            tagged.append(((pass_tier, -q_hits, s_rank, idx), it))
 
     tagged.sort(key=lambda pair: pair[0])
     return [pair[1] for pair in tagged]

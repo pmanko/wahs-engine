@@ -263,3 +263,109 @@ async def test_upstream_kb_and_note_rag_scoping_headers() -> None:
             last_user = captured[-1]["messages"][-1]["content"]
             assert "Note Precedence:" in last_user
             assert "Use ONLY subgraph links directly relevant" in last_user
+
+
+def test_stage_b_pass_tier_zero_anchors_not_starved_by_query_matched_tail_labs() -> None:
+    """Over-quota query-matched tail labs (pass_tier=1) must not starve pass_tier=0 clinical notes or vitals."""
+    gemma_cnt = get_exact_token_counter("gemma4")
+    entries: List[Dict[str, Any]] = [
+        {
+            "resource": {
+                "resourceType": "Patient",
+                "id": "pat-tier-order",
+                "name": [{"given": ["Sam"], "family": "Rivera"}],
+                "birthDate": "1964-05-10",
+                "gender": "female",
+            }
+        }
+    ]
+    # 24 distinct single-point lab_observation resources all matching "creatinine" (> quota 16).
+    for i in range(24):
+        entries.append(
+            {
+                "resource": {
+                    "resourceType": "Observation",
+                    "id": f"obs-creat-tail-{i:02d}",
+                    "status": "final",
+                    "category": [{"coding": [{"code": "laboratory"}]}],
+                    "effectiveDateTime": f"2025-{(i % 12) + 1:02d}-{(i % 20) + 1:02d}",
+                    "code": {
+                        "coding": [
+                            {
+                                "system": "http://loinc.org",
+                                "code": f"99{i:03d}-1",
+                                "display": f"Serum creatinine subpanel marker {i:02d} baseline ratio",
+                            }
+                        ]
+                    },
+                    "valueQuantity": {"value": 1.1 + i * 0.05, "unit": "mg/dL"},
+                }
+            }
+        )
+    # Unmatched pass_tier=0 clinical note and vital sign.
+    entries.append(
+        {
+            "resource": {
+                "resourceType": "Observation",
+                "id": "obs-bp-anchor",
+                "status": "final",
+                "category": [{"coding": [{"code": "vital-signs"}]}],
+                "effectiveDateTime": "2026-01-10",
+                "code": {"text": "Blood pressure panel"},
+                "component": [
+                    {"code": {"text": "Systolic blood pressure"}, "valueQuantity": {"value": 118, "unit": "mm[Hg]"}},
+                    {"code": {"text": "Diastolic blood pressure"}, "valueQuantity": {"value": 74, "unit": "mm[Hg]"}},
+                ],
+            }
+        }
+    )
+    entries.append(
+        {
+            "resource": {
+                "resourceType": "DocumentReference",
+                "id": "doc-note-anchor",
+                "status": "current",
+                "date": "2026-01-11T09:00:00Z",
+                "type": {"text": "Progress Note"},
+                "content": [
+                    {
+                        "attachment": {
+                            "contentType": "text/plain",
+                            "data": base64.b64encode(
+                                b"Outpatient cardiology follow-up: volume status euvolemic, plan continue current regimen."
+                            ).decode("ascii"),
+                        }
+                    }
+                ],
+            }
+        }
+    )
+    bundle = {"resourceType": "Bundle", "type": "collection", "entry": entries}
+
+    # At 1800 tokens all pass_tier=0 labs fit along with pass_tier=0 doc & vital anchors,
+    # well before the pass_tier=1 over-quota query-matched lab tail finishes (48 total lab lines).
+    res_mid = condense_bundle_to_budget(
+        bundle,
+        target_tokens=1800,
+        question="What is my creatinine trend?",
+        token_counter=gemma_cnt,
+    )
+    uuids_mid = _clinical_uuids(res_mid)
+    assert "doc-note-anchor" in uuids_mid
+    assert "obs-bp-anchor" in uuids_mid
+    lab_lines_included = sum(
+        1 for ln in res_mid.chart_text.splitlines() if "Serum creatinine subpanel marker" in ln
+    )
+    assert lab_lines_included < 48, f"Expected pass_tier=0 anchors before all 48 lab lines, got {lab_lines_included}"
+
+    prev: set[str] = set()
+    for bdg in (512, 1024, 1600, 1800, 2400, 4096):
+        r = condense_bundle_to_budget(
+            bundle,
+            target_tokens=bdg,
+            question="What is my creatinine trend?",
+            token_counter=gemma_cnt,
+        )
+        cur = _clinical_uuids(r)
+        assert not (prev - cur), f"Non-monotonic UUID drop at {bdg}: {prev - cur}"
+        prev = cur
