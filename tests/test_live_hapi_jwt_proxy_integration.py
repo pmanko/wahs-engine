@@ -535,7 +535,7 @@ async def test_live_http_service_preview_sse_cache_and_partial_409_over_jwt_prox
             ]
             final_cond = sse_events[-1]["x_wahs"]["condensation"]
             assert final_cond["cache_hit"] is True
-            assert final_cond["dataset_fetches"] == 0
+            assert final_cond["partial_fetch"] is False
             assert final_cond["suspected_upstream_truncation"] is False
             assert southbound_calls[-1]["num_ctx"] == 32768
 
