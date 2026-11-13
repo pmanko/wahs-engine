@@ -593,6 +593,7 @@ def prepare_upstream_messages(
             if rag_lines:
                 rag_block = (
                     "=== SINGLE-PATIENT CLINICAL NOTE & REPORT PASSAGES (BM25 RAG — cite inline as [N]) ===\n"
+                    "Note Precedence: Reconcile retrieved passages by date—newer Discharge Summaries, Addenda, or hold/stop instructions supersede older admission or baseline notes. Answer strictly what the user asked without listing unrelated conditions.\n"
                     + "\n".join(rag_lines)
                 )
                 messages[-1] = {
