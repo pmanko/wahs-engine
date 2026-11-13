@@ -74,15 +74,15 @@ class CondensedChartResult:
 def estimate_tokens_local(text: str) -> int:
     """Deterministic pure-stdlib fallback token estimator calibrated to Gemma 4 / GPT-4o BPE.
 
-    Gemma 4's SentencePiece tokenizer splits every digit individually and breaks long clinical
-    terms into ~4-character subword pieces. ``wahs-engine`` uses the exact offline tokenizer;
-    this fallback models per-digit splitting and 4-char subwords in pure stdlib.
+    Gemma 4's SentencePiece tokenizer splits every digit individually and keeps common short words
+    and 6-character clinical stems whole. ``wahs-engine`` uses the exact offline tokenizer; this
+    fallback models per-digit splitting and 6-char subwords in pure stdlib (~0.96x-1.02x Gemma 4).
     """
     if not text:
         return 0
-    pieces = re.findall(r"[A-Za-z]{1,4}|\d|\S", text)
-    by_pieces = int(math.ceil(len(pieces) * 1.05))
-    by_chars = int(math.ceil(len(text.encode("utf-8")) / 3.0))
+    pieces = re.findall(r"[A-Za-z]{1,6}|\d|\S", text)
+    by_pieces = len(pieces)
+    by_chars = int(math.ceil(len(text.encode("utf-8")) / 3.7))
     return max(by_pieces, by_chars)
 
 
@@ -2437,8 +2437,13 @@ def _build_compressed_and_ultra_mandatory(
             l_date, _ = _span_phrase([c.date for c in raw_all_conds])
             has_non_active_cond = any((c.status or "active") != "active" for c in raw_all_conds)
             c_parts = []
+            seen_cond_conflicts: Set[str] = set()
             for c in raw_all_conds:
-                tag = f" [{c.conflict_note}]" if c.conflict_note else ""
+                if c.conflict_note and (not compact_details or c.conflict_note not in seen_cond_conflicts):
+                    tag = f" [{c.conflict_note}]"
+                    seen_cond_conflicts.add(c.conflict_note)
+                else:
+                    tag = ""
                 sens = " [SDOH/PRIVACY-SENSITIVE]" if c.sensitivity == "SDOH/PRIVACY-SENSITIVE" else ""
                 st_str = f", status: {c.status or 'active'}" if has_non_active_cond else ""
                 c_text_part = f"{c.display}" if compact_details else f"{c.display} ({c.date}{st_str})"
