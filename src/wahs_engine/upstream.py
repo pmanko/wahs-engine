@@ -1165,6 +1165,25 @@ class SouthboundOpenAIClient:
                 stripper = _StreamingThinkStripper()
                 tool_calls_by_idx: Dict[int, Dict[str, Any]] = {}
                 round_raw_parts: List[str] = []
+                can_stream_live = current_tools is None
+                buffered_pieces: List[str] = []
+
+                def _content_sse(text_piece: str) -> str:
+                    out_chunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": requested_model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": text_piece},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    return f"data: {json.dumps(out_chunk)}\n\n"
+
                 llm_rounds += 1
                 async with client.stream(
                     "POST",
@@ -1202,31 +1221,17 @@ class SouthboundOpenAIClient:
                             round_raw_parts.append(raw_content)
                         piece = stripper.feed(raw_content)
                         if piece:
-                            out_chunk = {
-                                "id": completion_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": requested_model,
-                                "choices": [
-                                    {
-                                        "index": 0,
-                                        "delta": {"content": piece},
-                                        "finish_reason": None,
-                                    }
-                                ],
-                            }
-                            yield f"data: {json.dumps(out_chunk)}\n\n"
+                            if can_stream_live:
+                                yield _content_sse(piece)
+                            else:
+                                buffered_pieces.append(piece)
 
                 tail = stripper.flush()
                 if tail:
-                    tail_chunk = {
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": requested_model,
-                        "choices": [{"index": 0, "delta": {"content": tail}, "finish_reason": None}],
-                    }
-                    yield f"data: {json.dumps(tail_chunk)}\n\n"
+                    if can_stream_live:
+                        yield _content_sse(tail)
+                    else:
+                        buffered_pieces.append(tail)
 
                 if tool_calls_by_idx and round_idx < max_tool_rounds:
                     assembled_calls = [tool_calls_by_idx[k] for k in sorted(tool_calls_by_idx)]
@@ -1247,6 +1252,8 @@ class SouthboundOpenAIClient:
                     overflow_recovered += rec_delta
                     followup_msgs.extend(tool_msgs)
                     continue
+                for buffered_piece in buffered_pieces:
+                    yield _content_sse(buffered_piece)
                 break
         finally:
             if owns_client:

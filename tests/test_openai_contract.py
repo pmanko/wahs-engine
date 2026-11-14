@@ -184,3 +184,87 @@ async def test_openai_models_streaming_sse_vanilla_caller_and_overflow_tool_loop
             assert sync_body["x_wahs"]["condensation"]["budget_tokens"] == 512
             assert sync_body["x_wahs"]["condensation"]["actual_tokens"] <= 512
             assert sync_body["x_wahs"]["condensation"]["overflow_recovered"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_streaming_buffers_pre_tool_round_text_until_terminal_round() -> None:
+    from wahs_engine.app import create_app
+    from wahs_engine.config import ModelSpec, WahsEngineSettings
+
+    round_counter = {"n": 0}
+
+    def llm_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"object": "list", "data": [{"id": "gemma4:12b"}]})
+        round_counter["n"] += 1
+        if round_counter["n"] == 1:
+            sse_lines = [
+                'data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"PRE_TOOL_DRAFT "},"finish_reason":null}]}',
+                'data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"search_chart_entries","arguments":"{\\"query\\":\\"creatinine\\"}"}}]},"finish_reason":null}]}',
+                'data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":100,"completion_tokens":10,"total_tokens":110}}',
+                "data: [DONE]",
+            ]
+        else:
+            sse_lines = [
+                'data: {"id":"c2","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"FINAL_ANSWER"},"finish_reason":null}]}',
+                'data: {"id":"c2","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":120,"completion_tokens":5,"total_tokens":125}}',
+                "data: [DONE]",
+            ]
+        body = ("\n\n".join(sse_lines) + "\n\n").encode("utf-8")
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body)
+
+    settings = WahsEngineSettings(
+        allow_local_bundle_mode=True,
+        llm_base_url="http://mock-llm/v1",
+        default_model="wahs-test",
+        model_specs={
+            "wahs-test": ModelSpec(
+                upstream_model="gemma4:12b",
+                context_window=8192,
+                chart_budget_ceiling=2048,
+                tokenizer_family="gemma4",
+                provider_flavor="litellm",
+                disable_thinking=True,
+            )
+        },
+    )
+    entries = [{"resource": {"resourceType": "Patient", "id": "p-stream", "birthDate": "1960-01-01"}}]
+    for idx in range(45):
+        entries.append(
+            {
+                "resource": {
+                    "resourceType": "Observation",
+                    "id": f"obs-fill-{idx}",
+                    "status": "final",
+                    "category": [{"coding": [{"code": "laboratory"}]}],
+                    "code": {"coding": [{"system": "http://loinc.org", "code": f"999-{idx}", "display": f"Filler Lab Panel Result Number {idx} with Extended Descriptive Text"}]},
+                    "effectiveDateTime": "2026-01-01",
+                    "valueQuantity": {"value": float(idx), "unit": "mg/dL"},
+                }
+            }
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(llm_handler)) as llm_client:
+        app = create_app(settings, llm_http_client=llm_client)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://wahs-engine"
+        ) as api:
+            resp = await api.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "wahs-test",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "Check labs"}],
+                    "wahs": {
+                        "fhir_bundle": {"resourceType": "Bundle", "type": "collection", "entry": entries},
+                        "target_budget_tokens": 512,
+                        "enable_overflow_tools": True,
+                    },
+                },
+            )
+            assert resp.status_code == 200
+            raw_sse = resp.text
+
+    assert round_counter["n"] == 2
+    assert "PRE_TOOL_DRAFT" not in raw_sse
+    assert "FINAL_ANSWER" in raw_sse

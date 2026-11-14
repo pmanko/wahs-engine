@@ -995,16 +995,39 @@ class ClinicalEntityGraph:
             val = tgt.metadata.get("latest_value")
             if not isinstance(val, (int, float)):
                 return False
-            if ("egfr" in t_low or "glomerular filtration" in t_low) and val < 60:
-                return True
-            if "creatinine" in t_low and val >= 1.5:
-                return True
-            if "potassium" in t_low and (val >= 5.0 or val <= 3.4):
-                return True
-            if "inr" in t_low and val >= 3.5:
-                return True
-            if "hemoglobin" in t_low and "a1c" not in t_low and val < 11.5:
-                return True
+            unit_compact = re.sub(r"\s+", "", str(tgt.metadata.get("unit") or "").strip().lower())
+            if "egfr" in t_low or "glomerular filtration" in t_low:
+                return (not unit_compact or "ml/min" in unit_compact) and val < 60
+            if "creatinine" in t_low:
+                if unit_compact in {"", "mg/dl", "mg/100ml", "mg%"}:
+                    cr_mg_dl: Optional[float] = float(val)
+                elif unit_compact == "mg/l":
+                    cr_mg_dl = float(val) / 10.0
+                elif unit_compact in {"umol/l", "µmol/l", "μmol/l", "mcmol/l", "micromol/l", "mmol/m3"}:
+                    cr_mg_dl = float(val) / 88.42
+                elif unit_compact == "mmol/l":
+                    cr_mg_dl = (float(val) * 1000.0) / 88.42
+                else:
+                    cr_mg_dl = None
+                return cr_mg_dl is not None and cr_mg_dl >= 1.5
+            if "potassium" in t_low:
+                if unit_compact not in {"", "meq/l", "mmol/l", "meq/liter", "mmol/liter"}:
+                    return False
+                return val >= 5.0 or val <= 3.4
+            if "inr" in t_low:
+                if unit_compact not in {"", "{inr}", "inr", "ratio", "1", "none"}:
+                    return False
+                return val >= 3.5
+            if "hemoglobin" in t_low and "a1c" not in t_low:
+                if unit_compact in {"", "g/dl", "gm/dl", "g/100ml", "g%"}:
+                    hb_g_dl: Optional[float] = float(val)
+                elif unit_compact in {"g/l", "gm/l", "mg/ml"}:
+                    hb_g_dl = float(val) / 10.0
+                elif unit_compact == "mmol/l":
+                    hb_g_dl = float(val) * 1.6114
+                else:
+                    hb_g_dl = None
+                return hb_g_dl is not None and hb_g_dl < 11.5
             return False
 
         for m in scoped_meds:

@@ -300,3 +300,52 @@ def test_wahs_core_stdlib_purity_in_subprocess() -> None:
         check=True,
     )
     assert "OK" in proc.stdout
+
+
+def test_obs_safety_thresholds_convert_ucum_units_and_ignore_unknown_units() -> None:
+    from wahs_core import ClinicalEntityGraph, extract_bundle
+
+    def _bundle(cr_val: float, cr_unit: str, high_ref: float | None = None) -> Dict[str, Any]:
+        obs: Dict[str, Any] = {
+            "resourceType": "Observation",
+            "id": "obs-cr-1",
+            "status": "final",
+            "category": [{"coding": [{"code": "laboratory"}]}],
+            "code": {
+                "coding": [{"system": "http://loinc.org", "code": "2160-0", "display": "Creatinine [Mass/volume] in Serum or Plasma"}],
+                "text": "Creatinine",
+            },
+            "effectiveDateTime": "2026-10-01",
+            "valueQuantity": {"value": cr_val, "unit": cr_unit},
+        }
+        if high_ref is not None:
+            obs["referenceRange"] = [{"low": {"value": 60.0, "unit": cr_unit}, "high": {"value": high_ref, "unit": cr_unit}}]
+        return {
+            "resourceType": "Bundle",
+            "type": "collection",
+            "entry": [
+                {"resource": {"resourceType": "Patient", "id": "p-cr-1", "birthDate": "1960-01-01"}},
+                {
+                    "resource": {
+                        "resourceType": "MedicationRequest",
+                        "id": "med-met-cr",
+                        "status": "active",
+                        "authoredOn": "2026-09-01",
+                        "medicationCodeableConcept": {"text": "Metformin 500 MG Oral Tablet"},
+                    }
+                },
+                {"resource": obs},
+            ],
+        }
+
+    # Normal creatinine in SI units (100 umol/L == 1.13 mg/dL, ref 60-110) must NOT warn
+    g_norm = ClinicalEntityGraph.from_extracted_chart(extract_bundle(_bundle(100.0, "umol/L", high_ref=110.0)))
+    assert not any(e.edge_type == "CONTRAINDICATED_OR_DOSE_ADJUST_IN" for e in g_norm.edges)
+
+    # Elevated creatinine in SI units (150 umol/L == 1.70 mg/dL >= 1.5 mg/dL) DOES warn
+    g_high = ClinicalEntityGraph.from_extracted_chart(extract_bundle(_bundle(150.0, "umol/L", high_ref=110.0)))
+    assert any(e.edge_type == "CONTRAINDICATED_OR_DOSE_ADJUST_IN" for e in g_high.edges)
+
+    # Unrecognized unit marked non-abnormal must NOT trigger hard-coded mg/dL numeric threshold
+    g_unk = ClinicalEntityGraph.from_extracted_chart(extract_bundle(_bundle(25.0, "{arbitrary_units}")))
+    assert not any(e.edge_type == "CONTRAINDICATED_OR_DOSE_ADJUST_IN" for e in g_unk.edges)
