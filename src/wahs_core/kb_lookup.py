@@ -65,6 +65,10 @@ def get_clinical_exclusivity_and_privacy() -> Dict[str, Any]:
     return _load_json_pack("clinical_exclusivity_and_privacy.json")
 
 
+def get_clinical_graph_rules() -> Dict[str, Any]:
+    return _load_json_pack("clinical_graph_rules.json")
+
+
 def _norm_cond_display(text: str) -> str:
     return re.sub(
         r"\s*\((?:disorder|finding|situation)\)\s*$",

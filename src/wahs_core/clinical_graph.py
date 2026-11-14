@@ -23,7 +23,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 from .condenser import CondensedChartResult, estimate_tokens_local
 from .extractors import ClinicalItem, ExtractedChart, NumericPoint, extract_bundle
 from .kb import search as search_kb
-from .kb_lookup import extract_chart_kb_codes, get_rxnorm_lookup
+from .kb_lookup import extract_chart_kb_codes, get_clinical_graph_rules, get_rxnorm_lookup
 from .normalizers import (
     annotate_immunization_anomalies,
     classify_sensitivity,
@@ -343,13 +343,13 @@ class HubEnrichmentResult:
     overflow_recovered_count: int
     subgraph_nodes: int
     subgraph_edges: int
-    kb_Passages_matched: int
+    kb_passages_matched: int
     max_citation_idx_before: int
     max_citation_idx_after: int
     active_question: str = ""
     patient_name: str = ""
     omitted_by_category: Dict[str, int] = field(default_factory=dict)
-    edge_Breakdown: Dict[str, int] = field(default_factory=dict)
+    edge_breakdown: Dict[str, int] = field(default_factory=dict)
     recovered_mappings: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_metadata_dict(self) -> Dict[str, Any]:
@@ -360,227 +360,20 @@ class HubEnrichmentResult:
             "overflow_items_recovered": self.overflow_recovered_count,
             "subgraph_nodes": self.subgraph_nodes,
             "subgraph_edges": self.subgraph_edges,
-            "kb_passages_matched": self.kb_Passages_matched,
+            "kb_passages_matched": self.kb_passages_matched,
             "enrichment_tokens": self.enrichment_tokens,
             "max_citation_idx_before": self.max_citation_idx_before,
             "max_citation_idx_after": self.max_citation_idx_after,
             "patient_name": self.patient_name,
             "omitted_by_category": dict(self.omitted_by_category),
-            "edge_breakdown": dict(self.edge_Breakdown),
+            "edge_breakdown": dict(self.edge_breakdown),
             "recovered_mappings": list(self.recovered_mappings),
         }
 
 
 # ---------------------------------------------------------------------------
-# Clinical Domain Rules for Graph Edge Construction
+# Clinical Domain Rules for Graph Edge Construction (loaded from kb_data/clinical_graph_rules.json)
 # ---------------------------------------------------------------------------
-
-_DRUG_INDICATION_KEYWORDS: List[Tuple[Tuple[str, ...], Tuple[str, ...], str, str]] = [
-    (
-        ("apixaban", "eliquis", "rivaroxaban", "xarelto", "warfarin", "coumadin", "dabigatran", "edoxaban"),
-        ("atrial fibrillation", "afib", "flutter", "thrombosis", "embolism", "dvt", "pe", "stroke", "mechanical", "aortic valve", "mitral valve"),
-        "Anticoagulation for thromboembolic protection / atrial fibrillation / prosthetic valve",
-        "AHA/ACC/HRS AFib & Anticoagulation Guideline",
-    ),
-    (
-        ("sacubitril", "valsartan", "entresto", "lisinopril", "losartan", "ramipril", "enalapril", "carvedilol", "metoprolol", "bisoprolol", "spironolactone", "eplerenone", "furosemide", "lasix", "torsemide", "bumetanide"),
-        ("heart failure", "hfref", "hfpef", "cardiomyopathy", "ventricular dysfunction", "edema", "overload"),
-        "Guideline-directed medical therapy (GDMT) / decongestion for heart failure",
-        "AHA/ACC/HFSA Heart Failure Guideline",
-    ),
-    (
-        ("empagliflozin", "jardiance", "dapagliflozin", "farxiga", "canagliflozin"),
-        ("heart failure", "hfref", "hfpef", "diabetes", "kidney disease", "ckd", "renal", "nephropathy"),
-        "SGLT2 inhibitor organ-protective therapy for HF / T2DM / CKD",
-        "KDIGO CKD & ADA/AHA Cardiorenal Guideline",
-    ),
-    (
-        ("lisinopril", "losartan", "valsartan", "amlodipine", "hydrochlorothiazide", "chlorthalidone", "metoprolol", "carvedilol", "diltiazem", "spironolactone", "hydralazine"),
-        ("hypertension", "high blood pressure", "elevated blood pressure"),
-        "Antihypertensive therapy for blood pressure control",
-        "ACC/AHA Hypertension Guideline",
-    ),
-    (
-        ("metformin", "insulin", "glargine", "lispro", "aspart", "glipizide", "glimepiride", "semaglutide", "ozempic", "liraglutide", "dulaglutide", "sitagliptin"),
-        ("diabetes", "hyperglycemia", "prediabetes", "a1c"),
-        "Glycemic control therapy for diabetes mellitus",
-        "ADA Standards of Care in Diabetes",
-    ),
-    (
-        ("atorvastatin", "lipitor", "rosuvastatin", "crestor", "simvastatin", "pravastatin", "ezetimibe", "evolocumab"),
-        ("hyperlipidemia", "dyslipidemia", "hypercholesterolemia", "coronary", "cad", "atherosclerosis", "myocardial infarction", "stroke"),
-        "Lipid-lowering and atherosclerotic cardiovascular risk reduction",
-        "ACC/AHA Cholesterol & ASCVD Guideline",
-    ),
-    (
-        ("levothyroxine", "synthroid"),
-        ("hypothyroidism", "thyroid"),
-        "Thyroid hormone replacement for hypothyroidism",
-        "ATA Hypothyroidism Guideline",
-    ),
-    (
-        ("allopurinol", "febuxostat", "colchicine"),
-        ("gout", "hyperuricemia"),
-        "Urate-lowering / flare prophylaxis therapy for gout",
-        "ACR Gout Management Guideline",
-    ),
-    (
-        ("albuterol", "salbutamol", "tiotropium", "ipratropium", "fluticasone", "budesonide", "formoterol", "salmeterol", "montelukast"),
-        ("asthma", "copd", "chronic obstructive", "bronchitis", "wheezing"),
-        "Bronchodilator / anti-inflammatory airway therapy",
-        "GOLD COPD / GINA Asthma Strategy",
-    ),
-    (
-        ("sertraline", "escitalopram", "fluoxetine", "citalopram", "venlafaxine", "duloxetine", "bupropion"),
-        ("depression", "depressive", "anxiety", "ptsd", "mood"),
-        "Pharmacotherapy for depressive or anxiety disorder",
-        "APA Mood & Anxiety Clinical Practice Guideline",
-    ),
-    (
-        ("buprenorphine", "suboxone", "naloxone", "methadone", "naltrexone"),
-        ("opioid", "dependence", "substance", "addiction"),
-        "Medication for opioid use disorder (MOUD)",
-        "SAMHSA / ASAM OUD Guideline",
-    ),
-    (
-        ("aspirin", "clopidogrel", "plavix", "ticagrelor", "prasugrel", "isosorbide", "nitroglycerin"),
-        ("coronary", "cad", "angina", "ischemic", "myocardial infarction", "stent", "pci", "bypass", "cabg", "heart failure", "cardiomyopathy", "vascular"),
-        "Antiplatelet / antianginal therapy for ischemic or cardiovascular disease",
-        "ACC/AHA Chronic Coronary Disease Guideline",
-    ),
-]
-
-_SAFETY_CONTRAINDICATION_RULES: List[Tuple[Tuple[str, ...], Tuple[str, ...], str, str]] = [
-    (
-        ("metformin",),
-        ("stage 4", "stage 5", "ckd 4", "ckd 5", "kidney disease, stage 4", "kidney disease stage 4", "egfr", "glomerular filtration", "creatinine", "acute kidney", "aki"),
-        "Metformin renal safety: contraindicated when eGFR < 30 mL/min/1.73m2; avoid initiation and reduce dose when eGFR 30-44 due to lactic acidosis risk",
-        "FDA Metformin Boxed Warning & KDIGO Diabetes in CKD",
-    ),
-    (
-        ("spironolactone", "eplerenone", "sacubitril", "valsartan", "entresto", "lisinopril", "losartan", "ramipril", "enalapril"),
-        ("hyperkalemia", "potassium", "stage 4", "stage 5", "ckd 4", "kidney disease, stage 4", "kidney disease stage 4", "acute kidney", "aki", "creatinine", "egfr", "glomerular filtration"),
-        "RAAS / MRA cardiorenal safety: monitor potassium (hyperkalemia risk) and renal function (eGFR/creatinine) in advanced CKD or volume depletion",
-        "AHA/ACC/HFSA & KDIGO Cardiorenal Monitoring Rule",
-    ),
-    (
-        ("apixaban", "eliquis", "rivaroxaban", "xarelto", "dabigatran", "edoxaban"),
-        ("stage 4", "stage 5", "ckd 4", "kidney disease, stage 4", "kidney disease stage 4", "creatinine", "egfr", "glomerular filtration", "bleed", "hemorrhage", "anemia", "hemoglobin"),
-        "DOAC renal & bleeding safety: check renal dose-reduction criteria and monitor renal clearance/hemoglobin",
-        "FDA Apixaban/DOAC Renal Dosing & Anticoagulation Safety",
-    ),
-    (
-        ("warfarin", "coumadin"),
-        ("inr", "prothrombin", "bleed", "hemorrhage", "bruising", "hematuria", "melena"),
-        "Warfarin narrow therapeutic index: supratherapeutic INR or active bleeding requires prompt review and interaction check",
-        "CHEST Antithrombotic Therapy Guideline",
-    ),
-    (
-        ("ibuprofen", "naproxen", "meloxicam", "ketorolac", "diclofenac", "celecoxib", "indomethacin", "nsaid"),
-        ("kidney disease", "ckd", "renal", "heart failure", "hfref", "creatinine", "egfr", "apixaban", "warfarin", "rivaroxaban", "ulcer", "bleed"),
-        "NSAID high-risk interaction: associated with AKI, fluid retention/HF decompensation, and GI/anticoagulant bleeding",
-        "KDIGO & AGS Beers Criteria High-Risk Medication Rule",
-    ),
-    (
-        ("allopurinol", "colchicine", "gabapentin", "pregabalin", "digoxin", "fenofibrate"),
-        ("kidney disease", "ckd", "stage 3", "stage 4", "stage 5", "creatinine", "egfr", "glomerular filtration"),
-        "Renally cleared medication: check eGFR-guided dosing to prevent drug accumulation",
-        "Renal Pharmacotherapy Dosing Guideline",
-    ),
-    (
-        ("furosemide", "lasix", "torsemide", "bumetanide", "hydrochlorothiazide", "chlorthalidone", "metolazone"),
-        ("potassium", "sodium", "creatinine", "egfr", "urea nitrogen", "bun", "hypotension", "dehydration", "acute kidney"),
-        "Diuretic electrolyte & renal safety: monitor potassium, sodium, volume status, and creatinine",
-        "ACC/AHA Heart Failure Diuretic Monitoring Rule",
-    ),
-    (
-        ("insulin", "glargine", "lispro", "aspart", "glipizide", "glimepiride", "glyburide"),
-        ("hypoglycemia", "glucose", "hemoglobin a1c", "a1c", "kidney disease", "ckd"),
-        "Hypoglycemia risk: reduced renal clearance and tight glycemic control in CKD or older adults increase hypoglycemia risk",
-        "ADA Glycemic Targets & Older Adults Safety Guideline",
-    ),
-]
-
-_MONITORING_RULES: List[Tuple[Tuple[str, ...], Tuple[str, ...], str]] = [
-    (
-        ("kidney", "ckd", "renal", "nephropathy", "proteinuria", "spironolactone", "eplerenone", "sacubitril", "valsartan", "lisinopril", "losartan", "ramipril", "furosemide", "torsemide", "empagliflozin", "dapagliflozin", "metformin", "allopurinol"),
-        ("creatinine", "glomerular filtration", "egfr", "potassium", "urea nitrogen", "bun", "albumin/creatinine", "uacr", "cystatin"),
-        "Renal function & electrolyte surveillance (Cr / eGFR / K+ / BUN / UACR)",
-    ),
-    (
-        ("heart failure", "hfref", "hfpef", "cardiomyopathy", "edema", "dyspnea", "sacubitril", "valsartan", "furosemide", "torsemide", "spironolactone", "carvedilol", "metoprolol"),
-        ("natriuretic", "nt-probnp", "bnp", "body weight", "weight", "potassium", "creatinine", "sodium", "ejection fraction", "lvef"),
-        "Heart failure congestion & cardiorenal trajectory monitoring (NT-proBNP / Weight / K+ / Cr)",
-    ),
-    (
-        ("diabetes", "hyperglycemia", "metformin", "insulin", "glargine", "glipizide", "semaglutide", "liraglutide", "empagliflozin", "dapagliflozin"),
-        ("hemoglobin a1c", "hba1c", "a1c", "glucose", "albumin/creatinine", "uacr"),
-        "Glycemic control & diabetic nephropathy surveillance (HbA1c / Glucose / UACR)",
-    ),
-    (
-        ("atrial fibrillation", "afib", "thrombosis", "embolism", "warfarin", "apixaban", "rivaroxaban", "dabigatran", "heparin"),
-        ("inr", "prothrombin", "hemoglobin", "hematocrit", "platelet", "creatinine", "heart rate"),
-        "Anticoagulation safety, bleeding & rate surveillance (INR / Hgb / Platelets / Cr)",
-    ),
-    (
-        ("hyperlipidemia", "dyslipidemia", "coronary", "cad", "atherosclerosis", "atorvastatin", "rosuvastatin", "simvastatin", "ezetimibe"),
-        ("cholesterol", "ldl", "hdl", "triglyceride", "aminotransferase", "ast", "alt"),
-        "Lipid panel & statin safety surveillance (LDL-C / Total Cholesterol / Triglycerides / Hepatic enzymes)",
-    ),
-    (
-        ("hypertension", "blood pressure", "amlodipine", "lisinopril", "losartan", "valsartan", "hydrochlorothiazide", "chlorthalidone", "metoprolol", "carvedilol"),
-        ("blood pressure", "systolic", "diastolic", "mean arterial"),
-        "Hemodynamic blood pressure trajectory monitoring",
-    ),
-    (
-        ("hypothyroidism", "thyroid", "levothyroxine"),
-        ("thyrotropin", "tsh", "thyroxine", "free t4"),
-        "Thyroid function surveillance (TSH / Free T4)",
-    ),
-    (
-        ("gout", "hyperuricemia", "allopurinol", "febuxostat"),
-        ("urate", "uric acid"),
-        "Serum urate target surveillance",
-    ),
-    (
-        ("anemia", "iron deficiency", "bleed", "hemorrhage"),
-        ("hemoglobin", "hematocrit", "ferritin", "iron", "mcv", "reticulocyte"),
-        "Hematologic & iron status trajectory monitoring",
-    ),
-]
-
-_NOTE_HOLD_OR_MOD_CUES: Tuple[str, ...] = (
-    "stopped",
-    "stop ",
-    "discontinue",
-    "discontinued",
-    "held",
-    "holding",
-    "hold ",
-    "avoid ",
-    "reconcile",
-    "duplicate",
-    "not taking",
-    "non-adherent",
-    "nonadherent",
-    "self-discontinued",
-    "ran out",
-    "reduced",
-    "half dose",
-    "declined",
-    "intolerant",
-    "switched",
-    "outside",
-)
-
-_NOTE_RESUME_OR_CONTINUE_CUES: Tuple[str, ...] = (
-    "continue ",
-    "continuing ",
-    "resume ",
-    "resumed ",
-    "restart ",
-    "restarted ",
-)
 
 _NON_DRUG_PROBE_WORDS: Set[str] = {
     "admin",
@@ -1155,8 +948,14 @@ class ClinicalEntityGraph:
             for rule in rx_rules:
                 if not isinstance(rule, Mapping):
                     continue
-                al_terms = [str(t).lower() for t in (rule.get("allergen_terms") or ())]
-                med_terms = [str(t).lower() for t in (rule.get("medication_terms") or ())]
+                al_terms = [
+                    str(t).lower()
+                    for t in (rule.get("allergen_tokens") or rule.get("allergen_terms") or ())
+                ]
+                med_terms = [
+                    str(t).lower()
+                    for t in (rule.get("med_tokens") or rule.get("medication_terms") or ())
+                ]
                 if not any(t in al_low for t in al_terms):
                     continue
                 for m in scoped_meds:
@@ -1168,11 +967,18 @@ class ClinicalEntityGraph:
                                 target_id=m.node_id,
                                 edge_type="CROSS_REACTS_WITH",
                                 rationale=str(rule.get("rationale") or "Potential allergy cross-reactivity"),
-                                kb_source="RxNorm Allergy Cross-Reactivity Rules",
+                                kb_source=str(rule.get("kb_source") or "RxNorm Allergy Cross-Reactivity Rules"),
                                 source_citation=al.citation_idx,
                                 target_citation=m.citation_idx,
                             )
                         )
+
+        graph_rules = get_clinical_graph_rules()
+        indication_rules = graph_rules.get("drug_indication_rules") or ()
+        safety_rules = graph_rules.get("safety_contraindication_rules") or ()
+        monitoring_rules = graph_rules.get("monitoring_rules") or ()
+        hold_cues = tuple(str(c).lower() for c in (graph_rules.get("note_hold_or_mod_cues") or ()))
+        resume_cues = tuple(str(c).lower() for c in (graph_rules.get("note_resume_or_continue_cues") or ()))
 
         # 3. Drug -> Condition TREATS & Safety/Contraindication edges (scoped to active/trajectory entities)
         conflict_pairs: Set[frozenset[str]] = {
@@ -1203,7 +1009,13 @@ class ClinicalEntityGraph:
 
         for m in scoped_meds:
             m_low = f"{m.label} {m.metadata.get('ingredient_key', '')} {m.raw_line}".lower()
-            for drug_kws, cond_kws, rationale, kb_src in _DRUG_INDICATION_KEYWORDS:
+            for rule in indication_rules:
+                if not isinstance(rule, Mapping):
+                    continue
+                drug_kws = tuple(str(t).lower() for t in (rule.get("med_tokens") or ()))
+                cond_kws = tuple(str(t).lower() for t in (rule.get("target_tokens") or ()))
+                rationale = str(rule.get("rationale") or "")
+                kb_src = str(rule.get("kb_source") or "")
                 if any(dk in m_low for dk in drug_kws):
                     for c in scoped_conds:
                         c_low = f"{c.label} {c.raw_line}".lower()
@@ -1220,7 +1032,13 @@ class ClinicalEntityGraph:
                                 )
                             )
 
-            for drug_kws, risk_kws, rationale, kb_src in _SAFETY_CONTRAINDICATION_RULES:
+            for rule in safety_rules:
+                if not isinstance(rule, Mapping):
+                    continue
+                drug_kws = tuple(str(t).lower() for t in (rule.get("med_tokens") or ()))
+                risk_kws = tuple(str(t).lower() for t in (rule.get("target_tokens") or ()))
+                rationale = str(rule.get("rationale") or "")
+                kb_src = str(rule.get("kb_source") or "")
                 if not any(dk in m_low for dk in drug_kws):
                     continue
                 matched_tgts: List[ClinicalNode] = []
@@ -1270,7 +1088,12 @@ class ClinicalEntityGraph:
             e_low = f"{entity.label} {entity.metadata.get('ingredient_key', '')} {entity.raw_line}".lower()
             seen_rationale_counts: Dict[str, int] = {}
             seen_rationale_stems: Dict[str, Set[str]] = {}
-            for ent_kws, lab_kws, rationale in _MONITORING_RULES:
+            for rule in monitoring_rules:
+                if not isinstance(rule, Mapping):
+                    continue
+                ent_kws = tuple(str(t).lower() for t in (rule.get("trigger_tokens") or ()))
+                lab_kws = tuple(str(t).lower() for t in (rule.get("obs_tokens") or ()))
+                rationale = str(rule.get("rationale") or "")
                 if not any(ek in e_low for ek in ent_kws):
                     continue
                 matched_obs = [
@@ -1314,14 +1137,14 @@ class ClinicalEntityGraph:
             for n in notes_sorted:
                 raw_note = n.raw_line or ""
                 n_low = (raw_note or n.value_summary or "").lower()
-                if not n_low or not any(cue in n_low for cue in _NOTE_HOLD_OR_MOD_CUES):
+                if not n_low or not any(cue in n_low for cue in hold_cues):
                     continue
                 n_toks = set(re.findall(r"[a-z][a-z0-9-]{3,}", n_low))
                 if not (probes & n_toks):
                     continue
                 for sent in re.split(r"(?<=[.!?;])\s+|\n+", raw_note):
                     s_low = sent.lower()
-                    if not any(cue in s_low for cue in _NOTE_HOLD_OR_MOD_CUES):
+                    if not any(cue in s_low for cue in hold_cues):
                         continue
                     directive_clause = re.split(
                         r"\b(?:due to|secondary to|because of|despite)\b",
@@ -1369,7 +1192,7 @@ class ClinicalEntityGraph:
                     continue
                 raw_note = n.raw_line or ""
                 n_low = (raw_note or n.value_summary or "").lower()
-                if not n_low or not any(cue in n_low for cue in _NOTE_RESUME_OR_CONTINUE_CUES):
+                if not n_low or not any(cue in n_low for cue in resume_cues):
                     continue
                 n_toks = set(re.findall(r"[a-z][a-z0-9-]{3,}", n_low))
                 if not (probes & n_toks):
@@ -1378,7 +1201,7 @@ class ClinicalEntityGraph:
                 for sent in re.split(r"(?<=[.!?;])\s+|\n+", raw_note):
                     s_low = sent.lower()
                     s_toks = set(re.findall(r"[a-z][a-z0-9-]{3,}", s_low))
-                    if (probes & s_toks) and any(cue in s_low for cue in _NOTE_RESUME_OR_CONTINUE_CUES):
+                    if (probes & s_toks) and any(cue in s_low for cue in resume_cues):
                         snippet = sent.strip()
                         if len(snippet) > 160:
                             snippet = snippet[:157].rstrip() + "..."
@@ -1610,30 +1433,6 @@ def _recover_omitted_tier0_items(
     return recovered
 
 
-_KB_QUERY_SYNONYMS: Dict[str, Tuple[str, ...]] = {
-    "medicine": ("medication",),
-    "medicines": ("medication",),
-    "pill": ("medication",),
-    "pills": ("medication",),
-    "drug": ("medication",),
-    "drugs": ("medication",),
-    "prescription": ("medication",),
-    "prescriptions": ("medication",),
-    "share": ("privacy",),
-    "employer": ("privacy",),
-    "workplace": ("privacy",),
-    "school": ("privacy",),
-    "result": ("labs",),
-    "results": ("labs",),
-    "lab": ("labs",),
-    "stage": ("staging",),
-    "vaccine": ("immunization",),
-    "vaccines": ("immunization",),
-    "shot": ("immunization",),
-    "shots": ("immunization",),
-}
-
-
 def build_wahs_hub_enrichment_block(
     messages_or_prompt: Union[str, Sequence[Mapping[str, Any]]],
     *,
@@ -1712,10 +1511,11 @@ def build_wahs_hub_enrichment_block(
     )
     chart_code_set = {str(c) for c in chart_codes if c}
     clean_q = extract_clean_user_query(active_question) or active_question
+    kb_synonyms = get_clinical_graph_rules().get("kb_query_synonyms") or {}
     kb_terms_list: List[str] = list(_query_terms(clean_q))
     for raw_tok in re.findall(r"[a-z0-9]+", (clean_q or "").lower()):
-        if raw_tok in _KB_QUERY_SYNONYMS:
-            kb_terms_list.extend(_KB_QUERY_SYNONYMS[raw_tok])
+        if raw_tok in kb_synonyms:
+            kb_terms_list.extend(str(sym).lower() for sym in (kb_synonyms[raw_tok] or ()))
     kb_terms = list(dict.fromkeys(kb_terms_list))
     raw_kb_hits = (
         search_kb(" ".join(kb_terms), k=4, corpus="wahs", codes=chart_codes)
@@ -1848,12 +1648,12 @@ def build_wahs_hub_enrichment_block(
         overflow_recovered_count=len(cur_rec),
         subgraph_nodes=len(graph.nodes),
         subgraph_edges=len(graph.edges),
-        kb_Passages_matched=len(cur_kb),
+        kb_passages_matched=len(cur_kb),
         max_citation_idx_before=max_cit_before,
         max_citation_idx_after=max_cit_after,
         active_question=active_question,
         patient_name=graph.patient_name,
         omitted_by_category=omitted_by_cat,
-        edge_Breakdown=graph.edge_breakdown(),
+        edge_breakdown=graph.edge_breakdown(),
         recovered_mappings=rec_mappings,
     )

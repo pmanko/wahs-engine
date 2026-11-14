@@ -606,14 +606,31 @@ def extract_bundle(
     numeric_points: List[NumericPoint] = []
     all_clinical_dates: List[str] = []
 
-    # Pre-scan clinical dates to establish reference_date (excluding Patient & Device)
+    _skip_ref_date_statuses = {
+        "planned",
+        "booked",
+        "scheduled",
+        "proposed",
+        "cancelled",
+        "entered-in-error",
+        "noshow",
+    }
+
+    # Pre-scan clinical dates to establish reference_date (excluding Patient, Device, Coverage & future/cancelled items)
     for res in resources:
         rtype = str(res.get("resourceType") or "")
         if (
             rtype in NON_CLINICAL_RESOURCE_TYPES
             or rtype in LOOKUP_ONLY_RESOURCE_TYPES
-            or rtype in {"Patient", "Device"}
+            or rtype in {"Patient", "Device", "Coverage"}
         ):
+            continue
+        raw_st = (
+            _codeable_status(res.get("status"))
+            or _codeable_status(res.get("clinicalStatus"))
+        )
+        ver_st = _codeable_status(res.get("verificationStatus"))
+        if raw_st in _skip_ref_date_statuses or ver_st in _skip_ref_date_statuses:
             continue
         for field_name in (
             "effectiveDateTime",

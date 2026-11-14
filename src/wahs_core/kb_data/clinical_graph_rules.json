@@ -1,0 +1,706 @@
+{
+  "drug_indication_rules": [
+    {
+      "med_tokens": [
+        "apixaban",
+        "eliquis",
+        "rivaroxaban",
+        "xarelto",
+        "warfarin",
+        "coumadin",
+        "dabigatran",
+        "edoxaban"
+      ],
+      "target_tokens": [
+        "atrial fibrillation",
+        "afib",
+        "flutter",
+        "thrombosis",
+        "embolism",
+        "dvt",
+        "pe",
+        "stroke",
+        "mechanical",
+        "aortic valve",
+        "mitral valve"
+      ],
+      "rationale": "Anticoagulation for thromboembolic protection / atrial fibrillation / prosthetic valve",
+      "kb_source": "AHA/ACC/HRS AFib & Anticoagulation Guideline"
+    },
+    {
+      "med_tokens": [
+        "sacubitril",
+        "valsartan",
+        "entresto",
+        "lisinopril",
+        "losartan",
+        "ramipril",
+        "enalapril",
+        "carvedilol",
+        "metoprolol",
+        "bisoprolol",
+        "spironolactone",
+        "eplerenone",
+        "furosemide",
+        "lasix",
+        "torsemide",
+        "bumetanide"
+      ],
+      "target_tokens": [
+        "heart failure",
+        "hfref",
+        "hfpef",
+        "cardiomyopathy",
+        "ventricular dysfunction",
+        "edema",
+        "overload"
+      ],
+      "rationale": "Guideline-directed medical therapy (GDMT) / decongestion for heart failure",
+      "kb_source": "AHA/ACC/HFSA Heart Failure Guideline"
+    },
+    {
+      "med_tokens": [
+        "empagliflozin",
+        "jardiance",
+        "dapagliflozin",
+        "farxiga",
+        "canagliflozin"
+      ],
+      "target_tokens": [
+        "heart failure",
+        "hfref",
+        "hfpef",
+        "diabetes",
+        "kidney disease",
+        "ckd",
+        "renal",
+        "nephropathy"
+      ],
+      "rationale": "SGLT2 inhibitor organ-protective therapy for HF / T2DM / CKD",
+      "kb_source": "KDIGO CKD & ADA/AHA Cardiorenal Guideline"
+    },
+    {
+      "med_tokens": [
+        "lisinopril",
+        "losartan",
+        "valsartan",
+        "amlodipine",
+        "hydrochlorothiazide",
+        "chlorthalidone",
+        "metoprolol",
+        "carvedilol",
+        "diltiazem",
+        "spironolactone",
+        "hydralazine"
+      ],
+      "target_tokens": [
+        "hypertension",
+        "high blood pressure",
+        "elevated blood pressure"
+      ],
+      "rationale": "Antihypertensive therapy for blood pressure control",
+      "kb_source": "ACC/AHA Hypertension Guideline"
+    },
+    {
+      "med_tokens": [
+        "metformin",
+        "insulin",
+        "glargine",
+        "lispro",
+        "aspart",
+        "glipizide",
+        "glimepiride",
+        "semaglutide",
+        "ozempic",
+        "liraglutide",
+        "dulaglutide",
+        "sitagliptin"
+      ],
+      "target_tokens": [
+        "diabetes",
+        "hyperglycemia",
+        "prediabetes",
+        "a1c"
+      ],
+      "rationale": "Glycemic control therapy for diabetes mellitus",
+      "kb_source": "ADA Standards of Care in Diabetes"
+    },
+    {
+      "med_tokens": [
+        "atorvastatin",
+        "lipitor",
+        "rosuvastatin",
+        "crestor",
+        "simvastatin",
+        "pravastatin",
+        "ezetimibe",
+        "evolocumab"
+      ],
+      "target_tokens": [
+        "hyperlipidemia",
+        "dyslipidemia",
+        "hypercholesterolemia",
+        "coronary",
+        "cad",
+        "atherosclerosis",
+        "myocardial infarction",
+        "stroke"
+      ],
+      "rationale": "Lipid-lowering and atherosclerotic cardiovascular risk reduction",
+      "kb_source": "ACC/AHA Cholesterol & ASCVD Guideline"
+    },
+    {
+      "med_tokens": [
+        "levothyroxine",
+        "synthroid"
+      ],
+      "target_tokens": [
+        "hypothyroidism",
+        "thyroid"
+      ],
+      "rationale": "Thyroid hormone replacement for hypothyroidism",
+      "kb_source": "ATA Hypothyroidism Guideline"
+    },
+    {
+      "med_tokens": [
+        "allopurinol",
+        "febuxostat",
+        "colchicine"
+      ],
+      "target_tokens": [
+        "gout",
+        "hyperuricemia"
+      ],
+      "rationale": "Urate-lowering / flare prophylaxis therapy for gout",
+      "kb_source": "ACR Gout Management Guideline"
+    },
+    {
+      "med_tokens": [
+        "albuterol",
+        "salbutamol",
+        "tiotropium",
+        "ipratropium",
+        "fluticasone",
+        "budesonide",
+        "formoterol",
+        "salmeterol",
+        "montelukast"
+      ],
+      "target_tokens": [
+        "asthma",
+        "copd",
+        "chronic obstructive",
+        "bronchitis",
+        "wheezing"
+      ],
+      "rationale": "Bronchodilator / anti-inflammatory airway therapy",
+      "kb_source": "GOLD COPD / GINA Asthma Strategy"
+    },
+    {
+      "med_tokens": [
+        "sertraline",
+        "escitalopram",
+        "fluoxetine",
+        "citalopram",
+        "venlafaxine",
+        "duloxetine",
+        "bupropion"
+      ],
+      "target_tokens": [
+        "depression",
+        "depressive",
+        "anxiety",
+        "ptsd",
+        "mood"
+      ],
+      "rationale": "Pharmacotherapy for depressive or anxiety disorder",
+      "kb_source": "APA Mood & Anxiety Clinical Practice Guideline"
+    },
+    {
+      "med_tokens": [
+        "buprenorphine",
+        "suboxone",
+        "naloxone",
+        "methadone",
+        "naltrexone"
+      ],
+      "target_tokens": [
+        "opioid",
+        "dependence",
+        "substance",
+        "addiction"
+      ],
+      "rationale": "Medication for opioid use disorder (MOUD)",
+      "kb_source": "SAMHSA / ASAM OUD Guideline"
+    },
+    {
+      "med_tokens": [
+        "aspirin",
+        "clopidogrel",
+        "plavix",
+        "ticagrelor",
+        "prasugrel",
+        "isosorbide",
+        "nitroglycerin"
+      ],
+      "target_tokens": [
+        "coronary",
+        "cad",
+        "angina",
+        "ischemic",
+        "myocardial infarction",
+        "stent",
+        "pci",
+        "bypass",
+        "cabg",
+        "heart failure",
+        "cardiomyopathy",
+        "vascular"
+      ],
+      "rationale": "Antiplatelet / antianginal therapy for ischemic or cardiovascular disease",
+      "kb_source": "ACC/AHA Chronic Coronary Disease Guideline"
+    }
+  ],
+  "safety_contraindication_rules": [
+    {
+      "med_tokens": [
+        "metformin"
+      ],
+      "target_tokens": [
+        "stage 4",
+        "stage 5",
+        "ckd 4",
+        "ckd 5",
+        "kidney disease, stage 4",
+        "kidney disease stage 4",
+        "egfr",
+        "glomerular filtration",
+        "creatinine",
+        "acute kidney",
+        "aki"
+      ],
+      "rationale": "Metformin renal safety: contraindicated when eGFR < 30 mL/min/1.73m2; avoid initiation and reduce dose when eGFR 30-44 due to lactic acidosis risk",
+      "kb_source": "FDA Metformin Boxed Warning & KDIGO Diabetes in CKD"
+    },
+    {
+      "med_tokens": [
+        "spironolactone",
+        "eplerenone",
+        "sacubitril",
+        "valsartan",
+        "entresto",
+        "lisinopril",
+        "losartan",
+        "ramipril",
+        "enalapril"
+      ],
+      "target_tokens": [
+        "hyperkalemia",
+        "potassium",
+        "stage 4",
+        "stage 5",
+        "ckd 4",
+        "kidney disease, stage 4",
+        "kidney disease stage 4",
+        "acute kidney",
+        "aki",
+        "creatinine",
+        "egfr",
+        "glomerular filtration"
+      ],
+      "rationale": "RAAS / MRA cardiorenal safety: monitor potassium (hyperkalemia risk) and renal function (eGFR/creatinine) in advanced CKD or volume depletion",
+      "kb_source": "AHA/ACC/HFSA & KDIGO Cardiorenal Monitoring Rule"
+    },
+    {
+      "med_tokens": [
+        "apixaban",
+        "eliquis",
+        "rivaroxaban",
+        "xarelto",
+        "dabigatran",
+        "edoxaban"
+      ],
+      "target_tokens": [
+        "stage 4",
+        "stage 5",
+        "ckd 4",
+        "kidney disease, stage 4",
+        "kidney disease stage 4",
+        "creatinine",
+        "egfr",
+        "glomerular filtration",
+        "bleed",
+        "hemorrhage",
+        "anemia",
+        "hemoglobin"
+      ],
+      "rationale": "DOAC renal & bleeding safety: check renal dose-reduction criteria and monitor renal clearance/hemoglobin",
+      "kb_source": "FDA Apixaban/DOAC Renal Dosing & Anticoagulation Safety"
+    },
+    {
+      "med_tokens": [
+        "warfarin",
+        "coumadin"
+      ],
+      "target_tokens": [
+        "inr",
+        "prothrombin",
+        "bleed",
+        "hemorrhage",
+        "bruising",
+        "hematuria",
+        "melena"
+      ],
+      "rationale": "Warfarin narrow therapeutic index: supratherapeutic INR or active bleeding requires prompt review and interaction check",
+      "kb_source": "CHEST Antithrombotic Therapy Guideline"
+    },
+    {
+      "med_tokens": [
+        "ibuprofen",
+        "naproxen",
+        "meloxicam",
+        "ketorolac",
+        "diclofenac",
+        "celecoxib",
+        "indomethacin",
+        "nsaid"
+      ],
+      "target_tokens": [
+        "kidney disease",
+        "ckd",
+        "renal",
+        "heart failure",
+        "hfref",
+        "creatinine",
+        "egfr",
+        "apixaban",
+        "warfarin",
+        "rivaroxaban",
+        "ulcer",
+        "bleed"
+      ],
+      "rationale": "NSAID high-risk interaction: associated with AKI, fluid retention/HF decompensation, and GI/anticoagulant bleeding",
+      "kb_source": "KDIGO & AGS Beers Criteria High-Risk Medication Rule"
+    },
+    {
+      "med_tokens": [
+        "allopurinol",
+        "colchicine",
+        "gabapentin",
+        "pregabalin",
+        "digoxin",
+        "fenofibrate"
+      ],
+      "target_tokens": [
+        "kidney disease",
+        "ckd",
+        "stage 3",
+        "stage 4",
+        "stage 5",
+        "creatinine",
+        "egfr",
+        "glomerular filtration"
+      ],
+      "rationale": "Renally cleared medication: check eGFR-guided dosing to prevent drug accumulation",
+      "kb_source": "Renal Pharmacotherapy Dosing Guideline"
+    },
+    {
+      "med_tokens": [
+        "furosemide",
+        "lasix",
+        "torsemide",
+        "bumetanide",
+        "hydrochlorothiazide",
+        "chlorthalidone",
+        "metolazone"
+      ],
+      "target_tokens": [
+        "potassium",
+        "sodium",
+        "creatinine",
+        "egfr",
+        "urea nitrogen",
+        "bun",
+        "hypotension",
+        "dehydration",
+        "acute kidney"
+      ],
+      "rationale": "Diuretic electrolyte & renal safety: monitor potassium, sodium, volume status, and creatinine",
+      "kb_source": "ACC/AHA Heart Failure Diuretic Monitoring Rule"
+    },
+    {
+      "med_tokens": [
+        "insulin",
+        "glargine",
+        "lispro",
+        "aspart",
+        "glipizide",
+        "glimepiride",
+        "glyburide"
+      ],
+      "target_tokens": [
+        "hypoglycemia",
+        "glucose",
+        "hemoglobin a1c",
+        "a1c",
+        "kidney disease",
+        "ckd"
+      ],
+      "rationale": "Hypoglycemia risk: reduced renal clearance and tight glycemic control in CKD or older adults increase hypoglycemia risk",
+      "kb_source": "ADA Glycemic Targets & Older Adults Safety Guideline"
+    }
+  ],
+  "monitoring_rules": [
+    {
+      "trigger_tokens": [
+        "kidney",
+        "ckd",
+        "renal",
+        "nephropathy",
+        "proteinuria",
+        "spironolactone",
+        "eplerenone",
+        "sacubitril",
+        "valsartan",
+        "lisinopril",
+        "losartan",
+        "ramipril",
+        "furosemide",
+        "torsemide",
+        "empagliflozin",
+        "dapagliflozin",
+        "metformin",
+        "allopurinol"
+      ],
+      "obs_tokens": [
+        "creatinine",
+        "glomerular filtration",
+        "egfr",
+        "potassium",
+        "urea nitrogen",
+        "bun",
+        "albumin/creatinine",
+        "uacr",
+        "cystatin"
+      ],
+      "rationale": "Renal function & electrolyte surveillance (Cr / eGFR / K+ / BUN / UACR)"
+    },
+    {
+      "trigger_tokens": [
+        "heart failure",
+        "hfref",
+        "hfpef",
+        "cardiomyopathy",
+        "edema",
+        "dyspnea",
+        "sacubitril",
+        "valsartan",
+        "furosemide",
+        "torsemide",
+        "spironolactone",
+        "carvedilol",
+        "metoprolol"
+      ],
+      "obs_tokens": [
+        "natriuretic",
+        "nt-probnp",
+        "bnp",
+        "body weight",
+        "weight",
+        "potassium",
+        "creatinine",
+        "sodium",
+        "ejection fraction",
+        "lvef"
+      ],
+      "rationale": "Heart failure congestion & cardiorenal trajectory monitoring (NT-proBNP / Weight / K+ / Cr)"
+    },
+    {
+      "trigger_tokens": [
+        "diabetes",
+        "hyperglycemia",
+        "metformin",
+        "insulin",
+        "glargine",
+        "glipizide",
+        "semaglutide",
+        "liraglutide",
+        "empagliflozin",
+        "dapagliflozin"
+      ],
+      "obs_tokens": [
+        "hemoglobin a1c",
+        "hba1c",
+        "a1c",
+        "glucose",
+        "albumin/creatinine",
+        "uacr"
+      ],
+      "rationale": "Glycemic control & diabetic nephropathy surveillance (HbA1c / Glucose / UACR)"
+    },
+    {
+      "trigger_tokens": [
+        "atrial fibrillation",
+        "afib",
+        "thrombosis",
+        "embolism",
+        "warfarin",
+        "apixaban",
+        "rivaroxaban",
+        "dabigatran",
+        "heparin"
+      ],
+      "obs_tokens": [
+        "inr",
+        "prothrombin",
+        "hemoglobin",
+        "hematocrit",
+        "platelet",
+        "creatinine",
+        "heart rate"
+      ],
+      "rationale": "Anticoagulation safety, bleeding & rate surveillance (INR / Hgb / Platelets / Cr)"
+    },
+    {
+      "trigger_tokens": [
+        "hyperlipidemia",
+        "dyslipidemia",
+        "coronary",
+        "cad",
+        "atherosclerosis",
+        "atorvastatin",
+        "rosuvastatin",
+        "simvastatin",
+        "ezetimibe"
+      ],
+      "obs_tokens": [
+        "cholesterol",
+        "ldl",
+        "hdl",
+        "triglyceride",
+        "aminotransferase",
+        "ast",
+        "alt"
+      ],
+      "rationale": "Lipid panel & statin safety surveillance (LDL-C / Total Cholesterol / Triglycerides / Hepatic enzymes)"
+    },
+    {
+      "trigger_tokens": [
+        "hypertension",
+        "blood pressure",
+        "amlodipine",
+        "lisinopril",
+        "losartan",
+        "valsartan",
+        "hydrochlorothiazide",
+        "chlorthalidone",
+        "metoprolol",
+        "carvedilol"
+      ],
+      "obs_tokens": [
+        "blood pressure",
+        "systolic",
+        "diastolic",
+        "mean arterial"
+      ],
+      "rationale": "Hemodynamic blood pressure trajectory monitoring"
+    },
+    {
+      "trigger_tokens": [
+        "hypothyroidism",
+        "thyroid",
+        "levothyroxine"
+      ],
+      "obs_tokens": [
+        "thyrotropin",
+        "tsh",
+        "thyroxine",
+        "free t4"
+      ],
+      "rationale": "Thyroid function surveillance (TSH / Free T4)"
+    },
+    {
+      "trigger_tokens": [
+        "gout",
+        "hyperuricemia",
+        "allopurinol",
+        "febuxostat"
+      ],
+      "obs_tokens": [
+        "urate",
+        "uric acid"
+      ],
+      "rationale": "Serum urate target surveillance"
+    },
+    {
+      "trigger_tokens": [
+        "anemia",
+        "iron deficiency",
+        "bleed",
+        "hemorrhage"
+      ],
+      "obs_tokens": [
+        "hemoglobin",
+        "hematocrit",
+        "ferritin",
+        "iron",
+        "mcv",
+        "reticulocyte"
+      ],
+      "rationale": "Hematologic & iron status trajectory monitoring"
+    }
+  ],
+  "note_hold_or_mod_cues": [
+    "stopped",
+    "stop ",
+    "discontinue",
+    "discontinued",
+    "held",
+    "holding",
+    "hold ",
+    "avoid ",
+    "reconcile",
+    "duplicate",
+    "not taking",
+    "non-adherent",
+    "nonadherent",
+    "self-discontinued",
+    "ran out",
+    "reduced",
+    "half dose",
+    "declined",
+    "intolerant",
+    "switched",
+    "outside"
+  ],
+  "note_resume_or_continue_cues": [
+    "continue ",
+    "continuing ",
+    "resume ",
+    "resumed ",
+    "restart ",
+    "restarted "
+  ],
+  "kb_query_synonyms": {
+    "medicine": ["medication"],
+    "medicines": ["medication"],
+    "pill": ["medication"],
+    "pills": ["medication"],
+    "drug": ["medication"],
+    "drugs": ["medication"],
+    "prescription": ["medication"],
+    "prescriptions": ["medication"],
+    "share": ["privacy"],
+    "employer": ["privacy"],
+    "workplace": ["privacy"],
+    "school": ["privacy"],
+    "result": ["labs"],
+    "results": ["labs"],
+    "lab": ["labs"],
+    "stage": ["staging"],
+    "vaccine": ["immunization"],
+    "vaccines": ["immunization"],
+    "shot": ["immunization"],
+    "shots": ["immunization"]
+  }
+}

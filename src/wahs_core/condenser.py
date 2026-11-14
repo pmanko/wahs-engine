@@ -16,7 +16,6 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass
-from datetime import date, timedelta
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from .chart_serializer import render_chart
@@ -93,16 +92,6 @@ def _int_date(d: Optional[str]) -> int:
     if not d or not re.match(r"^\d{4}-\d{2}-\d{2}$", d):
         return 0
     return int(d.replace("-", ""))
-
-
-def _cutoff_iso(reference_date: Optional[str], days: int) -> str:
-    if not reference_date:
-        return "0000-00-00"
-    try:
-        ref = date.fromisoformat(reference_date[:10])
-        return (ref - timedelta(days=days)).isoformat()
-    except ValueError:
-        return "0000-00-00"
 
 
 def _merge_uuids(items: Sequence[ClinicalItem]) -> Tuple[str, ...]:
