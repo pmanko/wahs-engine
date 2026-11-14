@@ -1074,7 +1074,7 @@ class ClinicalEntityGraph:
         active_med_dicts = [
             {
                 "resourceUuid": it.resource_uuid,
-                "ingredient_key": it.ingredient_key or normalize_drug_ingredient(it.code, it.display),
+                "ingredient_key": it.ingredient_key or normalize_drug_ingredient(it.display),
                 "display": it.display,
                 "setting": str((it.metadata or {}).get("setting") or "prescribed"),
                 "date": it.date or "",
@@ -1427,6 +1427,17 @@ class ClinicalEntityGraph:
             [e for e in self.edges if e.edge_type != "REPORTED_BY_ORG"],
             key=_score_edge,
         )
+        high_prio_targets: Set[str] = set()
+        for edge in ranked:
+            if edge.edge_type not in _HIGH_PRIORITY_EDGE_TYPES:
+                continue
+            src = self.nodes.get(edge.source_id)
+            tgt = self.nodes.get(edge.target_id)
+            if src is not None and tgt is not None and tgt.node_id != src.node_id:
+                tgt_disp = tgt.short_display()
+                if tgt_disp:
+                    high_prio_targets.add(tgt_disp)
+
         seen_raw: Set[Tuple[str, str, str, str]] = set()
         stage_a: Dict[Tuple[str, str, str], List[str]] = {}
         for edge in ranked:
@@ -1440,6 +1451,13 @@ class ClinicalEntityGraph:
                 continue
             src_disp = src.short_display()
             tgt_disp = "" if tgt.node_id == src.node_id else tgt.short_display()
+            if (
+                not is_high_prio
+                and edge.edge_type == "MONITORED_BY"
+                and tgt_disp
+                and tgt_disp in high_prio_targets
+            ):
+                continue
             raw_key = (edge.edge_type, src_disp, tgt_disp, edge.rationale)
             if raw_key in seen_raw:
                 continue
@@ -1451,17 +1469,23 @@ class ClinicalEntityGraph:
 
         stage_b: Dict[Tuple[str, str, str], List[str]] = {}
         for (edge_type, src_disp, rationale), targets_list in stage_a.items():
+            if edge_type not in _HIGH_PRIORITY_EDGE_TYPES and not targets_list:
+                continue
             joined_targets = "; ".join(targets_list)
             key_b = (edge_type, joined_targets, rationale)
             sources_list = stage_b.setdefault(key_b, [])
             if src_disp not in sources_list:
                 sources_list.append(src_disp)
 
+        high_prio_lines = sum(
+            1 for (et, _, _) in stage_b if et in _HIGH_PRIORITY_EDGE_TYPES
+        )
+        max_bg = 0 if high_prio_lines >= 8 else (1 if high_prio_lines >= 6 else 3)
         lines: List[str] = []
         bg_emitted = 0
         for (edge_type, joined_targets, rationale), sources_list in stage_b.items():
             if edge_type not in _HIGH_PRIORITY_EDGE_TYPES:
-                if bg_emitted >= 3:
+                if bg_emitted >= max_bg:
                     continue
                 bg_emitted += 1
             joined_sources = "; ".join(sources_list)
@@ -1548,7 +1572,9 @@ def _recover_omitted_tier0_items(
             continue
         sec_prio = _SECTION_OVERFLOW_PRIORITY.get(it.section, 15)
         is_abn = 0 if (isinstance(it.metadata, Mapping) and it.metadata.get("is_abnormal")) else 1
-        candidates.append(((-overlap, sec_prio, is_abn, it.date or ""), it))  # type: ignore[arg-type]
+        dt10 = (it.date or "")[:10]
+        neg_dt = -int(dt10.replace("-", "")) if re.match(r"^\d{4}-\d{2}-\d{2}$", dt10) else 0
+        candidates.append(((-overlap, sec_prio, is_abn, neg_dt), it))  # type: ignore[arg-type]
 
     candidates.sort(key=lambda pair: pair[0])
     recovered: List[Tuple[str, Dict[str, Any]]] = []
@@ -1561,7 +1587,10 @@ def _recover_omitted_tier0_items(
             continue
         seen_uuids.add(ruuid)
         dt_part = f"({it.date}) " if it.date else ""
-        snippet = it.text or it.display or it.resource_type
+        snippet = (it.text or it.display or it.resource_type).strip()
+        rt_prefix = f"{it.resource_type}:"
+        if snippet.lower().startswith(rt_prefix.lower()):
+            snippet = snippet[len(rt_prefix):].strip()
         if len(snippet) > 160:
             snippet = snippet[:157].rstrip() + "..."
         line = f"  [{next_idx}] {dt_part}{it.resource_type}: {snippet}"
@@ -1579,6 +1608,30 @@ def _recover_omitted_tier0_items(
             break
 
     return recovered
+
+
+_KB_QUERY_SYNONYMS: Dict[str, Tuple[str, ...]] = {
+    "medicine": ("medication",),
+    "medicines": ("medication",),
+    "pill": ("medication",),
+    "pills": ("medication",),
+    "drug": ("medication",),
+    "drugs": ("medication",),
+    "prescription": ("medication",),
+    "prescriptions": ("medication",),
+    "share": ("privacy",),
+    "employer": ("privacy",),
+    "workplace": ("privacy",),
+    "school": ("privacy",),
+    "result": ("labs",),
+    "results": ("labs",),
+    "lab": ("labs",),
+    "stage": ("staging",),
+    "vaccine": ("immunization",),
+    "vaccines": ("immunization",),
+    "shot": ("immunization",),
+    "shots": ("immunization",),
+}
 
 
 def build_wahs_hub_enrichment_block(
@@ -1657,22 +1710,47 @@ def build_wahs_hub_enrichment_block(
         if extracted is not None
         else []
     )
-    kb_hits = (
-        search_kb(active_question, k=4, corpus="wahs", codes=chart_codes)
-        if (active_question or chart_codes)
+    chart_code_set = {str(c) for c in chart_codes if c}
+    clean_q = extract_clean_user_query(active_question) or active_question
+    kb_terms_list: List[str] = list(_query_terms(clean_q))
+    for raw_tok in re.findall(r"[a-z0-9]+", (clean_q or "").lower()):
+        if raw_tok in _KB_QUERY_SYNONYMS:
+            kb_terms_list.extend(_KB_QUERY_SYNONYMS[raw_tok])
+    kb_terms = list(dict.fromkeys(kb_terms_list))
+    raw_kb_hits = (
+        search_kb(" ".join(kb_terms), k=4, corpus="wahs", codes=chart_codes)
+        if kb_terms
         else []
     )
     kb_lines: List[str] = []
-    for hit in kb_hits:
+    for hit in raw_kb_hits:
+        is_privacy_kb = "privacy" in str(hit.get("id") or "").lower() or "sdoh" in {
+            str(t).lower() for t in (hit.get("tags") or [])
+        }
+        if is_privacy_kb and (sharing_posture == "external_share" or "privacy" not in kb_terms):
+            continue
+        hit_hay = f"{hit.get('title', '')} {hit.get('text', '')} {' '.join(hit.get('tags') or [])}".lower()
+        if not any(t in hit_hay or (len(t) >= 5 and t[:5] in hit_hay) for t in kb_terms):
+            continue
+        hit_codes = {str(c) for c in (hit.get("codes") or []) if c}
+        if (
+            hit_codes
+            and chart_code_set
+            and not is_privacy_kb
+            and not (hit_codes & chart_code_set)
+        ):
+            continue
         title = str(hit.get("title") or "Clinical Guideline").strip()
-        summary = str(hit.get("summary") or "").strip()
+        summary = str(hit.get("text") or hit.get("summary") or "").strip()
         source = str(hit.get("source") or "").strip()
         if not summary:
             continue
-        src_note = f" ({source})" if source else ""
+        src_short = source.split(" / ")[0].split(" — ")[0].strip()
+        src_note = f" ({src_short})" if src_short and len(src_short) <= 48 else ""
         kb_lines.append(f"- {title}{src_note}: {summary}")
 
     subgraph_lines = graph.format_subgraph_lines(active_question)
+    kb_lines = kb_lines[: (1 if len(subgraph_lines) >= 8 else 2)]
 
     header_line = (
         "=== CONTEXT ENRICHMENT (Patient Entity Subgraph, Overflow Recovery, & Clinical Guidelines) ==="
