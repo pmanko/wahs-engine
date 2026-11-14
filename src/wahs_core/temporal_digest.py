@@ -185,7 +185,12 @@ def _resolve_series_bounds(
     all_utc = all((p.timestamp or "").startswith("Z:") for p in raw_pts)
     all_naive = all((p.timestamp or "").startswith("N:") for p in raw_pts)
     if all_utc or all_naive:
-        pts_sorted = sorted(raw_pts, key=lambda p: (p.timestamp, day_of(p)))
+        bound_day = (
+            (lambda p: (_iso10(p.timestamp[2:]) or day_of(p)))
+            if all_utc
+            else day_of
+        )
+        pts_sorted = sorted(raw_pts, key=lambda p: (p.timestamp, bound_day(p)))
         min_ts = pts_sorted[0].timestamp
         max_ts = pts_sorted[-1].timestamp
         first_group = [p for p in pts_sorted if p.timestamp == min_ts]
@@ -198,8 +203,8 @@ def _resolve_series_bounds(
             last_ok,
             first_group,
             last_group,
-            day_of(first_group[0]),
-            day_of(last_group[-1]),
+            bound_day(first_group[0]),
+            bound_day(last_group[-1]),
         )
 
     min_day = min(day_of(p) for p in raw_pts)

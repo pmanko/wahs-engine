@@ -1999,6 +1999,64 @@ def extract_bundle(
                     metadata=enc_meta,
                 )
             )
+        elif rtype == "Appointment":
+            appt_start = _iso_date(res.get("start"))
+            appt_end = _iso_date(res.get("end"))
+            appt_date = appt_start or appt_end
+            appt_status = str(res.get("status") or "booked").strip().lower()
+            appt_type_code, appt_type_disp = _coding_pair(res.get("appointmentType") or {})
+            svc_types = res.get("serviceType") or []
+            svc_code, svc_disp = _coding_pair(svc_types[0] if svc_types else {})
+            specs = res.get("specialty") or []
+            spec_code, spec_disp = _coding_pair(specs[0] if specs else {})
+            appt_disp = (
+                str(res.get("description") or "").strip()
+                or svc_disp
+                or spec_disp
+                or appt_type_disp
+                or "Scheduled Appointment"
+            )
+            appt_code = svc_code or spec_code or appt_type_code
+            reasons: List[str] = []
+            for rc in res.get("reasonCode") or []:
+                _, r_disp = _coding_pair(rc)
+                if r_disp:
+                    reasons.append(r_disp)
+            org = resolve_source_org(res)
+            appt_sens, appt_sens_src = _classify_res_sensitivity(res, appt_code, appt_disp)
+            quals = [f"status: {appt_status}"]
+            if reasons:
+                quals.append(f"reason: {', '.join(dict.fromkeys(reasons))}")
+            if org:
+                quals.append(f"facility: {org}")
+            appt_meta: Dict[str, Any] = {"start": appt_start, "end": appt_end}
+            if appt_sens_src:
+                appt_meta["sensitivity_source"] = appt_sens_src
+            is_fulfilled = appt_status == "fulfilled"
+            items.append(
+                ClinicalItem(
+                    resource_type="Appointment",
+                    resource_uuid=rid,
+                    date=appt_date,
+                    clinical_date=appt_date if is_fulfilled else None,
+                    date_kind=(
+                        "clinical_event"
+                        if (is_fulfilled and appt_date)
+                        else ("planned" if appt_date else "unknown")
+                    ),
+                    section="encounter_routine",
+                    code=appt_code,
+                    display=appt_disp,
+                    text=f"Appointment: {appt_disp} ({', '.join(quals)})",
+                    mandatory=False,
+                    status=appt_status,
+                    end_date=appt_end,
+                    source_org=org,
+                    sensitivity=appt_sens,
+                    is_routine=True,
+                    metadata=appt_meta,
+                )
+            )
 
     return ExtractedChart(
         patient_id=patient_id,
