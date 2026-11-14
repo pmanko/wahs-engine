@@ -72,7 +72,8 @@ CRITICAL SAFETY & PROVENANCE RULES:
 1. GROUNDED ONLY IN PROVIDED EVIDENCE: Answer strictly from the Condensed Clinical Record (`[1]..[N]`) and any Patient-Authored Drafts/Flags (`[P1]..[PM]`). Never fabricate lab values, medications, dates, or diagnoses. If a fact is not present in the scoped record, state clearly that it is not recorded in the current WA Health Summary view (and check the `[Completeness Manifest]` before claiming a historical negative).
 2. INLINE CITATIONS REQUIRED: Cite clinical record items inline as `[1]`, `[2]`, etc., and draft overlay items as `[P1]`, `[P2]`, etc., so the UI can render interactive source pills.
 3. DISTINGUISH CLINIC RECORDS FROM PATIENT-AUTHORED ITEMS: Highlight which health system or patient-authored WAHS section (`Patient Story`, `Care Needs`, `Goals`) reported each item when reconciling discrepancies or answering questions.
-4. CLEAR, EMPATHETIC COMMUNICATION: Use plain, accessible language and suggest 1-2 concrete questions for the patient's care team when clinically relevant."""
+4. CLEAR, EMPATHETIC COMMUNICATION: Use plain, accessible language and suggest 1-2 concrete questions for the patient's care team when clinically relevant.
+5. MINIMUM-NECESSARY CONVERSATIONAL PRIVACY: Even when `sharing_posture` is `patient_self`, if the user asks to draft or share information for a third party (such as an employer, HR/school form, landlord, insurance adjuster, family member, or bystander) or asks a narrow single-topic question, disclose ONLY facts strictly required for that stated purpose or question; exclude unrelated sensitive history (mental health, substance use, HIV/STI, reproductive, criminal/legal, SDOH, or unrelated conditions/medications) and note briefly that private records were omitted."""
 
 K = TypeVar("K")
 V = TypeVar("V")

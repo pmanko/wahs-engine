@@ -769,7 +769,18 @@ _HOLD_CLAUSE_RE = re.compile(
 )
 
 
-def _extract_note_conflict_clauses(text: str, max_chars: int = 160) -> str:
+_VITAL_HEADER_RE = re.compile(
+    r"\b(?:BP|Blood\s+Pressure|HR|Pulse|SpO2|Temp(?:erature)?|Wt|Weight)\s*[:=]?\s*\d{2,3}(?:/\d{2,3})?(?:\.\d+)?[^.;|\n]{0,30}",
+    re.IGNORECASE,
+)
+
+
+def _extract_note_conflict_clauses(
+    text: str,
+    max_chars: int = 160,
+    *,
+    include_vitals: bool = False,
+) -> str:
     clauses = [
         c.strip()
         for c in re.split(r"[.;|\n]+", text or "")
@@ -778,6 +789,10 @@ def _extract_note_conflict_clauses(text: str, max_chars: int = 160) -> str:
     if not clauses:
         return (text or "").strip()[:max_chars]
     joined = "; ".join(clauses)
+    if include_vitals:
+        m_vit = _VITAL_HEADER_RE.search(text or "")
+        if m_vit and m_vit.group(0).strip().lower() not in joined.lower():
+            joined = f"{m_vit.group(0).strip()}; {joined}"
     return joined[:max_chars] + ("..." if len(joined) > max_chars else "")
 
 
@@ -794,8 +809,10 @@ def _excerpt_notes(notes: Sequence[ClinicalItem], max_chars: int = 400) -> List[
             else ""
         )
         if full_norm and len(full_norm) > max_chars:
-            if n.conflict_note:
-                c_clause = _extract_note_conflict_clauses(full_norm, max_chars=min(200, max_chars))
+            has_hold_clause = bool(_HOLD_CLAUSE_RE.search(full_norm))
+            if n.conflict_note or has_hold_clause:
+                c_cap = min(260, max(120, max_chars - 90))
+                c_clause = _extract_note_conflict_clauses(full_norm, max_chars=c_cap, include_vitals=True)
                 head_budget = max(60, max_chars - len(c_clause) - 6)
                 head = full_norm[:head_budget].strip()
                 if c_clause and c_clause.lower() not in head.lower():
@@ -2252,7 +2269,7 @@ def _build_compressed_and_ultra_mandatory(
     compact_conflict_notes: List[ClinicalItem] = []
     for cn in conflict_notes:
         raw_nt = str(cn.metadata.get("full_text") or cn.text or "")
-        clause_str = _extract_note_conflict_clauses(raw_nt, max_chars=120)
+        clause_str = _extract_note_conflict_clauses(raw_nt, max_chars=260, include_vitals=True)
         c_tag = f" [{cn.conflict_note}]" if cn.conflict_note else ""
         compact_conflict_notes.append(
             ClinicalItem(
@@ -2535,12 +2552,55 @@ def _build_compressed_and_ultra_mandatory(
     return compressed_mandatory, _build_ultra
 
 
+_PRIMARY_SECTION_QUOTAS: Dict[str, int] = {
+    "lab_trajectory": 16,
+    "clinical_note": 10,
+    "vital_sign": 8,
+    "careplan_active": 12,
+    "imaging": 8,
+    "lab_panel": 8,
+    "lab_observation": 16,
+    "med_historical": 12,
+    "condition_resolved": 15,
+    "procedure_major": 10,
+    "encounter_acuity": 10,
+    "immunization": 10,
+    "social_history": 8,
+    "survey_panel": 6,
+    "procedure_routine": 4,
+    "encounter_routine": 4,
+}
+
+_MICROBIOLOGY_PATHOLOGY_KW: Tuple[str, ...] = (
+    "culture",
+    "microbiology",
+    "gram stain",
+    "susceptib",
+    "isolate",
+    "growth",
+    "mrsa",
+    "klebsiella",
+    "coli",
+    "biopsy",
+    "pathology",
+)
+
+
 def _rank_optional_items_deterministic(
     optional_items: Sequence[ClinicalItem],
     *,
     question: str,
 ) -> List[ClinicalItem]:
-    """Budget-independent deterministic priority ordering for optional items in Stage B."""
+    """Budget-independent 2-pass priority ordering for optional items in Stage B.
+
+    Pass 0 selects a fixed primary horizon per clinical section (and prioritizes
+    microbiology/cultures over routine numeric repeats) so large historical
+    lab/condition tails cannot starve recent notes, vitals, imaging, or careplans
+    at 8k–32k budgets. Pass 1 emits the remaining historical tail in balanced
+    section priority order. Because quotas and rankings do not depend on
+    ``target_tokens``, prefix monotonicity (``covered_uuids(B1) <= covered_uuids(B2)``)
+    is strictly guaranteed.
+    """
     q_terms = {
         tok.lower()
         for tok in re.findall(r"[A-Za-z0-9]+", question or "")
@@ -2548,33 +2608,53 @@ def _rank_optional_items_deterministic(
     }
     section_rank = {
         "lab_trajectory": 1,
-        "med_historical": 2,
-        "procedure_major": 3,
-        "encounter_acuity": 4,
-        "immunization": 5,
+        "clinical_note": 2,
+        "vital_sign": 3,
+        "careplan_active": 4,
+        "imaging": 5,
         "lab_panel": 6,
-        "lab_observation": 7,
-        "condition_resolved": 8,
-        "vital_sign": 9,
-        "careplan_active": 10,
+        "med_historical": 7,
+        "procedure_major": 8,
+        "encounter_acuity": 9,
+        "immunization": 10,
         "social_history": 11,
-        "clinical_note": 12,
-        "survey_panel": 13,
-        "imaging": 14,
+        "lab_observation": 12,
+        "condition_resolved": 13,
+        "survey_panel": 14,
         "procedure_routine": 15,
         "encounter_routine": 16,
     }
-    return sorted(
-        optional_items,
-        key=lambda it: (
-            -sum(1 for t in q_terms if t in f"{it.display} {it.text}".lower()),
-            section_rank.get(it.section, 20),
+
+    def _within_section_key(it: ClinicalItem) -> Tuple[Any, ...]:
+        hay = f"{it.display} {it.text}".lower()
+        q_hits = sum(1 for t in q_terms if t in hay)
+        is_micro = 0 if (it.section == "lab_observation" and any(kw in hay for kw in _MICROBIOLOGY_PATHOLOGY_KW)) else 1
+        return (
+            -q_hits,
+            is_micro,
             0 if int(it.metadata.get("n_points", 0)) >= 2 else 1,
             int(it.metadata.get("analyte_rank", 999)),
             -_int_date(it.date),
             str(it.resource_uuid or ""),
-        ),
-    )
+        )
+
+    by_section: Dict[str, List[ClinicalItem]] = {}
+    for it in optional_items:
+        by_section.setdefault(it.section, []).append(it)
+
+    tagged: List[Tuple[Tuple[Any, ...], ClinicalItem]] = []
+    for sec, sec_items in by_section.items():
+        ordered_sec = sorted(sec_items, key=_within_section_key)
+        quota = _PRIMARY_SECTION_QUOTAS.get(sec, 4)
+        s_rank = section_rank.get(sec, 20)
+        for idx, it in enumerate(ordered_sec):
+            hay = f"{it.display} {it.text}".lower()
+            q_hits = sum(1 for t in q_terms if t in hay)
+            pass_tier = 0 if idx < quota else 1
+            tagged.append(((pass_tier, -q_hits, s_rank, idx), it))
+
+    tagged.sort(key=lambda pair: pair[0])
+    return [pair[1] for pair in tagged]
 
 
 def _condense_two_stage_monotonic(

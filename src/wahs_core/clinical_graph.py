@@ -1822,8 +1822,9 @@ def build_wahs_hub_enrichment_block(
     # Rule 4: Assemble and enforce <= max_tokens cap
     header_line = "[WAHS CLINICAL CONTEXT ENRICHMENT]"
     instruction_line = (
-        "Context Note: Cite any Tier-0 recovered chart items below inline as [N]; "
-        "treat guideline entries as general clinical reference rather than patient-specific diagnoses."
+        "Context Note: Cite any Tier-0 recovered chart items below inline as [N]. "
+        "Use ONLY subgraph links directly relevant to the user's specific question (do NOT recite unrelated medication/condition alerts), "
+        "and treat guideline entries as general clinical reference rather than patient-specific diagnoses."
     )
 
     cat_desc = (
