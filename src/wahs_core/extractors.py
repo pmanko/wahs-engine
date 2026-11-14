@@ -96,6 +96,7 @@ class NumericPoint:
     interpretation: Optional[str] = None
     reference_range: Optional[str] = None
     is_abnormal: bool = False
+    timestamp: str = ""
 
 
 @dataclass
@@ -163,6 +164,31 @@ def _iso_timestamp(val: Optional[str]) -> Optional[str]:
     if m:
         return f"{m.group(1)}T{m.group(2)}"
     return None
+
+
+def _sort_timestamp_key(val: Optional[str]) -> str:
+    """Return canonical comparable timestamp (`Z:...` UTC or `N:...` naive) when intraday time is present."""
+    if not val:
+        return ""
+    s = str(val).strip()
+    if not re.match(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}", s):
+        return ""
+    iso_norm = re.sub(
+        r"^(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2})($|[Zz]|[+-]\d{2}(?::?\d{2})?)$",
+        r"\1:00\2",
+        s,
+    )
+    if iso_norm.endswith(("Z", "z")):
+        iso_norm = f"{iso_norm[:-1]}+00:00"
+    iso_norm = re.sub(r"(\.\d{6})\d+", r"\1", iso_norm)
+    try:
+        dt = datetime.fromisoformat(iso_norm)
+    except ValueError:
+        return ""
+    if dt.tzinfo is not None:
+        dt_utc = dt.astimezone(timezone.utc)
+        return f"Z:{dt_utc.strftime('%Y-%m-%dT%H:%M:%S')}.{dt_utc.microsecond:06d}"
+    return f"N:{dt.strftime('%Y-%m-%dT%H:%M:%S')}.{dt.microsecond:06d}"
 
 
 def _coding_pair(codeable: Optional[Mapping[str, Any]]) -> Tuple[str, str]:
@@ -1269,6 +1295,7 @@ def extract_bundle(
         obs_date: str,
         obs_cat: str,
         obs_cats: Sequence[str],
+        obs_ts: str = "",
     ) -> Tuple[List[NumericPoint], List[str], Optional[str], List[Dict[str, Any]], bool]:
         pts: List[NumericPoint] = []
         comp_sens: List[str] = []
@@ -1305,6 +1332,7 @@ def extract_bundle(
                             interpretation=c_interp,
                             reference_range=c_rr,
                             is_abnormal=c_abn,
+                            timestamp=obs_ts or _sort_timestamp_key(obs_date),
                         )
                     )
                 elif c_cmp:
@@ -1354,7 +1382,8 @@ def extract_bundle(
             continue
         rid = str(res.get("id") or "")
         code, disp = _coding_pair(res.get("code"))
-        p_date = _iso_date(res.get("effectiveDateTime") or res.get("issued"))
+        p_date_raw = res.get("effectiveDateTime") or res.get("issued")
+        p_date = _iso_date(p_date_raw)
         is_survey = bool(_SURVEY_PANEL_PATTERNS.search(disp or ""))
 
         member_uuids: List[str] = [rid]
@@ -1392,6 +1421,7 @@ def extract_bundle(
                 (_iso_timestamp(o_date_raw) if preserve_intraday_timestamps else _iso_date(o_date_raw))
                 or p_date
             )
+            o_sort_ts = _sort_timestamp_key(o_date_raw if o_date_raw else p_date_raw)
             o_primary_cat = o_cats[0] if o_cats else ("survey" if is_survey else "laboratory")
             o_sens, o_sens_src = _classify_res_sensitivity(
                 child_obs, o_code, f"{o_disp} {val_str}", o_cats
@@ -1416,7 +1446,7 @@ def extract_bundle(
                     child_comp_entries,
                     child_comp_structured,
                 ) = _extract_obs_components(
-                    child_obs, oid, o_date or "", o_primary_cat, o_cats
+                    child_obs, oid, o_date or "", o_primary_cat, o_cats, obs_ts=o_sort_ts
                 )
                 if child_comp_structured:
                     structured_child_count += 1
@@ -1449,6 +1479,7 @@ def extract_bundle(
                         interpretation=o_interp,
                         reference_range=o_range,
                         is_abnormal=o_abn,
+                        timestamp=o_sort_ts,
                     )
                 )
             else:
@@ -1568,6 +1599,7 @@ def extract_bundle(
         raw_obs_dt = res.get("effectiveDateTime") or res.get("issued")
         o_date = _iso_date(raw_obs_dt)
         o_ts = (_iso_timestamp(raw_obs_dt) if preserve_intraday_timestamps else None) or o_date
+        o_sort_ts = _sort_timestamp_key(raw_obs_dt)
         cats = _categories(res)
         val_str, num_val, unit = _format_obs_value(res)
         obs_interp, obs_range, obs_abn = _extract_obs_interpretation_and_range(res, num_val)
@@ -1585,7 +1617,7 @@ def extract_bundle(
                 comp_entries,
                 all_comp_structured,
             ) = _extract_obs_components(
-                res, rid, o_ts or o_date or "", primary_cat, cats
+                res, rid, o_ts or o_date or "", primary_cat, cats, obs_ts=o_sort_ts
             )
             numeric_points.extend(comp_pts)
             if any(pt.is_abnormal for pt in comp_pts) or any(
@@ -1631,6 +1663,7 @@ def extract_bundle(
                     interpretation=obs_interp,
                     reference_range=obs_range,
                     is_abnormal=obs_abn,
+                    timestamp=o_sort_ts,
                 )
             )
 

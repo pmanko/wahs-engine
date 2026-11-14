@@ -1025,7 +1025,18 @@ class ClinicalEntityGraph:
             series_by_key.setdefault(key, []).append(pt)
 
         for code_key, points in series_by_key.items():
-            points_sorted = sorted(points, key=lambda p: p.date or "")
+            all_utc = bool(points) and all((p.timestamp or "").startswith("Z:") for p in points)
+            all_naive = bool(points) and all((p.timestamp or "").startswith("N:") for p in points)
+            if all_utc or all_naive:
+                points_sorted = sorted(
+                    points,
+                    key=lambda p: (p.timestamp or "", (p.date or "")[:10], p.resource_uuid or ""),
+                )
+            else:
+                points_sorted = sorted(
+                    points,
+                    key=lambda p: ((p.date or "")[:10], p.timestamp or "", p.resource_uuid or ""),
+                )
             latest = points_sorted[-1]
             abn_tag = f" [{latest.interpretation}]" if latest.interpretation and latest.is_abnormal else ""
             date_tag = f" on {latest.date[:10]}" if latest.date else " (date unknown)"

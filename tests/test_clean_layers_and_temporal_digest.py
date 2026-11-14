@@ -572,7 +572,7 @@ def test_kb_fts5_boolean_stopwords_and_external_share_privacy_gate() -> None:
         condensed=cond_self,
         sharing_posture="patient_self",
     )
-    assert enr_med.kb_Passages_matched >= 1
+    assert enr_med.kb_passages_matched >= 1
 
     cond_ext = condense_bundle_to_budget(ext, target_tokens=8192, sharing_posture="external_share")
     enr_ext = build_wahs_hub_enrichment_block(
@@ -669,6 +669,180 @@ def test_local_wahs_bundles_token_budget_gates() -> None:
                 sharing_posture="patient_self",
             )
             assert enr.enrichment_tokens < 1500, f"{bpath.name} {qid}: enrichment_tokens={enr.enrichment_tokens}"
-            assert enr.kb_Passages_matched >= 1, f"{bpath.name} {qid}: kb_Passages_matched={enr.kb_Passages_matched}"
+            assert enr.kb_passages_matched >= 1, f"{bpath.name} {qid}: kb_passages_matched={enr.kb_passages_matched}"
             assert dig.digest_tokens < 650, f"{bpath.name} {qid}: digest_tokens={dig.digest_tokens}"
+
+
+def test_we8_same_day_trend_guard_timezone_ordering_encounter_status_and_admin_ref_date() -> None:
+    # WE8-1a: Date-only same-day readings with distinct values must not infer a trend or depend on UUIDs
+    def _same_day_date_only_bundle(id_low: str, id_high: str) -> Dict[str, Any]:
+        return {
+            "resourceType": "Bundle",
+            "type": "collection",
+            "entry": [
+                {"resource": {"resourceType": "Patient", "id": "pat-we8-1", "birthDate": "1970-01-01"}},
+                {
+                    "resource": {
+                        "resourceType": "Observation",
+                        "id": id_low,
+                        "status": "final",
+                        "category": [{"coding": [{"code": "laboratory"}]}],
+                        "code": {"coding": [{"code": "2160-0", "display": "Creatinine"}]},
+                        "effectiveDateTime": "2026-10-15",
+                        "valueQuantity": {"value": 1.1, "unit": "mg/dL"},
+                    }
+                },
+                {
+                    "resource": {
+                        "resourceType": "Observation",
+                        "id": id_high,
+                        "status": "final",
+                        "category": [{"coding": [{"code": "laboratory"}]}],
+                        "code": {"coding": [{"code": "2160-0", "display": "Creatinine"}]},
+                        "effectiveDateTime": "2026-10-15",
+                        "interpretation": [{"coding": [{"code": "H"}]}],
+                        "valueQuantity": {"value": 1.8, "unit": "mg/dL"},
+                    }
+                },
+            ],
+        }
+
+    ext_a = extract_bundle(_same_day_date_only_bundle("obs-aaa", "obs-zzz"))
+    cond_a = condense_bundle_to_budget(ext_a, target_tokens=8192)
+    dig_a = build_temporal_digest(ext_a, cond_a, question="How is creatinine trending?")
+
+    ext_b = extract_bundle(_same_day_date_only_bundle("obs-zzz", "obs-aaa"))
+    cond_b = condense_bundle_to_budget(ext_b, target_tokens=8192)
+    dig_b = build_temporal_digest(ext_b, cond_b, question="How is creatinine trending?")
+
+    assert "intraday order unknown — trend not supported" in dig_a.digest_text
+    assert dig_a.digest_text == dig_b.digest_text
+    assert dig_a.summary == dig_b.summary
+    assert dig_a.summary["multi_point_series_count"] == 0
+
+    # WE8-1b: Intraday timestamps with mixed UTC ('Z') and offset ('-04:00') sort by UTC instant
+    def _intraday_tz_bundle(id_earlier: str, id_later: str) -> Dict[str, Any]:
+        return {
+            "resourceType": "Bundle",
+            "type": "collection",
+            "entry": [
+                {"resource": {"resourceType": "Patient", "id": "pat-we8-2", "birthDate": "1970-01-01"}},
+                {
+                    "resource": {
+                        "resourceType": "Observation",
+                        "id": id_later,  # 13:00-04:00 == 17:00Z (later)
+                        "status": "final",
+                        "category": [{"coding": [{"code": "laboratory"}]}],
+                        "code": {"coding": [{"code": "2160-0", "display": "Creatinine"}]},
+                        "effectiveDateTime": "2026-10-15T13:00:00-04:00",
+                        "interpretation": [{"coding": [{"code": "H"}]}],
+                        "valueQuantity": {"value": 1.8, "unit": "mg/dL"},
+                    }
+                },
+                {
+                    "resource": {
+                        "resourceType": "Observation",
+                        "id": id_earlier,  # 14:00:00Z (earlier)
+                        "status": "final",
+                        "category": [{"coding": [{"code": "laboratory"}]}],
+                        "code": {"coding": [{"code": "2160-0", "display": "Creatinine"}]},
+                        "effectiveDateTime": "2026-10-15T14:00:00Z",
+                        "valueQuantity": {"value": 1.1, "unit": "mg/dL"},
+                    }
+                },
+            ],
+        }
+
+    for (eid, lid) in [("obs-zzz", "obs-aaa"), ("obs-aaa", "obs-zzz")]:
+        ext_tz = extract_bundle(_intraday_tz_bundle(eid, lid))
+        cond_tz = condense_bundle_to_budget(ext_tz, target_tokens=8192)
+        dig_tz = build_temporal_digest(ext_tz, cond_tz, question="How is creatinine trending?")
+        assert "increasing +0.7" in dig_tz.digest_text
+        assert "latest 1.8 mg/dL" in dig_tz.digest_text
+        assert dig_tz.summary["multi_point_series_count"] == 1
+        g_tz = ClinicalEntityGraph.from_extracted_chart(ext_tz)
+        cr_node = [n for n in g_tz.nodes.values() if n.category == "Observation"][0]
+        assert cr_node.metadata["latest_value"] == 1.8
+
+    # WE8-2: Only finished/completed encounters drive Last Completed Clinical Encounter;
+    # cancelled/entered-in-error/noshow/arrived/in-progress are handled properly.
+    enc_bundle = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "pat-we8-3", "birthDate": "1975-05-05"}},
+            {
+                "resource": {
+                    "resourceType": "Encounter",
+                    "id": "enc-fin",
+                    "status": "finished",
+                    "type": [{"text": "Finished Primary Visit"}],
+                    "period": {"start": "2026-10-01", "end": "2026-10-01"},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Encounter",
+                    "id": "enc-inprog",
+                    "status": "in-progress",
+                    "type": [{"text": "Ongoing ED Stay"}],
+                    "period": {"start": "2026-10-10"},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Encounter",
+                    "id": "enc-arrived",
+                    "status": "arrived",
+                    "type": [{"text": "Arrived Clinic Visit"}],
+                    "period": {"start": "2026-10-11"},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Encounter",
+                    "id": "enc-cancelled",
+                    "status": "cancelled",
+                    "type": [{"text": "Cancelled Procedure"}],
+                    "period": {"start": "2026-11-20"},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Encounter",
+                    "id": "enc-eie",
+                    "status": "entered-in-error",
+                    "type": [{"text": "Entered-in-Error Visit"}],
+                    "period": {"start": "2026-12-25"},
+                }
+            },
+        ],
+    }
+    ext_enc = extract_bundle(enc_bundle)
+    cond_enc = condense_bundle_to_budget(ext_enc, target_tokens=8192)
+    dig_enc = build_temporal_digest(ext_enc, cond_enc, question="When was my last visit?")
+    assert dig_enc.reference_date == "2026-10-11"
+    assert dig_enc.summary["last_clinical_encounter_date"] == "2026-10-01"
+    assert dig_enc.summary["upcoming_appointments_count"] == 0
+    assert "Finished Primary Visit" in dig_enc.digest_text
+    assert "Last Completed Clinical Encounter: 2026-10-01" in dig_enc.digest_text
+    assert "Cancelled Procedure" not in dig_enc.digest_text
+    assert "Entered-in-Error Visit" not in dig_enc.digest_text
+
+    # WE8-3: Administrative-only bundle (Patient, Device, Coverage) leaves reference_date None
+    admin_bundle = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "pat-adm", "birthDate": "1960-01-01"}},
+            {"resource": {"resourceType": "Device", "id": "dev-adm", "status": "active", "manufactureDate": "2026-09-01", "type": {"text": "CGM Sensor"}}},
+            {"resource": {"resourceType": "Coverage", "id": "cov-adm", "status": "active", "period": {"start": "2026-01-01", "end": "2026-12-31"}, "type": {"text": "Commercial Health Plan"}}},
+        ],
+    }
+    ext_adm = extract_bundle(admin_bundle)
+    cond_adm = condense_bundle_to_budget(ext_adm, target_tokens=8192)
+    dig_adm = build_temporal_digest(ext_adm, cond_adm, question="What is the date of my last clinical visit?")
+    assert ext_adm.reference_date is None
+    assert dig_adm.reference_date is None
+    assert "Reference Date Anchor: undetermined" in dig_adm.digest_text
 

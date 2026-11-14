@@ -28,8 +28,10 @@ from .extractors import ClinicalItem, ExtractedChart, NumericPoint
 from .normalizers import classify_sensitivity, is_non_medical_admin_code
 
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
-_UPCOMING_ENCOUNTER_STATUSES: Set[str] = {"planned", "booked", "scheduled", "proposed", "arrived"}
+_UPCOMING_ENCOUNTER_STATUSES: Set[str] = {"planned", "booked", "scheduled", "proposed"}
 _FUTURE_APPT_STATUSES: Set[str] = {"planned", "booked", "scheduled", "proposed"}
+_EXCLUDED_EVENT_STATUSES: Set[str] = {"cancelled", "entered-in-error", "noshow"}
+_COMPLETED_ENCOUNTER_STATUSES: Set[str] = {"finished", "completed", ""}
 _STOPPED_MED_STATUSES: Set[str] = {
     "stopped",
     "cancelled",
@@ -154,6 +156,76 @@ def _series_priority(
     return (-overlap, is_recent, abn, multi, prio, neg_dt, c_low)
 
 
+def _day_boundary_points(
+    day_pts: Sequence[NumericPoint],
+    *,
+    pick_max: bool,
+) -> Tuple[bool, List[NumericPoint]]:
+    """Return whether a boundary day yields a deterministic single value (no UUID tie-breaking)."""
+    if len(day_pts) == 1:
+        return True, list(day_pts)
+    all_utc = all((p.timestamp or "").startswith("Z:") for p in day_pts)
+    all_naive = all((p.timestamp or "").startswith("N:") for p in day_pts)
+    if all_utc or all_naive:
+        extreme_ts = (max if pick_max else min)(p.timestamp for p in day_pts)
+        extreme_pts = [p for p in day_pts if p.timestamp == extreme_ts]
+        return len({p.value for p in extreme_pts}) == 1, extreme_pts
+    if len({p.value for p in day_pts}) == 1:
+        return True, list(day_pts)
+    return False, list(day_pts)
+
+
+def _resolve_series_bounds(
+    raw_pts: Sequence[NumericPoint],
+) -> Tuple[bool, bool, List[NumericPoint], List[NumericPoint], str, str]:
+    """Resolve chronological first/last groups without falling back to UUID ordering."""
+    day_of = lambda p: _iso10(p.date) or ""
+    all_utc = all((p.timestamp or "").startswith("Z:") for p in raw_pts)
+    all_naive = all((p.timestamp or "").startswith("N:") for p in raw_pts)
+    if all_utc or all_naive:
+        pts_sorted = sorted(raw_pts, key=lambda p: (p.timestamp, day_of(p)))
+        min_ts = pts_sorted[0].timestamp
+        max_ts = pts_sorted[-1].timestamp
+        first_group = [p for p in pts_sorted if p.timestamp == min_ts]
+        last_group = [p for p in pts_sorted if p.timestamp == max_ts]
+        first_ok = len({p.value for p in first_group}) == 1
+        last_ok = len({p.value for p in last_group}) == 1
+        trend_supported = (min_ts < max_ts) and first_ok and last_ok
+        return (
+            trend_supported,
+            last_ok,
+            first_group,
+            last_group,
+            day_of(first_group[0]),
+            day_of(last_group[-1]),
+        )
+
+    min_day = min(day_of(p) for p in raw_pts)
+    max_day = max(day_of(p) for p in raw_pts)
+    first_day_pts = [p for p in raw_pts if day_of(p) == min_day]
+    last_day_pts = [p for p in raw_pts if day_of(p) == max_day]
+    first_ok, first_group = _day_boundary_points(first_day_pts, pick_max=False)
+    last_ok, last_group = _day_boundary_points(last_day_pts, pick_max=True)
+    trend_supported = (min_day < max_day) and first_ok and last_ok
+    return trend_supported, last_ok, first_group, last_group, min_day, max_day
+
+
+def _cites_for_group(uuid_to_cit: Mapping[str, int], pts: Sequence[NumericPoint]) -> str:
+    indices = sorted(
+        {uuid_to_cit[p.resource_uuid] for p in pts if p.resource_uuid and p.resource_uuid in uuid_to_cit}
+    )
+    return "".join(f"[{idx}]" for idx in indices)
+
+
+def _abn_note_for_group(pts: Sequence[NumericPoint]) -> Tuple[str, bool]:
+    if not any(p.is_abnormal for p in pts):
+        return "", False
+    interps = sorted({str(p.interpretation).strip() for p in pts if p.is_abnormal and p.interpretation})
+    if len(interps) == 1:
+        return f" [{interps[0]}]", True
+    return " [ABNORMAL]", True
+
+
 def _collect_numeric_series(
     points: Sequence[NumericPoint],
     *,
@@ -163,7 +235,7 @@ def _collect_numeric_series(
     q_terms: Set[str],
     past_12m_start: Optional[str] = None,
 ) -> Tuple[List[Tuple[str, Dict[str, Any]]], int, int]:
-    """Group typed ``NumericPoint`` objects into chronological series with n=1 trend guard."""
+    """Group typed ``NumericPoint`` objects into chronological series with n=1 & tie trend guards."""
     grouped: Dict[Tuple[str, str], List[NumericPoint]] = {}
     seen_point_keys: Set[Tuple[str, str, str, float]] = set()
 
@@ -179,7 +251,7 @@ def _collect_numeric_series(
         code_norm = (pt.code or "").strip().lower()
         concept_norm = re.sub(r"\s+", " ", (pt.concept or "").strip()).lower()
         group_key = (code_norm or concept_norm or "observation", unit_norm.lower())
-        dedup_key = (pt.resource_uuid or "", code_norm or concept_norm, iso_dt, float(pt.value))
+        dedup_key = (pt.resource_uuid or "", code_norm or concept_norm, pt.timestamp or iso_dt, float(pt.value))
         if dedup_key in seen_point_keys:
             continue
         seen_point_keys.add(dedup_key)
@@ -189,48 +261,30 @@ def _collect_numeric_series(
     multi_point_count = 0
 
     for _, raw_pts in grouped.items():
-        pts_sorted = sorted(raw_pts, key=lambda p: (p.date or "", p.resource_uuid or ""))
-        n_pts = len(pts_sorted)
-        first = pts_sorted[0]
-        last = pts_sorted[-1]
-        first_dt = _iso10(first.date) or ""
-        last_dt = _iso10(last.date) or ""
-        concept_label = (last.concept or first.concept or last.code or "Observation").strip()
-        unit_label = f" {last.unit.strip()}" if (last.unit or "").strip() else ""
-        abn_note = f" [{last.interpretation}]" if last.interpretation and last.is_abnormal else (" [ABNORMAL]" if last.is_abnormal else "")
-        last_cite = _cite_for_uuid(uuid_to_cit, last.resource_uuid)
-
-        if n_pts >= 2:
-            multi_point_count += 1
-            vals = [p.value for p in pts_sorted]
-            vmin, vmax = min(vals), max(vals)
-            delta = last.value - first.value
-            direction = _series_direction(first.value, last.value)
-            sign = "+" if delta > 0 else ""
-            first_cite = _cite_for_uuid(uuid_to_cit, first.resource_uuid)
-            first_cite_str = first_cite if first_cite != last_cite else ""
-            line = (
-                f"- {concept_label}: latest {_format_num(last.value)}{unit_label}{abn_note} on {last_dt}{last_cite} "
-                f"| window {first_dt}{first_cite_str}..{last_dt}{last_cite} "
-                f"(n={n_pts}, {direction} {sign}{_format_num(delta)}; range {_format_num(vmin)}..{_format_num(vmax)})"
-            )
-            meta: Dict[str, Any] = {
-                "concept": concept_label,
-                "n_points": n_pts,
-                "trend_supported": True,
-                "direction": direction,
-                "delta": round(delta, 4),
-                "start_date": first_dt,
-                "end_date": last_dt,
-                "latest_value": last.value,
-                "unit": (last.unit or "").strip(),
+        n_pts = len(raw_pts)
+        concept_label = sorted(
+            {
+                (p.concept or p.code or "Observation").strip()
+                for p in raw_pts
             }
-        else:
+        )[-1]
+        unit_label_raw = sorted({(p.unit or "").strip() for p in raw_pts})[-1]
+        unit_label = f" {unit_label_raw}" if unit_label_raw else ""
+
+        if n_pts == 1:
+            last = raw_pts[0]
+            last_dt = _iso10(last.date) or ""
+            abn_note = (
+                f" [{last.interpretation}]"
+                if last.interpretation and last.is_abnormal
+                else (" [ABNORMAL]" if last.is_abnormal else "")
+            )
+            last_cite = _cite_for_uuid(uuid_to_cit, last.resource_uuid)
             line = (
                 f"- {concept_label}: {_format_num(last.value)}{unit_label}{abn_note} on {last_dt}{last_cite} "
                 f"(n=1, single point — trend not supported)"
             )
-            meta = {
+            meta: Dict[str, Any] = {
                 "concept": concept_label,
                 "n_points": 1,
                 "trend_supported": False,
@@ -239,11 +293,86 @@ def _collect_numeric_series(
                 "start_date": last_dt,
                 "end_date": last_dt,
                 "latest_value": last.value,
-                "unit": (last.unit or "").strip(),
+                "unit": unit_label_raw,
             }
+            rank_pt = last
+        else:
+            trend_supported, latest_known, first_group, last_group, first_dt, last_dt = _resolve_series_bounds(raw_pts)
+            vals = [p.value for p in raw_pts]
+            vmin, vmax = min(vals), max(vals)
+            abn_note, any_abn = _abn_note_for_group(last_group)
+            last_cite = _cites_for_group(uuid_to_cit, last_group)
+
+            if trend_supported:
+                multi_point_count += 1
+                first_val = first_group[0].value
+                last_val = last_group[0].value
+                delta = last_val - first_val
+                direction = _series_direction(first_val, last_val)
+                sign = "+" if delta > 0 else ""
+                first_cite = _cites_for_group(uuid_to_cit, first_group)
+                first_cite_str = first_cite if first_cite != last_cite else ""
+                line = (
+                    f"- {concept_label}: latest {_format_num(last_val)}{unit_label}{abn_note} on {last_dt}{last_cite} "
+                    f"| window {first_dt}{first_cite_str}..{last_dt}{last_cite} "
+                    f"(n={n_pts}, {direction} {sign}{_format_num(delta)}; range {_format_num(vmin)}..{_format_num(vmax)})"
+                )
+                meta = {
+                    "concept": concept_label,
+                    "n_points": n_pts,
+                    "trend_supported": True,
+                    "direction": direction,
+                    "delta": round(delta, 4),
+                    "start_date": first_dt,
+                    "end_date": last_dt,
+                    "latest_value": last_val,
+                    "unit": unit_label_raw,
+                }
+                rank_pt = NumericPoint(
+                    resource_uuid="",
+                    date=last_dt,
+                    code=last_group[0].code,
+                    concept=concept_label,
+                    value=last_val,
+                    unit=unit_label_raw,
+                    category=last_group[0].category,
+                    is_abnormal=any_abn,
+                )
+            else:
+                latest_val_opt: Optional[float] = last_group[0].value if latest_known else None
+                if latest_val_opt is not None:
+                    head_val = f"latest {_format_num(latest_val_opt)}{unit_label}{abn_note}"
+                else:
+                    head_val = f"range {_format_num(vmin)}..{_format_num(vmax)}{unit_label}{abn_note}"
+                line = (
+                    f"- {concept_label}: {head_val} on {last_dt}{last_cite} "
+                    f"| window {first_dt}..{last_dt} "
+                    f"(n={n_pts}, intraday order unknown — trend not supported; range {_format_num(vmin)}..{_format_num(vmax)})"
+                )
+                meta = {
+                    "concept": concept_label,
+                    "n_points": n_pts,
+                    "trend_supported": False,
+                    "direction": "none",
+                    "delta": None,
+                    "start_date": first_dt,
+                    "end_date": last_dt,
+                    "latest_value": latest_val_opt,
+                    "unit": unit_label_raw,
+                }
+                rank_pt = NumericPoint(
+                    resource_uuid="",
+                    date=last_dt,
+                    code=last_group[0].code,
+                    concept=concept_label,
+                    value=latest_val_opt if latest_val_opt is not None else vmax,
+                    unit=unit_label_raw,
+                    category=last_group[0].category,
+                    is_abnormal=any_abn,
+                )
 
         rank_key = _series_priority(
-            concept_label, last, n_pts, q_terms, past_12m_start=past_12m_start
+            concept_label, rank_pt, n_pts, q_terms, past_12m_start=past_12m_start
         )
         rendered_ranked.append((rank_key, line, meta))
 
@@ -293,6 +422,8 @@ def build_temporal_digest(
         if it.section in {"patient", "manifest"}:
             continue
         st = (it.status or "").strip().lower()
+        if st in _EXCLUDED_EVENT_STATUSES:
+            continue
         c_dt = _clinical_item_date(it)
         any_dt = _any_non_patient_date(it)
 
@@ -302,7 +433,8 @@ def build_temporal_digest(
 
         if c_dt is not None:
             completed_clinical_dates.append((c_dt, it))
-            if it.section in {"encounter_acuity", "encounter_routine"} or it.resource_type == "Encounter":
+            is_encounter = it.section in {"encounter_acuity", "encounter_routine"} or it.resource_type == "Encounter"
+            if is_encounter and st in _COMPLETED_ENCOUNTER_STATUSES:
                 encounters_completed.append((c_dt, it))
         elif any_dt is not None and it.section not in _ADMIN_SECTIONS and it.date_kind != "administrative":
             fallback_clinical_dates.append(any_dt)
@@ -312,8 +444,7 @@ def build_temporal_digest(
     elif fallback_clinical_dates:
         reference_date = max(fallback_clinical_dates)
     else:
-        all_valid = [d for d in (_any_non_patient_date(it) for it in kept_items) if d is not None]
-        reference_date = max(all_valid) if all_valid else _iso10(extracted.reference_date)
+        reference_date = _iso10(extracted.reference_date)
 
     # Reclassify any Encounter or active CarePlan dated strictly after reference_date as upcoming.
     filtered_completed_encounters: List[Tuple[str, ClinicalItem]] = []
