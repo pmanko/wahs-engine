@@ -22,10 +22,10 @@ import datetime as _dt
 import re
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
-from .clinical_graph import _build_citation_lookup, _is_sensitive_item, _query_terms
+from .clinical_graph import _build_citation_lookup, _is_sensitive_item, _query_terms, extract_clean_user_query
 from .condenser import CondensedChartResult, estimate_tokens_local
 from .extractors import ClinicalItem, ExtractedChart, NumericPoint
-from .normalizers import classify_sensitivity
+from .normalizers import classify_sensitivity, is_non_medical_admin_code
 
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 _UPCOMING_ENCOUNTER_STATUSES: Set[str] = {"planned", "booked", "scheduled", "proposed", "arrived"}
@@ -132,16 +132,26 @@ def _series_direction(first_val: float, last_val: float) -> str:
     return "increasing" if delta > 0 else "decreasing"
 
 
-def _series_priority(concept: str, latest: NumericPoint, n_points: int, q_terms: Set[str]) -> Tuple[int, int, int, int, str]:
+def _series_priority(
+    concept: str,
+    latest: NumericPoint,
+    n_points: int,
+    q_terms: Set[str],
+    *,
+    past_12m_start: Optional[str] = None,
+) -> Tuple[int, int, int, int, int, int, str]:
     c_low = (concept or "").lower()
     overlap = sum(1 for t in q_terms if t in c_low)
+    last_dt = _iso10(latest.date) or "0000-00-00"
+    is_recent = 0 if (not past_12m_start or last_dt >= past_12m_start) else 1
     abn = 0 if latest.is_abnormal else 1
     multi = 0 if n_points >= 2 else 1
     prio = next(
         (idx for idx, pat in enumerate(_PRIORITY_SERIES_PATTERNS) if pat.search(c_low)),
         len(_PRIORITY_SERIES_PATTERNS) + 1,
     )
-    return (-overlap, abn, multi, prio, c_low)
+    neg_dt = -int(last_dt.replace("-", "")) if re.match(r"^\d{4}-\d{2}-\d{2}$", last_dt) else 0
+    return (-overlap, is_recent, abn, multi, prio, neg_dt, c_low)
 
 
 def _collect_numeric_series(
@@ -151,6 +161,7 @@ def _collect_numeric_series(
     is_external: bool,
     uuid_to_cit: Mapping[str, int],
     q_terms: Set[str],
+    past_12m_start: Optional[str] = None,
 ) -> Tuple[List[Tuple[str, Dict[str, Any]]], int, int]:
     """Group typed ``NumericPoint`` objects into chronological series with n=1 trend guard."""
     grouped: Dict[Tuple[str, str], List[NumericPoint]] = {}
@@ -174,7 +185,7 @@ def _collect_numeric_series(
         seen_point_keys.add(dedup_key)
         grouped.setdefault(group_key, []).append(pt)
 
-    rendered_ranked: List[Tuple[Tuple[int, int, int, int, str], str, Dict[str, Any]]] = []
+    rendered_ranked: List[Tuple[Tuple[int, int, int, int, int, int, str], str, Dict[str, Any]]] = []
     multi_point_count = 0
 
     for _, raw_pts in grouped.items():
@@ -231,21 +242,14 @@ def _collect_numeric_series(
                 "unit": (last.unit or "").strip(),
             }
 
-        rank_key = _series_priority(concept_label, last, n_pts, q_terms)
+        rank_key = _series_priority(
+            concept_label, last, n_pts, q_terms, past_12m_start=past_12m_start
+        )
         rendered_ranked.append((rank_key, line, meta))
 
     rendered_ranked.sort(key=lambda pair: pair[0])
     out_entries = [(line, meta) for _, line, meta in rendered_ranked]
     return out_entries, len(rendered_ranked), multi_point_count
-
-
-def _format_med_line(item: ClinicalItem, uuid_to_cit: Mapping[str, int]) -> str:
-    label = (item.display or item.text or "Medication").strip()
-    dt = _iso10(item.clinical_date or item.date) or "date unknown"
-    status = (item.status or "unknown").strip().lower()
-    cite = _cite_for_uuid(uuid_to_cit, item.resource_uuid, item.member_uuids)
-    org_part = f" | {item.source_org}" if item.source_org else ""
-    return f"  - {label} ({dt}, status: {status}{org_part}){cite}"
 
 
 def build_temporal_digest(
@@ -260,7 +264,8 @@ def build_temporal_digest(
 ) -> TemporalDigestResult:
     """Build deterministic chart-derived temporal anchor, encounter horizon, and trend digest."""
     is_external = sharing_posture == "external_share"
-    q_terms = _query_terms(question)
+    clean_q = extract_clean_user_query(question) or question
+    q_terms = _query_terms(clean_q)
 
     uuid_to_cit, _, _ = _build_citation_lookup(condensed, None)
     if extra_uuid_to_citation:
@@ -356,24 +361,38 @@ def build_temporal_digest(
                         f"- Administrative/Non-Visit Record Post-Dating Last Clinical Encounter: {lbl} ({a_dt}; NOT a clinical encounter){cite}"
                     )
 
-    # 2. Longitudinal Numeric Series (with no-trend-from-one-point guard)
+    # 2. Longitudinal Numeric Series (with no-trend-from-one-point guard & stem dedup)
     ranked_series, total_series_count, multi_point_count = _collect_numeric_series(
         extracted.numeric_points,
         redacted_uuids=redacted_uuids,
         is_external=is_external,
         uuid_to_cit=uuid_to_cit,
         q_terms=q_terms,
+        past_12m_start=past_12m_start,
     )
-    max_rendered_series = 14
-    selected_series = ranked_series[:max_rendered_series]
+    deduped_series: List[Tuple[str, Dict[str, Any]]] = []
+    seen_stems: Set[str] = set()
+    for entry in ranked_series:
+        c_raw = str(entry[1].get("concept") or "").lower()
+        stem = re.sub(r"\s*\[[^\]]+\].*$", "", c_raw).strip() or c_raw
+        if stem in seen_stems:
+            continue
+        seen_stems.add(stem)
+        deduped_series.append(entry)
+    selected_series = deduped_series[:4]
 
-    # 3. Medication Timeline Summary (active vs stopped/historical)
+    # 3. Medication Order Horizon (active vs stopped/historical count & latest date guard)
     med_items = [
         it
         for it in kept_items
-        if it.section in {"med_active", "med_historical"}
-        or it.resource_type
-        in {"MedicationRequest", "MedicationStatement", "MedicationAdministration", "MedicationDispense"}
+        if (
+            it.section in {"med_active", "med_historical"}
+            or it.resource_type
+            in {"MedicationRequest", "MedicationStatement", "MedicationAdministration", "MedicationDispense"}
+        )
+        and not is_non_medical_admin_code(it.code)
+        and str((it.metadata or {}).get("setting") or "").lower() != "inpatient/administered"
+        and not (it.display or it.text or "").strip().lower().startswith(("inpatient ", "naclflush"))
     ]
     active_meds: List[ClinicalItem] = []
     stopped_meds: List[ClinicalItem] = []
@@ -384,11 +403,24 @@ def build_temporal_digest(
         else:
             active_meds.append(m)
 
-    active_meds.sort(key=lambda m: (_iso10(m.clinical_date or m.date) or "0000-00-00", m.display or ""), reverse=True)
-    stopped_meds.sort(key=lambda m: (_iso10(m.clinical_date or m.date) or "0000-00-00", m.display or ""), reverse=True)
-
-    active_med_lines = [_format_med_line(m, uuid_to_cit) for m in active_meds[:8]]
-    stopped_med_lines = [_format_med_line(m, uuid_to_cit) for m in stopped_meds[:8]]
+    latest_active_dt = max(
+        (_iso10(m.clinical_date or m.date) or "" for m in active_meds),
+        default="",
+    )
+    latest_stopped_dt = max(
+        (_iso10(m.clinical_date or m.date) or "" for m in stopped_meds),
+        default="",
+    )
+    med_horizon_line = ""
+    if active_meds or stopped_meds:
+        act_note = f"{len(active_meds)} active (latest {latest_active_dt or 'undated'})"
+        stop_note = (
+            f"{len(stopped_meds)} stopped/historical (latest {latest_stopped_dt or 'undated'}; "
+            "do NOT report stopped/completed orders as currently taken unless explicitly restarted later)"
+            if stopped_meds
+            else "0 stopped/historical"
+        )
+        med_horizon_line = f"- Medication Order Horizon: {act_note}, {stop_note}."
 
     # Build static header & encounter lines
     header_lines: List[str] = [
@@ -440,8 +472,8 @@ def build_temporal_digest(
 
     def _render_digest(
         series_slice: Sequence[Tuple[str, Dict[str, Any]]],
-        act_meds_slice: Sequence[str],
-        stop_meds_slice: Sequence[str],
+        *,
+        include_med_horizon: bool = True,
     ) -> str:
         sections: List[str] = list(header_lines)
         if series_slice:
@@ -452,38 +484,23 @@ def build_temporal_digest(
         else:
             sections.append("Longitudinal Numeric Series: none documented with ISO clinical dates.")
 
-        if act_meds_slice or stop_meds_slice:
-            sections.append(
-                f"Medication Timeline ({len(active_meds)} active, {len(stopped_meds)} stopped/historical):"
-            )
-            if act_meds_slice:
-                sections.append("  Active Medications:")
-                sections.extend(act_meds_slice)
-            if stop_meds_slice:
-                sections.append("  Stopped/Historical Medications:")
-                sections.extend(stop_meds_slice)
+        if med_horizon_line and include_med_horizon:
+            sections.append(med_horizon_line)
         return "\n".join(sections)
 
     count_tokens = token_counter or estimate_tokens_local
     cur_series = list(selected_series)
-    cur_act_meds = list(active_med_lines)
-    cur_stop_meds = list(stopped_med_lines)
+    include_med_horizon = bool(med_horizon_line)
 
-    digest_text = _render_digest(cur_series, cur_act_meds, cur_stop_meds)
+    digest_text = _render_digest(cur_series, include_med_horizon=include_med_horizon)
     if max_tokens is not None and max_tokens > 0:
         while count_tokens(digest_text) > max_tokens:
-            if len(cur_stop_meds) > 2:
-                cur_stop_meds.pop()
-            elif len(cur_series) > 4:
+            if len(cur_series) > 2:
                 cur_series.pop()
-            elif len(cur_act_meds) > 2:
-                cur_act_meds.pop()
-            elif cur_stop_meds:
-                cur_stop_meds.pop()
+            elif include_med_horizon:
+                include_med_horizon = False
             elif cur_series:
                 cur_series.pop()
-            elif cur_act_meds:
-                cur_act_meds.pop()
             else:
                 lo, hi = 0, len(digest_text)
                 while lo < hi:
@@ -497,7 +514,7 @@ def build_temporal_digest(
                 if count_tokens(digest_text) > max_tokens and lo > 0:
                     digest_text = digest_text[:lo]
                 break
-            digest_text = _render_digest(cur_series, cur_act_meds, cur_stop_meds)
+            digest_text = _render_digest(cur_series, include_med_horizon=include_med_horizon)
 
     final_tokens = count_tokens(digest_text)
     summary: Dict[str, Any] = {

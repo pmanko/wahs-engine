@@ -11,7 +11,7 @@ from fastapi.responses import StreamingResponse
 import httpx
 import uvicorn
 
-from wahs_core import build_temporal_digest
+from wahs_core import build_temporal_digest, extract_clean_user_query
 
 from .assembler import WAHSBundleAssembler
 from .config import WahsEngineSettings
@@ -121,7 +121,7 @@ def create_app(
                 build_temporal_digest(
                     ctx.extracted,
                     ctx.condensed,
-                    question=last_q,
+                    question=extract_clean_user_query(last_q) or last_q,
                     sharing_posture=options.sharing_posture,
                 ).summary
             )

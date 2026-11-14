@@ -716,7 +716,7 @@ def prepare_upstream_messages(
             temporal_res = build_temporal_digest(
                 ctx.extracted,
                 ctx.condensed,
-                question=raw_last_user_query,
+                question=clean_last_user_query,
                 sharing_posture=options.sharing_posture,
                 extra_uuid_to_citation=extra_cits,
                 max_tokens=digest_budget,
