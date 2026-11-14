@@ -14,6 +14,7 @@ import math
 import re
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
+from .clinical_graph import extract_clean_user_query
 from .extractors import ClinicalItem, ExtractedChart, extract_bundle
 from .normalizers import classify_sensitivity
 
@@ -340,7 +341,8 @@ def retrieve_clinical_note_passages(
     `sharing_posture` (`external_share` redacts `SDOH/PRIVACY-SENSITIVE` items).
     """
     extracted = _ensure_extracted(bundle_or_extracted)
-    q_tokens = _tokenize_for_bm25(query)
+    clean_query = extract_clean_user_query(query) or query
+    q_tokens = _tokenize_for_bm25(clean_query)
     q_unique = list(dict.fromkeys(q_tokens))
 
     candidate_chunks: List[Dict[str, Any]] = []

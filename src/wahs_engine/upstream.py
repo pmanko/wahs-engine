@@ -15,6 +15,7 @@ import httpx
 
 from wahs_core import (
     build_wahs_hub_enrichment_block,
+    extract_clean_user_query,
     get_lab_history,
     read_clinical_note,
     retrieve_clinical_note_passages,
@@ -540,6 +541,9 @@ def prepare_upstream_messages(
     raw_last_user_query = next(
         (t["content"] for t in reversed(turns) if t["role"] == "user"), ""
     )
+    clean_last_user_query = (
+        extract_clean_user_query(raw_last_user_query) or raw_last_user_query
+    )
 
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": ctx.system_prompt},
@@ -556,8 +560,11 @@ def prepare_upstream_messages(
             minimal_turn_toks = count_chat_messages_tokens(
                 [messages[0], messages[-1]], tools=tools, tokenizer_family=tok_family
             )
-            enrichment_max_tokens = max(
+            window_slack = max(
                 256, ctx_window - effective_max_tokens - minimal_turn_toks - 128
+            )
+            enrichment_max_tokens = min(
+                window_slack, max(1280, int(ctx.condensed.target_tokens * 0.25))
             )
             enrichment = build_wahs_hub_enrichment_block(
                 messages,
@@ -567,6 +574,9 @@ def prepare_upstream_messages(
                 max_tokens=enrichment_max_tokens,
                 sharing_posture=options.sharing_posture,
                 token_counter=exact_counter,
+                max_overflow_recover=(
+                    0 if options.retrieval_strategy == "dynamic_fhir_tools" else 5
+                ),
             )
             kb_meta = enrichment.to_metadata_dict()
             overflow_recovered = int(
@@ -604,7 +614,7 @@ def prepare_upstream_messages(
         try:
             rag_res = retrieve_clinical_note_passages(
                 ctx.extracted,
-                raw_last_user_query,
+                clean_last_user_query,
                 sharing_posture=options.sharing_posture,
                 top_k=5,
             )

@@ -9,6 +9,7 @@ from .clinical_graph import (
     ClinicalNode,
     HubEnrichmentResult,
     build_wahs_hub_enrichment_block,
+    extract_clean_user_query,
 )
 from .condenser import (
     CondensedChartResult,
@@ -78,6 +79,7 @@ __all__ = [
     "estimate_tokens_local",
     "extract_bundle",
     "extract_chart_kb_codes",
+    "extract_clean_user_query",
     "get_acip_rules",
     "get_clinical_exclusivity_and_privacy",
     "get_lab_history",

@@ -30,6 +30,7 @@ from .normalizers import (
     classify_vaccine_group,
     detect_condition_conflicts,
     detect_medication_conflicts,
+    is_non_medical_admin_code,
     normalize_drug_ingredient,
 )
 
@@ -91,6 +92,13 @@ _EDGE_PRIORITY: Dict[str, int] = {
     "MONITORED_BY": 4,
     "TREATS": 5,
     "REPORTED_BY_ORG": 6,
+}
+
+_HIGH_PRIORITY_EDGE_TYPES: Set[str] = {
+    "CROSS_REACTS_WITH",
+    "CONTRAINDICATED_OR_DOSE_ADJUST_IN",
+    "CONFLICTS_WITH",
+    "CONTRADICTED_OR_MODIFIED_BY_NOTE",
 }
 
 _SECTION_OVERFLOW_PRIORITY: Dict[str, int] = {
@@ -247,8 +255,31 @@ _QUERY_STOPWORDS: Set[str] = {
     "will",
     "with",
     "would",
+    "write",
     "you",
     "your",
+    "ask",
+    "condition",
+    "conditions",
+    "disease",
+    "draft",
+    "function",
+    "give",
+    "letter",
+    "level",
+    "levels",
+    "medicine",
+    "medicines",
+    "new",
+    "problem",
+    "problems",
+    "result",
+    "right",
+    "share",
+    "stage",
+    "status",
+    "value",
+    "values",
 }
 
 _CITATION_TAG_RE = re.compile(r"\[(\d+)\]")
@@ -280,8 +311,9 @@ class ClinicalNode:
     def short_display(self) -> str:
         tag = f"[{self.citation_idx}] " if self.citation_idx is not None else ""
         if self.category == "DocumentReference":
+            lbl = self.label[:61].rstrip() + "..." if len(self.label) > 64 else self.label
             date_suffix = f" ({self.date_str})" if self.date_str else ""
-            return f"{tag}{self.label}{date_suffix}".strip()
+            return f"{tag}{lbl}{date_suffix}".strip()
         val_clean = (self.value_summary or "").strip()
         val = f" ({val_clean})" if val_clean else ""
         return f"{tag}{self.label}{val}".strip()
@@ -519,10 +551,15 @@ _MONITORING_RULES: List[Tuple[Tuple[str, ...], Tuple[str, ...], str]] = [
 
 _NOTE_HOLD_OR_MOD_CUES: Tuple[str, ...] = (
     "stopped",
+    "stop ",
+    "discontinue",
     "discontinued",
     "held",
     "holding",
     "hold ",
+    "avoid ",
+    "reconcile",
+    "duplicate",
     "not taking",
     "non-adherent",
     "nonadherent",
@@ -534,6 +571,55 @@ _NOTE_HOLD_OR_MOD_CUES: Tuple[str, ...] = (
     "intolerant",
     "switched",
     "outside",
+)
+
+_NOTE_RESUME_OR_CONTINUE_CUES: Tuple[str, ...] = (
+    "continue ",
+    "continuing ",
+    "resume ",
+    "resumed ",
+    "restart ",
+    "restarted ",
+)
+
+_NON_DRUG_PROBE_WORDS: Set[str] = {
+    "admin",
+    "administered",
+    "capsule",
+    "capsules",
+    "delayed",
+    "device",
+    "dose",
+    "drops",
+    "extended",
+    "flush",
+    "injection",
+    "inpatient",
+    "liquid",
+    "medication",
+    "medications",
+    "naclflush",
+    "order",
+    "oral",
+    "packet",
+    "patch",
+    "release",
+    "sodium",
+    "solution",
+    "spray",
+    "succinate",
+    "suspension",
+    "syringe",
+    "tablet",
+    "tablets",
+    "topical",
+    "unspecified",
+    "vial",
+}
+
+_TRAILING_WRAPPER_SPLIT_RE = re.compile(
+    r"\n+\s*(?:GROUNDING\s*&\s*FORMATTING\s*RULES\s*:|===\s*[A-Z0-9])",
+    flags=re.IGNORECASE,
 )
 
 
@@ -552,13 +638,63 @@ def _is_sensitive_item(item: ClinicalItem) -> bool:
     return sens == "SDOH/PRIVACY-SENSITIVE"
 
 
+def _med_name_probes(node: ClinicalNode) -> Set[str]:
+    """Extract normalized ingredient and brand/generic name probes for note matching."""
+    probes: Set[str] = set()
+    sources = [
+        str(node.metadata.get("ingredient_key") or ""),
+        normalize_drug_ingredient(node.label),
+    ]
+    for src in sources:
+        for tok in re.findall(r"[a-z][a-z0-9-]{3,}", src.lower()):
+            if tok not in _NON_DRUG_PROBE_WORDS:
+                probes.add(tok)
+    lbl = (node.label or "").strip().lower()
+    for br in re.findall(r"\[([^\]]+)\]", lbl):
+        for tok in re.findall(r"[a-z][a-z0-9-]{3,}", br):
+            if tok not in _NON_DRUG_PROBE_WORDS:
+                probes.add(tok)
+    first_word = re.match(r"^([a-z][a-z0-9-]{3,})", lbl)
+    if first_word:
+        w = first_word.group(1)
+        if w not in _NON_DRUG_PROBE_WORDS:
+            probes.add(w)
+    return probes
+
+
+def _dedup_nodes_by_identity(nodes: Sequence[ClinicalNode]) -> List[ClinicalNode]:
+    """Deduplicate clinical nodes by normalized ingredient/code/label, preferring newest and cited."""
+    ordered = sorted(
+        nodes,
+        key=lambda n: (n.date_str or "", 1 if n.citation_idx is not None else 0),
+        reverse=True,
+    )
+    out: List[ClinicalNode] = []
+    seen: Set[str] = set()
+    for n in ordered:
+        ing = str(n.metadata.get("ingredient_key") or "").strip().lower()
+        key = ing if ing else (n.code or n.label or n.node_id).strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(n)
+    return out
+
+
+def extract_clean_user_query(text: str) -> str:
+    """Strip wrapper headers (`USER_QUESTION:`) and trailing harness/enrichment blocks."""
+    txt = str(text or "").strip()
+    if not txt:
+        return ""
+    m = re.search(r"USER_QUESTION:\s*(.+)$", txt, flags=re.IGNORECASE | re.DOTALL)
+    if m:
+        txt = m.group(1).strip()
+    return _TRAILING_WRAPPER_SPLIT_RE.split(txt, maxsplit=1)[0].strip()
+
+
 def _extract_last_user_question(messages_or_prompt: Union[str, Sequence[Mapping[str, Any]]]) -> str:
     if isinstance(messages_or_prompt, str):
-        txt = messages_or_prompt.strip()
-        m = re.search(r"USER_QUESTION:\s*(.+)$", txt, flags=re.IGNORECASE | re.DOTALL)
-        if m:
-            return m.group(1).strip()
-        return txt
+        return extract_clean_user_query(messages_or_prompt)
     for msg in reversed(messages_or_prompt):
         if (msg.get("role") or "").lower() != "user":
             continue
@@ -569,8 +705,7 @@ def _extract_last_user_question(messages_or_prompt: Union[str, Sequence[Mapping[
         else:
             joined = str(content or "").strip()
         if joined:
-            m = re.search(r"USER_QUESTION:\s*(.+)$", joined, flags=re.IGNORECASE | re.DOTALL)
-            return m.group(1).strip() if m else joined
+            return extract_clean_user_query(joined)
     return ""
 
 
@@ -642,7 +777,11 @@ class ClinicalEntityGraph:
         return node
 
     def add_edge(self, edge: ClinicalEdge) -> None:
-        key = (edge.source_id, edge.target_id, edge.edge_type, edge.rationale)
+        if edge.edge_type == "CONFLICTS_WITH":
+            src_k, tgt_k = sorted((edge.source_id, edge.target_id))
+            key = (src_k, tgt_k, edge.edge_type, edge.rationale)
+        else:
+            key = (edge.source_id, edge.target_id, edge.edge_type, edge.rationale)
         if key in self._edge_keys:
             return
         self._edge_keys.add(key)
@@ -768,6 +907,10 @@ class ClinicalEntityGraph:
                 )
             )
 
+        numeric_point_uuids: Set[str] = {
+            pt.resource_uuid for pt in extracted.numeric_points if pt.resource_uuid
+        }
+
         for idx, item in enumerate(extracted.items):
             if item.section in {"patient", "manifest"}:
                 continue
@@ -779,6 +922,20 @@ class ClinicalEntityGraph:
 
             kept_items.append(item)
             cat = _SECTION_TO_CATEGORY.get(item.section, "Observation")
+            if (
+                cat == "Observation"
+                and item.section in {"lab_observation", "vital_sign"}
+                and item.resource_uuid
+                and item.resource_uuid in numeric_point_uuids
+            ):
+                continue
+            item_setting = str(item.metadata.get("setting") or "")
+            if item.section == "med_historical" and (
+                item_setting.lower() == "inpatient/administered"
+                or (item.display or "").strip().lower().startswith(("inpatient ", "naclflush"))
+                or bool(re.match(r"^\d{8,}\b", (item.display or "").strip()))
+            ):
+                continue
             r_uuid = item.resource_uuid or f"{cat.lower()}-{idx}"
             node_id = f"{cat.lower()}:{r_uuid}"
             raw_note = ""
@@ -810,13 +967,15 @@ class ClinicalEntityGraph:
                     raw_line=raw_note or item.text,
                     metadata={
                         "section": item.section,
+                        "setting": item_setting,
                         "ingredient_key": item.ingredient_key or "",
                         "dosage": list(item.metadata.get("dosage") or []),
                         "therapeutic_class": str(item.metadata.get("therapeutic_class") or ""),
                     },
                 )
             )
-            _register_org(item.source_org, node)
+            if item.section not in {"med_historical", "condition_resolved"}:
+                _register_org(item.source_org, node)
 
         # Group numeric_points by code/concept into trajectory Observation nodes
         series_by_key: Dict[str, List[NumericPoint]] = {}
@@ -833,13 +992,7 @@ class ClinicalEntityGraph:
             latest = points_sorted[-1]
             abn_tag = f" [{latest.interpretation}]" if latest.interpretation and latest.is_abnormal else ""
             date_tag = f" on {latest.date[:10]}" if latest.date else " (date unknown)"
-            prev_vals = ", ".join(
-                f"{p.value:g} ({p.date[:10] if p.date else 'undated'})"
-                for p in points_sorted[-4:-1]
-            )
             val_summary = f"latest {latest.value:g} {latest.unit}{abn_tag}{date_tag}".strip()
-            if prev_vals:
-                val_summary += f"; prev: {prev_vals}"
             obs_id = f"obs:{_slugify(code_key)}"
             graph.add_node(
                 ClinicalNode(
@@ -980,7 +1133,22 @@ class ClinicalEntityGraph:
                     )
                 )
 
-        # 2. Allergy cross-reactivity from kb_data/rxnorm_lookup.json
+        active_med_nodes = [
+            m
+            for m in meds
+            if m.metadata.get("section") == "med_active"
+            and not is_non_medical_admin_code(m.code)
+        ]
+        scoped_meds = _dedup_nodes_by_identity(active_med_nodes)
+        active_cond_nodes = [
+            c
+            for c in conds
+            if c.metadata.get("section") == "condition_active"
+            and not is_non_medical_admin_code(c.code)
+        ]
+        scoped_conds = _dedup_nodes_by_identity(active_cond_nodes)
+
+        # 2. Allergy cross-reactivity from kb_data/rxnorm_lookup.json (active meds only)
         rx_rules = get_rxnorm_lookup().get("allergy_cross_reactivity_rules") or []
         for al in allergies:
             al_low = f"{al.label} {al.raw_line}".lower()
@@ -991,7 +1159,7 @@ class ClinicalEntityGraph:
                 med_terms = [str(t).lower() for t in (rule.get("medication_terms") or ())]
                 if not any(t in al_low for t in al_terms):
                     continue
-                for m in meds:
+                for m in scoped_meds:
                     m_low = f"{m.label} {m.metadata.get('ingredient_key', '')}".lower()
                     if any(mt in m_low for mt in med_terms):
                         self.add_edge(
@@ -1006,12 +1174,38 @@ class ClinicalEntityGraph:
                             )
                         )
 
-        # 3. Drug -> Condition TREATS & Safety/Contraindication edges
-        for m in meds:
+        # 3. Drug -> Condition TREATS & Safety/Contraindication edges (scoped to active/trajectory entities)
+        conflict_pairs: Set[frozenset[str]] = {
+            frozenset((e.source_id, e.target_id))
+            for e in self.edges
+            if e.edge_type == "CONFLICTS_WITH" and e.source_id != e.target_id
+        }
+
+        def _is_clinically_significant_obs(tgt: ClinicalNode, t_low: str) -> bool:
+            if tgt.category != "Observation":
+                return True
+            if bool(tgt.metadata.get("is_abnormal")):
+                return True
+            val = tgt.metadata.get("latest_value")
+            if not isinstance(val, (int, float)):
+                return False
+            if ("egfr" in t_low or "glomerular filtration" in t_low) and val < 60:
+                return True
+            if "creatinine" in t_low and val >= 1.5:
+                return True
+            if "potassium" in t_low and (val >= 5.0 or val <= 3.4):
+                return True
+            if "inr" in t_low and val >= 3.5:
+                return True
+            if "hemoglobin" in t_low and "a1c" not in t_low and val < 11.5:
+                return True
+            return False
+
+        for m in scoped_meds:
             m_low = f"{m.label} {m.metadata.get('ingredient_key', '')} {m.raw_line}".lower()
             for drug_kws, cond_kws, rationale, kb_src in _DRUG_INDICATION_KEYWORDS:
                 if any(dk in m_low for dk in drug_kws):
-                    for c in conds:
+                    for c in scoped_conds:
                         c_low = f"{c.label} {c.raw_line}".lower()
                         if any(ck in c_low for ck in cond_kws):
                             self.add_edge(
@@ -1029,58 +1223,113 @@ class ClinicalEntityGraph:
             for drug_kws, risk_kws, rationale, kb_src in _SAFETY_CONTRAINDICATION_RULES:
                 if not any(dk in m_low for dk in drug_kws):
                     continue
-                for tgt in conds + obs + meds:
+                matched_tgts: List[ClinicalNode] = []
+                for tgt in scoped_conds + obs + scoped_meds:
                     if tgt.node_id == m.node_id:
                         continue
+                    if frozenset((m.node_id, tgt.node_id)) in conflict_pairs:
+                        continue
                     t_low = f"{tgt.label} {tgt.value_summary} {tgt.raw_line}".lower()
-                    if any(rk in t_low for rk in risk_kws):
-                        self.add_edge(
-                            ClinicalEdge(
-                                source_id=m.node_id,
-                                target_id=tgt.node_id,
-                                edge_type="CONTRAINDICATED_OR_DOSE_ADJUST_IN",
-                                rationale=rationale,
-                                kb_source=kb_src,
-                                source_citation=m.citation_idx,
-                                target_citation=tgt.citation_idx,
-                            )
+                    if not any(
+                        rk in t_low and not (rk == "hemoglobin" and "a1c" in t_low)
+                        for rk in risk_kws
+                    ):
+                        continue
+                    if not _is_clinically_significant_obs(tgt, t_low):
+                        continue
+                    matched_tgts.append(tgt)
+                matched_tgts.sort(
+                    key=lambda n: (1 if n.metadata.get("is_abnormal") else 0, n.date_str or ""),
+                    reverse=True,
+                )
+                seen_tgt_stem: Set[Tuple[str, str]] = set()
+                emitted_for_rule = 0
+                for tgt in matched_tgts:
+                    stem = re.split(r"[^a-z0-9]+", (tgt.label or "").strip().lower())[0]
+                    stem_key = (tgt.category, stem)
+                    if stem_key in seen_tgt_stem:
+                        continue
+                    seen_tgt_stem.add(stem_key)
+                    self.add_edge(
+                        ClinicalEdge(
+                            source_id=m.node_id,
+                            target_id=tgt.node_id,
+                            edge_type="CONTRAINDICATED_OR_DOSE_ADJUST_IN",
+                            rationale=rationale,
+                            kb_source=kb_src,
+                            source_citation=m.citation_idx,
+                            target_citation=tgt.citation_idx,
                         )
+                    )
+                    emitted_for_rule += 1
+                    if emitted_for_rule >= 2:
+                        break
 
-        # 4. Condition/Medication -> Observation MONITORING edges
-        for entity in conds + meds:
+        # 4. Condition/Medication -> Observation MONITORING edges (active entities + trajectory obs)
+        for entity in scoped_conds + scoped_meds:
             e_low = f"{entity.label} {entity.metadata.get('ingredient_key', '')} {entity.raw_line}".lower()
+            seen_rationale_counts: Dict[str, int] = {}
+            seen_rationale_stems: Dict[str, Set[str]] = {}
             for ent_kws, lab_kws, rationale in _MONITORING_RULES:
                 if not any(ek in e_low for ek in ent_kws):
                     continue
-                for ob in obs:
-                    ob_low = f"{ob.label} {ob.value_summary}".lower()
-                    if any(lk in ob_low for lk in lab_kws):
-                        self.add_edge(
-                            ClinicalEdge(
-                                source_id=entity.node_id,
-                                target_id=ob.node_id,
-                                edge_type="MONITORED_BY",
-                                rationale=rationale,
-                                kb_source="Clinical Monitoring & Cardiorenal Panel Link",
-                                source_citation=entity.citation_idx,
-                                target_citation=ob.citation_idx,
-                            )
+                matched_obs = [
+                    ob
+                    for ob in obs
+                    if any(lk in f"{ob.label} {ob.value_summary}".lower() for lk in lab_kws)
+                ]
+                matched_obs.sort(
+                    key=lambda o: (1 if o.metadata.get("is_abnormal") else 0, o.date_str or ""),
+                    reverse=True,
+                )
+                stems = seen_rationale_stems.setdefault(rationale, set())
+                for ob in matched_obs:
+                    if seen_rationale_counts.get(rationale, 0) >= 3:
+                        break
+                    stem = re.split(r"[^a-z0-9]+", (ob.label or "").strip().lower())[0]
+                    if stem and stem in stems:
+                        continue
+                    if stem:
+                        stems.add(stem)
+                    self.add_edge(
+                        ClinicalEdge(
+                            source_id=entity.node_id,
+                            target_id=ob.node_id,
+                            edge_type="MONITORED_BY",
+                            rationale=rationale,
+                            kb_source="Clinical Monitoring & Cardiorenal Panel Link",
+                            source_citation=entity.citation_idx,
+                            target_citation=ob.citation_idx,
                         )
+                    )
+                    seen_rationale_counts[rationale] = seen_rationale_counts.get(rationale, 0) + 1
 
-        # 5. ClinicalNote -> Medication hold/discontinue/modification reconciliation edges
-        for n in notes:
-            n_low = (n.raw_line or n.value_summary or "").lower()
-            if not n_low or not any(cue in n_low for cue in _NOTE_HOLD_OR_MOD_CUES):
+        # 5. ClinicalNote -> Medication hold/discontinue/reconcile & resume reconciliation edges
+        notes_sorted = sorted(notes, key=lambda n: n.date_str or "", reverse=True)
+        for m in scoped_meds:
+            probes = _med_name_probes(m)
+            if not probes:
                 continue
-            for m in meds:
-                ing = str(m.metadata.get("ingredient_key") or "").lower()
-                med_base = (m.label.split()[0] if m.label else "").lower()
-                probe = ing if len(ing) >= 4 else med_base
-                if not probe or len(probe) < 4 or probe not in n_low:
+            matched_m = False
+            for n in notes_sorted:
+                raw_note = n.raw_line or ""
+                n_low = (raw_note or n.value_summary or "").lower()
+                if not n_low or not any(cue in n_low for cue in _NOTE_HOLD_OR_MOD_CUES):
                     continue
-                for sent in re.split(r"(?<=[.!?;])\s+|\n+", n.raw_line or ""):
+                n_toks = set(re.findall(r"[a-z][a-z0-9-]{3,}", n_low))
+                if not (probes & n_toks):
+                    continue
+                for sent in re.split(r"(?<=[.!?;])\s+|\n+", raw_note):
                     s_low = sent.lower()
-                    if probe in s_low and any(cue in s_low for cue in _NOTE_HOLD_OR_MOD_CUES):
+                    if not any(cue in s_low for cue in _NOTE_HOLD_OR_MOD_CUES):
+                        continue
+                    directive_clause = re.split(
+                        r"\b(?:due to|secondary to|because of|despite)\b",
+                        s_low,
+                        maxsplit=1,
+                    )[0]
+                    directive_toks = set(re.findall(r"[a-z][a-z0-9-]{3,}", directive_clause))
+                    if probes & directive_toks:
                         snippet = sent.strip()
                         if len(snippet) > 160:
                             snippet = snippet[:157].rstrip() + "..."
@@ -1095,12 +1344,69 @@ class ClinicalEntityGraph:
                                 target_citation=n.citation_idx,
                             )
                         )
+                        matched_m = True
                         break
+                if matched_m:
+                    break
+
+        active_med_probes = {p for m in scoped_meds for p in _med_name_probes(m)}
+        stopped_candidates = [
+            m
+            for m in meds
+            if m.metadata.get("section") == "med_historical"
+            and not is_non_medical_admin_code(m.code)
+            and str(m.metadata.get("setting") or "").lower() != "inpatient/administered"
+            and not (m.label or "").strip().lower().startswith(("inpatient ", "naclflush"))
+        ]
+        for m in _dedup_nodes_by_identity(stopped_candidates):
+            probes = _med_name_probes(m)
+            if not probes or (probes & active_med_probes):
+                continue
+            m_date = (m.date_str or "")[:10]
+            for n in notes_sorted:
+                n_date = (n.date_str or "")[:10]
+                if m_date and n_date and n_date < m_date:
+                    continue
+                raw_note = n.raw_line or ""
+                n_low = (raw_note or n.value_summary or "").lower()
+                if not n_low or not any(cue in n_low for cue in _NOTE_RESUME_OR_CONTINUE_CUES):
+                    continue
+                n_toks = set(re.findall(r"[a-z][a-z0-9-]{3,}", n_low))
+                if not (probes & n_toks):
+                    continue
+                matched_note = False
+                for sent in re.split(r"(?<=[.!?;])\s+|\n+", raw_note):
+                    s_low = sent.lower()
+                    s_toks = set(re.findall(r"[a-z][a-z0-9-]{3,}", s_low))
+                    if (probes & s_toks) and any(cue in s_low for cue in _NOTE_RESUME_OR_CONTINUE_CUES):
+                        snippet = sent.strip()
+                        if len(snippet) > 160:
+                            snippet = snippet[:157].rstrip() + "..."
+                        self.add_edge(
+                            ClinicalEdge(
+                                source_id=m.node_id,
+                                target_id=n.node_id,
+                                edge_type="CONTRADICTED_OR_MODIFIED_BY_NOTE",
+                                rationale=(
+                                    f"Stopped/historical order but newer note ({n.date_str or 'undated'}) "
+                                    f"instructs continue/resume: {snippet}"
+                                ),
+                                kb_source="Longitudinal Note-to-Medication Reconciliation",
+                                source_citation=m.citation_idx,
+                                target_citation=n.citation_idx,
+                            )
+                        )
+                        matched_note = True
+                        break
+                if matched_note:
+                    break
 
     def format_subgraph_lines(self, question: str = "", *, max_lines: Optional[int] = None) -> List[str]:
         q_terms = _query_terms(question)
 
-        def _score_edge(edge: ClinicalEdge) -> Tuple[int, int, str]:
+        def _edge_overlap(edge: ClinicalEdge) -> int:
+            if not q_terms:
+                return 0
             src = self.nodes.get(edge.source_id)
             tgt = self.nodes.get(edge.target_id)
             hay = " ".join(
@@ -1110,7 +1416,10 @@ class ClinicalEntityGraph:
                     edge.rationale,
                 ]
             ).lower()
-            overlap = sum(1 for t in q_terms if t in hay)
+            return sum(1 for t in q_terms if t in hay)
+
+        def _score_edge(edge: ClinicalEdge) -> Tuple[int, int, str]:
+            overlap = _edge_overlap(edge)
             prio = _EDGE_PRIORITY.get(edge.edge_type, 9)
             return (-overlap, prio, edge.edge_type)
 
@@ -1118,27 +1427,58 @@ class ClinicalEntityGraph:
             [e for e in self.edges if e.edge_type != "REPORTED_BY_ORG"],
             key=_score_edge,
         )
-        seen: Set[str] = set()
-        lines: List[str] = []
+        seen_raw: Set[Tuple[str, str, str, str]] = set()
+        stage_a: Dict[Tuple[str, str, str], List[str]] = {}
         for edge in ranked:
+            is_high_prio = edge.edge_type in _HIGH_PRIORITY_EDGE_TYPES
+            if not is_high_prio:
+                if not q_terms or _edge_overlap(edge) == 0:
+                    continue
             src = self.nodes.get(edge.source_id)
             tgt = self.nodes.get(edge.target_id)
             if src is None or tgt is None:
                 continue
-            if tgt.node_id == src.node_id:
-                line = f"- {edge.edge_type}: {src.short_display()} — {edge.rationale}"
-            else:
-                line = (
-                    f"- {edge.edge_type}: {src.short_display()} -> {tgt.short_display()} "
-                    f"({edge.rationale})"
-                )
-            if line in seen:
+            src_disp = src.short_display()
+            tgt_disp = "" if tgt.node_id == src.node_id else tgt.short_display()
+            raw_key = (edge.edge_type, src_disp, tgt_disp, edge.rationale)
+            if raw_key in seen_raw:
                 continue
-            seen.add(line)
+            seen_raw.add(raw_key)
+            key_a = (edge.edge_type, src_disp, edge.rationale)
+            targets_list = stage_a.setdefault(key_a, [])
+            if tgt_disp and tgt_disp not in targets_list and len(targets_list) < 4:
+                targets_list.append(tgt_disp)
+
+        stage_b: Dict[Tuple[str, str, str], List[str]] = {}
+        for (edge_type, src_disp, rationale), targets_list in stage_a.items():
+            joined_targets = "; ".join(targets_list)
+            key_b = (edge_type, joined_targets, rationale)
+            sources_list = stage_b.setdefault(key_b, [])
+            if src_disp not in sources_list:
+                sources_list.append(src_disp)
+
+        lines: List[str] = []
+        bg_emitted = 0
+        for (edge_type, joined_targets, rationale), sources_list in stage_b.items():
+            if edge_type not in _HIGH_PRIORITY_EDGE_TYPES:
+                if bg_emitted >= 3:
+                    continue
+                bg_emitted += 1
+            joined_sources = "; ".join(sources_list)
+            if not joined_targets:
+                line = f"- {edge_type}: {joined_sources} — {rationale}"
+            else:
+                line = f"- {edge_type}: {joined_sources} -> {joined_targets} ({rationale})"
             lines.append(line)
             if max_lines is not None and len(lines) >= max_lines:
                 break
         return lines
+
+
+_LONGITUDINAL_QUERY_RE = re.compile(
+    r"\b(?:trajector\w*|trend\w*|histor\w*|chang\w*|over time|prior|previous|baseline|20\d{2})\b",
+    flags=re.IGNORECASE,
+)
 
 
 def _recover_omitted_tier0_items(
@@ -1148,13 +1488,33 @@ def _recover_omitted_tier0_items(
     question: str,
     sharing_posture: str,
     max_cit_before: int,
-    max_recover: int = 8,
+    max_recover: int = 5,
 ) -> List[Tuple[str, Dict[str, Any]]]:
     """Recover highest-relevance omitted items using typed ``ExtractedChart.items``."""
-    if extracted is None:
+    if extracted is None or max_recover <= 0:
         return []
     is_external = sharing_posture == "external_share"
     q_terms = _query_terms(question)
+    if not q_terms:
+        return []
+
+    is_longitudinal_q = bool(_LONGITUDINAL_QUERY_RE.search(question or ""))
+    series_latest: Dict[str, Tuple[str, str]] = {}
+    uuid_to_series: Dict[str, str] = {}
+    for pt in extracted.numeric_points:
+        if not pt.resource_uuid:
+            continue
+        s_key = f"{pt.code or ''}:{pt.concept}".strip(":")
+        uuid_to_series[pt.resource_uuid] = s_key
+        pt_dt = pt.date or ""
+        prev = series_latest.get(s_key)
+        if prev is None or pt_dt >= prev[0]:
+            series_latest[s_key] = (pt_dt, pt.resource_uuid)
+    series_with_latest_in_chart: Set[str] = {
+        s_key
+        for s_key, (_, latest_uuid) in series_latest.items()
+        if latest_uuid in represented_uuids
+    }
 
     candidates: List[Tuple[Tuple[int, int, str], ClinicalItem]] = []
     for it in extracted.items:
@@ -1162,11 +1522,28 @@ def _recover_omitted_tier0_items(
             continue
         if is_external and _is_sensitive_item(it):
             continue
+        if (
+            not is_longitudinal_q
+            and it.section in {"condition_resolved", "med_historical"}
+        ):
+            continue
+        if (
+            not is_longitudinal_q
+            and it.section in {"lab_observation", "vital_sign"}
+            and it.resource_uuid
+            and uuid_to_series.get(it.resource_uuid) in series_with_latest_in_chart
+        ):
+            continue
         uuids_here = {u for u in (it.resource_uuid, *it.member_uuids) if u}
         if not uuids_here or uuids_here.issubset(represented_uuids):
             continue
         hay = f"{it.display} {it.text} {it.source_org or ''} {it.date or ''}".lower()
-        overlap = sum(1 for t in q_terms if t in hay)
+        hay_tokens = set(re.findall(r"[a-z0-9]{2,}", hay))
+        overlap = sum(
+            1
+            for t in q_terms
+            if any(ht == t or (len(t) >= 4 and ht.startswith(t)) for ht in hay_tokens)
+        )
         if q_terms and overlap == 0:
             continue
         sec_prio = _SECTION_OVERFLOW_PRIORITY.get(it.section, 15)
@@ -1185,8 +1562,8 @@ def _recover_omitted_tier0_items(
         seen_uuids.add(ruuid)
         dt_part = f"({it.date}) " if it.date else ""
         snippet = it.text or it.display or it.resource_type
-        if len(snippet) > 220:
-            snippet = snippet[:217].rstrip() + "..."
+        if len(snippet) > 160:
+            snippet = snippet[:157].rstrip() + "..."
         line = f"  [{next_idx}] {dt_part}{it.resource_type}: {snippet}"
         mapping_dict: Dict[str, Any] = {
             "index": next_idx,
@@ -1213,6 +1590,7 @@ def build_wahs_hub_enrichment_block(
     max_tokens: Optional[int] = None,
     sharing_posture: str = "patient_self",
     token_counter: Optional[Callable[[str], int]] = None,
+    max_overflow_recover: int = 5,
 ) -> HubEnrichmentResult:
     """Construct Layer-3 clinical entity graph, Tier-0 overflow recovery, and KB enrichment.
 
@@ -1268,9 +1646,9 @@ def build_wahs_hub_enrichment_block(
             question=active_question,
             sharing_posture=sharing_posture,
             max_cit_before=max_cit_before,
-            max_recover=8,
+            max_recover=max_overflow_recover,
         )
-        if overflow_triggered
+        if overflow_triggered and max_overflow_recover > 0
         else []
     )
 
