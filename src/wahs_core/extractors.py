@@ -733,6 +733,11 @@ def extract_bundle(
             qualifiers.append(f"category: {'/'.join(cats)}")
         if reactions:
             qualifiers.append(f"reaction: {', '.join(reactions)}")
+        allergy_meta: Dict[str, Any] = {}
+        if sens_source:
+            allergy_meta["sensitivity_source"] = sens_source
+        if v_status:
+            allergy_meta["verification_status"] = v_status
         items.append(
             ClinicalItem(
                 resource_type="AllergyIntolerance",
@@ -748,7 +753,7 @@ def extract_bundle(
                 status=c_status,
                 source_org=resolve_source_org(res),
                 sensitivity=sens,
-                metadata={"sensitivity_source": sens_source} if sens_source else {},
+                metadata=allergy_meta,
             )
         )
 

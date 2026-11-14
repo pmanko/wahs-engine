@@ -764,6 +764,7 @@ class ClinicalEntityGraph:
                         "ingredient_key": item.ingredient_key or "",
                         "dosage": list(item.metadata.get("dosage") or []),
                         "therapeutic_class": str(item.metadata.get("therapeutic_class") or ""),
+                        "verification_status": str(item.metadata.get("verification_status") or "").lower(),
                     },
                 )
             )
@@ -941,9 +942,23 @@ class ClinicalEntityGraph:
         ]
         scoped_conds = _dedup_nodes_by_identity(active_cond_nodes)
 
-        # 2. Allergy cross-reactivity from kb_data/rxnorm_lookup.json (active meds only)
+        # 2. Allergy cross-reactivity from kb_data/rxnorm_lookup.json (actionable allergies + active meds only)
+        def _is_actionable_allergy(al_node: ClinicalNode) -> bool:
+            c_st = (al_node.status or "").strip().lower()
+            if c_st in {"inactive", "resolved", "entered-in-error"}:
+                return False
+            v_st = str(al_node.metadata.get("verification_status") or "").strip().lower()
+            if v_st in {"refuted", "entered-in-error"}:
+                return False
+            al_raw = f"{al_node.label} {al_node.raw_line}".lower()
+            if "verification: refuted" in al_raw or "verification: entered-in-error" in al_raw:
+                return False
+            return True
+
         rx_rules = get_rxnorm_lookup().get("allergy_cross_reactivity_rules") or []
         for al in allergies:
+            if not _is_actionable_allergy(al):
+                continue
             al_low = f"{al.label} {al.raw_line}".lower()
             for rule in rx_rules:
                 if not isinstance(rule, Mapping):
@@ -990,45 +1005,54 @@ class ClinicalEntityGraph:
         def _is_clinically_significant_obs(tgt: ClinicalNode, t_low: str) -> bool:
             if tgt.category != "Observation":
                 return True
-            if bool(tgt.metadata.get("is_abnormal")):
-                return True
+            is_abn = bool(tgt.metadata.get("is_abnormal"))
+            interp = str(tgt.metadata.get("interpretation") or "").strip().lower()
+            is_high = interp in {"h", "hh", "high", "above high normal", "critical high", ">"}
+            is_low = interp in {"l", "ll", "low", "below low normal", "critical low", "<"}
             val = tgt.metadata.get("latest_value")
-            if not isinstance(val, (int, float)):
-                return False
+            has_num = isinstance(val, (int, float))
             unit_compact = re.sub(r"\s+", "", str(tgt.metadata.get("unit") or "").strip().lower())
+
             if "egfr" in t_low or "glomerular filtration" in t_low:
-                return (not unit_compact or "ml/min" in unit_compact) and val < 60
+                if has_num and (not unit_compact or "ml/min" in unit_compact):
+                    return float(val) < 60
+                return is_abn and is_low
             if "creatinine" in t_low:
-                if unit_compact in {"", "mg/dl", "mg/100ml", "mg%"}:
-                    cr_mg_dl: Optional[float] = float(val)
-                elif unit_compact == "mg/l":
-                    cr_mg_dl = float(val) / 10.0
-                elif unit_compact in {"umol/l", "µmol/l", "μmol/l", "mcmol/l", "micromol/l", "mmol/m3"}:
-                    cr_mg_dl = float(val) / 88.42
-                elif unit_compact == "mmol/l":
-                    cr_mg_dl = (float(val) * 1000.0) / 88.42
-                else:
-                    cr_mg_dl = None
-                return cr_mg_dl is not None and cr_mg_dl >= 1.5
+                if has_num:
+                    if unit_compact in {"", "mg/dl", "mg/100ml", "mg%"}:
+                        return float(val) >= 1.5
+                    if unit_compact == "mg/l":
+                        return (float(val) / 10.0) >= 1.5
+                    if unit_compact in {"umol/l", "µmol/l", "μmol/l", "mcmol/l", "micromol/l", "mmol/m3"}:
+                        return (float(val) / 88.42) >= 1.5
+                    if unit_compact == "mmol/l":
+                        return ((float(val) * 1000.0) / 88.42) >= 1.5
+                return is_abn and is_high
             if "potassium" in t_low:
-                if unit_compact not in {"", "meq/l", "mmol/l", "meq/liter", "mmol/liter"}:
-                    return False
-                return val >= 5.0 or val <= 3.4
+                if has_num and unit_compact in {"", "meq/l", "mmol/l", "meq/liter", "mmol/liter"}:
+                    return float(val) >= 5.0 or float(val) <= 3.4
+                return is_abn and (is_high or is_low or not interp)
             if "inr" in t_low:
-                if unit_compact not in {"", "{inr}", "inr", "ratio", "1", "none"}:
-                    return False
-                return val >= 3.5
+                if has_num and unit_compact in {"", "{inr}", "inr", "ratio", "1", "none"}:
+                    return float(val) >= 3.5
+                return is_abn and is_high
             if "hemoglobin" in t_low and "a1c" not in t_low:
-                if unit_compact in {"", "g/dl", "gm/dl", "g/100ml", "g%"}:
-                    hb_g_dl: Optional[float] = float(val)
-                elif unit_compact in {"g/l", "gm/l", "mg/ml"}:
-                    hb_g_dl = float(val) / 10.0
-                elif unit_compact == "mmol/l":
-                    hb_g_dl = float(val) * 1.6114
-                else:
-                    hb_g_dl = None
-                return hb_g_dl is not None and hb_g_dl < 11.5
-            return False
+                if has_num:
+                    if unit_compact in {"", "g/dl", "gm/dl", "g/100ml", "g%"}:
+                        return float(val) < 11.5
+                    if unit_compact in {"g/l", "gm/l", "mg/ml"}:
+                        return (float(val) / 10.0) < 11.5
+                    if unit_compact == "mmol/l":
+                        return (float(val) * 1.6114) < 11.5
+                return is_abn and is_low
+            if "glucose" in t_low:
+                if has_num:
+                    if unit_compact in {"", "mg/dl", "mg/100ml", "mg%"}:
+                        return float(val) < 70
+                    if unit_compact == "mmol/l":
+                        return float(val) < 3.9
+                return is_abn and is_low
+            return is_abn
 
         for m in scoped_meds:
             m_low = f"{m.label} {m.metadata.get('ingredient_key', '')} {m.raw_line}".lower()

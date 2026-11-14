@@ -349,3 +349,104 @@ def test_obs_safety_thresholds_convert_ucum_units_and_ignore_unknown_units() -> 
     # Unrecognized unit marked non-abnormal must NOT trigger hard-coded mg/dL numeric threshold
     g_unk = ClinicalEntityGraph.from_extracted_chart(extract_bundle(_bundle(25.0, "{arbitrary_units}")))
     assert not any(e.edge_type == "CONTRAINDICATED_OR_DOSE_ADJUST_IN" for e in g_unk.edges)
+
+
+def test_refuted_and_inactive_allergies_excluded_from_cross_reactivity() -> None:
+    from wahs_core import ClinicalEntityGraph, extract_bundle
+
+    def _allergy_bundle(c_status: str, v_status: str) -> Dict[str, Any]:
+        return {
+            "resourceType": "Bundle",
+            "type": "collection",
+            "entry": [
+                {"resource": {"resourceType": "Patient", "id": "p-al-1", "birthDate": "1960-01-01"}},
+                {
+                    "resource": {
+                        "resourceType": "AllergyIntolerance",
+                        "id": "al-pen-1",
+                        "clinicalStatus": {"coding": [{"code": c_status}]},
+                        "verificationStatus": {"coding": [{"code": v_status}]},
+                        "code": {"text": "Penicillin G"},
+                    }
+                },
+                {
+                    "resource": {
+                        "resourceType": "MedicationRequest",
+                        "id": "med-cef-1",
+                        "status": "active",
+                        "authoredOn": "2026-09-01",
+                        "medicationCodeableConcept": {"text": "Cefazolin 1000 MG"},
+                    }
+                },
+            ],
+        }
+
+    g_refuted = ClinicalEntityGraph.from_extracted_chart(extract_bundle(_allergy_bundle("active", "refuted")))
+    assert not any(e.edge_type == "CROSS_REACTS_WITH" for e in g_refuted.edges)
+
+    g_eie = ClinicalEntityGraph.from_extracted_chart(extract_bundle(_allergy_bundle("active", "entered-in-error")))
+    assert not any(e.edge_type == "CROSS_REACTS_WITH" for e in g_eie.edges)
+
+    g_inactive = ClinicalEntityGraph.from_extracted_chart(extract_bundle(_allergy_bundle("inactive", "confirmed")))
+    assert not any(e.edge_type == "CROSS_REACTS_WITH" for e in g_inactive.edges)
+
+    g_confirmed = ClinicalEntityGraph.from_extracted_chart(extract_bundle(_allergy_bundle("active", "confirmed")))
+    assert any(e.edge_type == "CROSS_REACTS_WITH" for e in g_confirmed.edges)
+
+
+def test_abnormal_labs_in_non_risky_direction_do_not_trigger_safety_warnings() -> None:
+    from wahs_core import ClinicalEntityGraph, extract_bundle
+
+    def _bundle(med_text: str, obs_code: str, obs_disp: str, val: float, unit: str, interp: str) -> Dict[str, Any]:
+        return {
+            "resourceType": "Bundle",
+            "type": "collection",
+            "entry": [
+                {"resource": {"resourceType": "Patient", "id": "p-dir-1", "birthDate": "1960-01-01"}},
+                {
+                    "resource": {
+                        "resourceType": "MedicationRequest",
+                        "id": "med-1",
+                        "status": "active",
+                        "authoredOn": "2026-09-01",
+                        "medicationCodeableConcept": {"text": med_text},
+                    }
+                },
+                {
+                    "resource": {
+                        "resourceType": "Observation",
+                        "id": "obs-1",
+                        "status": "final",
+                        "category": [{"coding": [{"code": "laboratory"}]}],
+                        "code": {"coding": [{"system": "http://loinc.org", "code": obs_code, "display": obs_disp}], "text": obs_disp},
+                        "interpretation": [{"coding": [{"code": interp}]}],
+                        "effectiveDateTime": "2026-10-01",
+                        "valueQuantity": {"value": val, "unit": unit},
+                    }
+                },
+            ],
+        }
+
+    # Apixaban + HIGH hemoglobin (18 g/dL, H) -> NOT an anemia/bleed risk
+    g_hb_hi = ClinicalEntityGraph.from_extracted_chart(
+        extract_bundle(_bundle("Apixaban 5 MG", "718-7", "Hemoglobin", 18.0, "g/dL", "H"))
+    )
+    assert not any(e.edge_type == "CONTRAINDICATED_OR_DOSE_ADJUST_IN" for e in g_hb_hi.edges)
+
+    # Apixaban + LOW hemoglobin (8.5 g/dL, L) -> DOES warn
+    g_hb_lo = ClinicalEntityGraph.from_extracted_chart(
+        extract_bundle(_bundle("Apixaban 5 MG", "718-7", "Hemoglobin", 8.5, "g/dL", "L"))
+    )
+    assert any(e.edge_type == "CONTRAINDICATED_OR_DOSE_ADJUST_IN" for e in g_hb_lo.edges)
+
+    # Metformin + HIGH eGFR (130 mL/min/1.73m2, H) -> NOT renal impairment
+    g_egfr_hi = ClinicalEntityGraph.from_extracted_chart(
+        extract_bundle(_bundle("Metformin 500 MG", "33914-3", "Glomerular filtration rate (eGFR)", 130.0, "mL/min/1.73m2", "H"))
+    )
+    assert not any(e.edge_type == "CONTRAINDICATED_OR_DOSE_ADJUST_IN" for e in g_egfr_hi.edges)
+
+    # Metformin + LOW eGFR (28 mL/min/1.73m2, L) -> DOES warn
+    g_egfr_lo = ClinicalEntityGraph.from_extracted_chart(
+        extract_bundle(_bundle("Metformin 500 MG", "33914-3", "Glomerular filtration rate (eGFR)", 28.0, "mL/min/1.73m2", "L"))
+    )
+    assert any(e.edge_type == "CONTRAINDICATED_OR_DOSE_ADJUST_IN" for e in g_egfr_lo.edges)
