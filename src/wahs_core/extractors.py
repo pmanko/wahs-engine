@@ -28,6 +28,7 @@ from .kb_lookup import (
 from .normalizers import (
     annotate_immunization_anomalies,
     classify_sensitivity,
+    classify_sensitivity_with_source,
     classify_vaccine_group,
     detect_condition_conflicts,
     detect_medication_conflicts,
@@ -82,21 +83,6 @@ _ROUTINE_SCREENING_PROCEDURE_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
-# Synthea note sections that merely repeat structured problem/allergy/med/vital lists verbatim.
-_BOILERPLATE_NOTE_SECTIONS: Set[str] = {
-    "history of present illness",
-    "past medical history",
-    "social history",
-    "family history",
-    "allergies",
-    "medications",
-    "vital signs",
-    "results",
-    "procedures",
-    "review of systems",
-    "physical exam",
-}
-
 
 @dataclass
 class NumericPoint:
@@ -107,6 +93,9 @@ class NumericPoint:
     value: float
     unit: str
     category: str
+    interpretation: Optional[str] = None
+    reference_range: Optional[str] = None
+    is_abnormal: bool = False
 
 
 @dataclass
@@ -334,12 +323,95 @@ def _format_structured_dosage(d_inst: Mapping[str, Any]) -> str:
     return d_txt or structured_str
 
 
-def _extract_unique_note_narrative(decoded_text: str, *, preserve_all_sections: bool = False) -> str:
-    """Extract unique encounter narrative (`# Chief Complaint`, `# Assessment and Plan`, etc.)
-    from a clinical note while stripping repeated Synthea template header/table dumps.
+def _extract_meta_security_codes(res: Mapping[str, Any]) -> Tuple[str, ...]:
+    """Extract uppercased HL7 ``Resource.meta.security[].code`` labels."""
+    meta_obj = res.get("meta")
+    if not isinstance(meta_obj, Mapping):
+        return ()
+    codes: List[str] = []
+    for sec in meta_obj.get("security") or []:
+        if isinstance(sec, Mapping):
+            code = str(sec.get("code") or "").strip().upper()
+            if code:
+                codes.append(code)
+    return tuple(dict.fromkeys(codes))
 
-    Preserves full normalized note content at extraction time (Tier 0); later tiers perform
-    explicitly reported excerpting when needed."""
+
+def _extract_obs_interpretation_and_range(
+    obs: Mapping[str, Any],
+    num_val: Optional[float],
+) -> Tuple[Optional[str], Optional[str], bool]:
+    """Extract native FHIR ``Observation.interpretation`` and ``referenceRange`` cleanly."""
+    interp_code = ""
+    interp_disp = ""
+    raw_interp = obs.get("interpretation")
+    if isinstance(raw_interp, Mapping):
+        raw_interp = [raw_interp]
+    if isinstance(raw_interp, list):
+        for entry in raw_interp:
+            if isinstance(entry, Mapping):
+                c, d = _coding_pair(entry)
+                if c or d:
+                    interp_code, interp_disp = c, d
+                    break
+
+    range_str: Optional[str] = None
+    low_bound: Optional[float] = None
+    high_bound: Optional[float] = None
+    raw_ranges = obs.get("referenceRange")
+    if isinstance(raw_ranges, list) and raw_ranges and isinstance(raw_ranges[0], Mapping):
+        rr0 = raw_ranges[0]
+        low_obj = rr0.get("low") if isinstance(rr0.get("low"), Mapping) else {}
+        high_obj = rr0.get("high") if isinstance(rr0.get("high"), Mapping) else {}
+        try:
+            low_bound = float(low_obj["value"]) if low_obj.get("value") is not None else None
+        except (TypeError, ValueError):
+            low_bound = None
+        try:
+            high_bound = float(high_obj["value"]) if high_obj.get("value") is not None else None
+        except (TypeError, ValueError):
+            high_bound = None
+        if rr0.get("text"):
+            range_str = str(rr0["text"]).strip()
+        elif low_bound is not None and high_bound is not None:
+            u = str(high_obj.get("unit") or low_obj.get("unit") or "").strip()
+            u_sp = f" {u}" if u else ""
+            range_str = f"{_format_num(low_bound)}-{_format_num(high_bound)}{u_sp}"
+        elif high_bound is not None:
+            u = str(high_obj.get("unit") or "").strip()
+            range_str = f"<= {_format_num(high_bound)}" + (f" {u}" if u else "")
+        elif low_bound is not None:
+            u = str(low_obj.get("unit") or "").strip()
+            range_str = f">= {_format_num(low_bound)}" + (f" {u}" if u else "")
+
+    norm_code = interp_code.upper()
+    if norm_code in {"H", "HH", "HU", "L", "LL", "LU", "A", "AA", "CRIT", "POS", "ABNORMAL", "HIGH", "LOW"}:
+        is_abnormal = True
+        interp_label: Optional[str] = interp_code or interp_disp
+    elif norm_code in {"N", "NORMAL"}:
+        is_abnormal = False
+        interp_label = interp_code
+    elif interp_disp:
+        is_abnormal = interp_disp.lower() in {"high", "low", "critical", "abnormal", "positive"}
+        interp_label = interp_disp
+    else:
+        is_abnormal = False
+        interp_label = None
+
+    if interp_label is None and num_val is not None:
+        if low_bound is not None and num_val < low_bound:
+            interp_label = "L"
+            is_abnormal = True
+        elif high_bound is not None and num_val > high_bound:
+            interp_label = "H"
+            is_abnormal = True
+
+    return interp_label, range_str, is_abnormal
+
+
+def _extract_unique_note_narrative(decoded_text: str, *, preserve_all_sections: bool = True) -> str:
+    """Extract normalized clinical note narrative, preserving all non-empty Markdown sections faithfully."""
+    del preserve_all_sections
     lines = [line.strip() for line in (decoded_text or "").splitlines()]
     if not lines:
         return ""
@@ -356,53 +428,24 @@ def _extract_unique_note_narrative(decoded_text: str, *, preserve_all_sections: 
         sections.setdefault(current_header, []).append(line)
 
     kept_parts: List[str] = []
-    # Check if structured Markdown sections exist
     has_markdown_headers = any(k != "preamble" for k in sections)
     if has_markdown_headers:
+        if sections.get("preamble"):
+            pre_body = " ".join(sections["preamble"]).strip()
+            if pre_body:
+                kept_parts.append(pre_body)
         for header, body_lines in sections.items():
             if header == "preamble":
                 continue
-            if not preserve_all_sections and header in _BOILERPLATE_NOTE_SECTIONS:
-                continue
             compact_body = " ".join(body_lines).strip()
-            if not compact_body or compact_body.lower() in {"no active allergies.", "none", "n/a"}:
+            if not compact_body:
                 continue
             kept_parts.append(f"{header.title()}: {compact_body}")
         if kept_parts:
             return " | ".join(kept_parts)
-        # If every section was boilerplate (e.g. "No complaints."), check chief complaint fallback
-        cc = " ".join(sections.get("chief complaint") or []).strip()
-        ap = " ".join(sections.get("assessment and plan") or []).strip()
-        fallback = " | ".join(p for p in (cc, ap) if p)
-        if fallback:
-            return fallback
 
-    # Plain-text non-Synthea note fallback: keep all non-header content
-    non_empty = [l for l in lines if l and not l.lower().startswith(("patient:", "date:", "provider:"))]
+    non_empty = [l for l in lines if l and not re.match(r"^[-=_*]{3,}$", l)]
     return " ".join(non_empty).strip()
-
-
-def extract_bundle_lossless(
-    bundle: Mapping[str, Any],
-    *,
-    enable_privacy_classification: bool = False,
-    filter_room_equipment_devices: bool = False,
-) -> ExtractedChart:
-    """Non-destructive W12/W15 FHIR Bundle extractor:
-    - Zero pre-baked `[conflict_note]` mutations in rendered chart lines
-    - Optional `enable_privacy_classification` (`False` by default, deferred to W9)
-    - Optional `filter_room_equipment_devices` (`False` by default so clinic-equipment `Device` artifacts are retained non-destructively and inspectable)
-    - Preserves intraday timestamps (`YYYY-MM-DDTHH:MM`) on lab/vital observations
-    - Preserves all non-empty clinical note sections (`# Medications`, `# HPI`, etc.) plus full decoded text in metadata
-    """
-    return extract_bundle(
-        bundle,
-        include_conflict_annotations=False,
-        enable_privacy_classification=enable_privacy_classification,
-        preserve_intraday_timestamps=True,
-        preserve_all_note_sections=True,
-        filter_room_equipment_devices=filter_room_equipment_devices,
-    )
 
 
 def extract_bundle(
@@ -541,14 +584,36 @@ def extract_bundle(
                         return t_code
         return None
 
+    def _classify_res_sensitivity(
+        res: Mapping[str, Any],
+        code: Optional[str],
+        display: str,
+        categories: Sequence[str] = (),
+        *,
+        fallback_kb_sensitivity: Optional[str] = None,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        if not enable_privacy_classification:
+            return None, None
+        sec_codes = _extract_meta_security_codes(res)
+        sens, src = classify_sensitivity_with_source(
+            code, display, categories, meta_security_codes=sec_codes
+        )
+        if not sens and fallback_kb_sensitivity:
+            return str(fallback_kb_sensitivity), "kb_coded_privacy"
+        return sens, src
+
     items: List[ClinicalItem] = []
     numeric_points: List[NumericPoint] = []
     all_clinical_dates: List[str] = []
 
-    # Pre-scan clinical dates to establish reference_date (latest clinical event in bundle)
+    # Pre-scan clinical dates to establish reference_date (excluding Patient & Device)
     for res in resources:
         rtype = str(res.get("resourceType") or "")
-        if rtype in NON_CLINICAL_RESOURCE_TYPES or rtype in LOOKUP_ONLY_RESOURCE_TYPES or rtype == "Patient":
+        if (
+            rtype in NON_CLINICAL_RESOURCE_TYPES
+            or rtype in LOOKUP_ONLY_RESOURCE_TYPES
+            or rtype in {"Patient", "Device"}
+        ):
             continue
         for field_name in (
             "effectiveDateTime",
@@ -640,7 +705,8 @@ def extract_bundle(
                     _, m_disp = _coding_pair(manif)
                     if m_disp:
                         reactions.append(f"{m_disp} ({sev})" if sev else m_disp)
-        rec_date = _iso_date(res.get("recordedDate") or res.get("onsetDateTime")) or reference_date
+        rec_date = _iso_date(res.get("recordedDate") or res.get("onsetDateTime"))
+        sens, sens_source = _classify_res_sensitivity(res, code, disp, cats)
         qualifiers = [f"status: {c_status}"]
         if v_status:
             qualifiers.append(f"verification: {v_status}")
@@ -656,7 +722,7 @@ def extract_bundle(
                 resource_uuid=rid,
                 date=rec_date,
                 clinical_date=rec_date,
-                date_kind="clinical_event",
+                date_kind="clinical_event" if rec_date else "unknown",
                 section="allergy",
                 code=code or disp,
                 display=disp or code or "Unspecified allergy",
@@ -664,10 +730,12 @@ def extract_bundle(
                 mandatory=True,
                 status=c_status,
                 source_org=resolve_source_org(res),
+                sensitivity=sens,
+                metadata={"sensitivity_source": sens_source} if sens_source else {},
             )
         )
 
-    # 3. Extract Condition (Active vs Resolved/Historical, with conflict & SDOH sensitivity classification)
+    # 3. Extract Condition (Active vs Resolved/Historical)
     raw_conditions: List[Dict[str, Any]] = []
     for res in resources:
         if res.get("resourceType") != "Condition":
@@ -680,15 +748,9 @@ def extract_bundle(
         abatement = _iso_date(res.get("abatementDateTime"))
         cats = _categories(res)
         cond_kb = resolve_condition_code(code, disp)
-        sens = (
-            classify_sensitivity(code, disp, cats)
-            or (
-                cond_kb.get("sensitivity")
-                if cond_kb.get("resolved_by") != "heuristic_fallback"
-                else None
-            )
-            if enable_privacy_classification
-            else None
+        kb_sens = cond_kb.get("sensitivity") if cond_kb.get("resolved_by") != "heuristic_fallback" else None
+        sens, sens_source = _classify_res_sensitivity(
+            res, code, disp, cats, fallback_kb_sensitivity=kb_sens
         )
         raw_conditions.append(
             {
@@ -701,6 +763,7 @@ def extract_bundle(
                 "abatement": abatement,
                 "categories": cats,
                 "sensitivity": sens,
+                "sensitivity_source": sens_source,
                 "source_org": resolve_source_org(res),
                 "kb_resolution": cond_kb,
             }
@@ -724,7 +787,6 @@ def extract_bundle(
         conflict = condition_conflicts.get(rid)
         sens = c["sensitivity"]
         event_date = c["onset"] if is_active else (c["abatement"] or c["onset"])
-        event_date = event_date or reference_date
         details = [f"status: {c['status']}"]
         if c["onset"]:
             details.append(f"onset: {c['onset']}")
@@ -734,23 +796,25 @@ def extract_bundle(
             details.append(f"source: {c['source_org']}")
         if c["code"]:
             details.append(f"SNOMED: {c['code']}")
-        suffix = ""
-        if conflict:
-            suffix += f" [{conflict}]"
-        if sens == "SDOH/PRIVACY-SENSITIVE":
-            suffix += " [sensitivity: SDOH/PRIVACY-SENSITIVE]"
         cond_kb = c["kb_resolution"]
+        cond_meta: Dict[str, Any] = {
+            "onset": c["onset"],
+            "abatement": c["abatement"],
+            "kb_resolution": cond_kb,
+        }
+        if c["sensitivity_source"]:
+            cond_meta["sensitivity_source"] = c["sensitivity_source"]
         items.append(
             ClinicalItem(
                 resource_type="Condition",
                 resource_uuid=rid,
                 date=event_date,
                 clinical_date=event_date,
-                date_kind="clinical_event",
+                date_kind="clinical_event" if event_date else "unknown",
                 section="condition_active" if is_active else "condition_resolved",
                 code=c["code"] or c["display"],
                 display=c["display"],
-                text=f"Condition: {c['display']} ({', '.join(details)}){suffix}",
+                text=f"Condition: {c['display']} ({', '.join(details)})",
                 mandatory=is_active or bool(conflict),
                 status=c["status"],
                 end_date=c["abatement"],
@@ -758,11 +822,7 @@ def extract_bundle(
                 sensitivity=sens,
                 conflict_note=conflict,
                 is_routine=(sens == "SDOH-SOCIAL"),
-                metadata={
-                    "onset": c["onset"],
-                    "abatement": c["abatement"],
-                    "kb_resolution": cond_kb,
-                },
+                metadata=cond_meta,
             )
         )
 
@@ -792,7 +852,7 @@ def extract_bundle(
             or res.get("effectiveDateTime")
             or (res.get("effectivePeriod") or {}).get("start")
             or res.get("whenHandedOver")
-        ) or reference_date
+        )
         end_date = _iso_date((res.get("effectivePeriod") or {}).get("end"))
 
         # Extract dosage text and/or structured dosage instructions if available
@@ -842,6 +902,7 @@ def extract_bundle(
                 for entry_link in raw_link:
                     if isinstance(entry_link, Mapping) and entry_link.get("reference"):
                         linked_order_uuids.append(_strip_urn(str(entry_link.get("reference"))))
+        med_sens, med_sens_src = _classify_res_sensitivity(res, code, resolved_disp or disp)
         raw_meds.append(
             {
                 "resourceType": rtype,
@@ -857,6 +918,8 @@ def extract_bundle(
                 "setting": setting,
                 "ingredient_key": ingredient,
                 "source_org": resolve_source_org(res),
+                "sensitivity": med_sens,
+                "sensitivity_source": med_sens_src,
                 "linked_order_uuids": tuple(dict.fromkeys(u for u in linked_order_uuids if u)),
                 "kb_resolution": med_kb,
             }
@@ -882,48 +945,48 @@ def extract_bundle(
             quals.append(f"source: {m['source_org']}")
         if m["code"]:
             quals.append(f"RxNorm: {m['code']}")
-        suffix = (
-            f" [ingredient_group: {ing_grp} ({t_class}); {m_conflict}]"
-            if m_conflict
-            else ""
-        )
+        med_meta: Dict[str, Any] = {
+            "reasons": m["reasons"],
+            "dosage": m["dose_strs"],
+            "setting": m["setting"],
+            "ingredient_group": ing_grp,
+            "therapeutic_class": t_class,
+            "kb_resolution": med_kb,
+        }
+        if m["sensitivity_source"]:
+            med_meta["sensitivity_source"] = m["sensitivity_source"]
         items.append(
             ClinicalItem(
                 resource_type=m["resourceType"],
                 resource_uuid=rid,
                 date=m["date"],
                 clinical_date=m["date"],
-                date_kind="clinical_event",
+                date_kind="clinical_event" if m["date"] else "unknown",
                 section="med_active" if m["is_active"] else "med_historical",
                 code=m["code"] or m["ingredient_key"],
                 display=m["display"],
-                text=f"Medication: {m['display']} ({', '.join(quals)}){suffix}",
+                text=f"Medication: {m['display']} ({', '.join(quals)})",
                 mandatory=m["is_active"],
                 status=m["status"],
                 end_date=m["end_date"],
                 source_org=m["source_org"],
+                sensitivity=m["sensitivity"],
                 conflict_note=m_conflict,
                 ingredient_key=m["ingredient_key"],
-                metadata={
-                    "reasons": m["reasons"],
-                    "dosage": m["dose_strs"],
-                    "setting": m["setting"],
-                    "ingredient_group": ing_grp,
-                    "therapeutic_class": t_class,
-                    "kb_resolution": med_kb,
-                },
+                metadata=med_meta,
             )
         )
 
-    # 5. Extract Immunization (with ACIP schedule & duplicate pre-annotation)
+    # 5. Extract Immunization
     raw_imms: List[Dict[str, Any]] = []
     for res in resources:
         if res.get("resourceType") != "Immunization":
             continue
         rid = str(res.get("id") or "")
         code, disp = _coding_pair(res.get("vaccineCode"))
-        occ_date = _iso_date(res.get("occurrenceDateTime")) or reference_date
+        occ_date = _iso_date(res.get("occurrenceDateTime"))
         status = str(res.get("status") or "completed").strip().lower()
+        imm_sens, imm_sens_src = _classify_res_sensitivity(res, code, disp)
         raw_imms.append(
             {
                 "resourceUuid": rid,
@@ -932,6 +995,8 @@ def extract_bundle(
                 "date": occ_date,
                 "status": status,
                 "source_org": resolve_source_org(res),
+                "sensitivity": imm_sens,
+                "sensitivity_source": imm_sens_src,
                 "group": classify_vaccine_group(code, disp),
             }
         )
@@ -953,36 +1018,37 @@ def extract_bundle(
             quals.append(f"CVX: {imm['code']}")
         if imm["source_org"]:
             quals.append(f"source: {imm['source_org']}")
-        suffix = f" [{anom}]" if anom else ""
-        # Attach all series UUIDs to ACIP schedule anomaly items so every dose UUID in the series
-        # survives even in Tier 4 micro-capsules.
         series_members: Tuple[str, ...] = (
             tuple(imms_by_group.get(imm["group"], [rid]))
             if anom and anom.startswith("acip_schedule_note:")
             else ()
         )
         imm_kb = resolve_immunization_code(imm["code"], imm["display"])
+        imm_meta: Dict[str, Any] = {
+            "vaccine_group": imm_kb.get("vaccine_group", imm["group"]),
+            "kb_resolution": imm_kb,
+        }
+        if imm["sensitivity_source"]:
+            imm_meta["sensitivity_source"] = imm["sensitivity_source"]
         items.append(
             ClinicalItem(
                 resource_type="Immunization",
                 resource_uuid=rid,
                 date=imm["date"],
                 clinical_date=imm["date"],
-                date_kind="clinical_event",
+                date_kind="clinical_event" if imm["date"] else "unknown",
                 section="immunization",
                 code=imm["code"] or imm["group"],
                 display=imm["display"],
-                text=f"Immunization: {imm['display']} ({', '.join(quals)}){suffix}",
+                text=f"Immunization: {imm['display']} ({', '.join(quals)})",
                 mandatory=bool(anom),
                 status=imm["status"],
                 source_org=imm["source_org"],
+                sensitivity=imm["sensitivity"],
                 conflict_note=anom,
                 ingredient_key=imm["group"],
                 member_uuids=series_members,
-                metadata={
-                    "vaccine_group": imm_kb.get("vaccine_group", imm["group"]),
-                    "kb_resolution": imm_kb,
-                },
+                metadata=imm_meta,
             )
         )
 
@@ -996,6 +1062,7 @@ def extract_bundle(
         if rtype == "DocumentReference":
             n_date = _iso_date(res.get("date") or (res.get("context") or {}).get("period", {}).get("start"))
             _, n_type = _coding_pair(res.get("type"))
+            sec_codes = _extract_meta_security_codes(res)
             for content_item in res.get("content") or []:
                 att = (content_item or {}).get("attachment") or {}
                 b64_data = att.get("data")
@@ -1005,6 +1072,7 @@ def extract_bundle(
                         notes_by_hash[digest]["member_uuids"].append(rid)
                         if n_date:
                             notes_by_hash[digest]["dates"].append(n_date)
+                        notes_by_hash[digest]["meta_security"].extend(sec_codes)
                         dedup_note_count += 1
                     else:
                         try:
@@ -1014,17 +1082,18 @@ def extract_bundle(
                         notes_by_hash[digest] = {
                             "primary_type": "DocumentReference",
                             "primary_uuid": rid,
-                            "date": n_date or reference_date,
-                            "dates": [n_date] if n_date else ([reference_date] if reference_date else []),
+                            "date": n_date,
+                            "dates": [n_date] if n_date else [],
                             "title": n_type or "Clinical Note",
                             "decoded": decoded,
                             "source_org": resolve_source_org(res),
                             "member_uuids": [rid],
+                            "meta_security": list(sec_codes),
                         }
         elif rtype == "DiagnosticReport" and (res.get("presentedForm") or []):
-            # DiagnosticReport with presentedForm[] (with or without result[])
             n_date = _iso_date(res.get("effectiveDateTime") or res.get("issued"))
             _, n_type = _coding_pair(res.get("code"))
+            sec_codes = _extract_meta_security_codes(res)
             for pf in res.get("presentedForm") or []:
                 b64_data = (pf or {}).get("data")
                 if isinstance(b64_data, str) and b64_data:
@@ -1033,6 +1102,7 @@ def extract_bundle(
                         notes_by_hash[digest]["member_uuids"].append(rid)
                         if n_date:
                             notes_by_hash[digest]["dates"].append(n_date)
+                        notes_by_hash[digest]["meta_security"].extend(sec_codes)
                         dedup_note_count += 1
                     else:
                         try:
@@ -1042,12 +1112,13 @@ def extract_bundle(
                         notes_by_hash[digest] = {
                             "primary_type": "DiagnosticReport",
                             "primary_uuid": rid,
-                            "date": n_date or reference_date,
-                            "dates": [n_date] if n_date else ([reference_date] if reference_date else []),
+                            "date": n_date,
+                            "dates": [n_date] if n_date else [],
                             "title": n_type or "Clinical Note",
                             "decoded": decoded,
                             "source_org": resolve_source_org(res),
                             "member_uuids": [rid],
+                            "meta_security": list(sec_codes),
                         }
 
     for note_info in notes_by_hash.values():
@@ -1065,35 +1136,39 @@ def extract_bundle(
             if len(distinct_dates) > 1
             else ""
         )
-        note_sens = (
-            classify_sensitivity("", f"{note_info['title']} {note_info['decoded']} {snippet}")
-            if enable_privacy_classification
-            else None
-        )
-        sens_suffix = " [sensitivity: SDOH/PRIVACY-SENSITIVE]" if note_sens == "SDOH/PRIVACY-SENSITIVE" else ""
+        if enable_privacy_classification:
+            note_sens, note_sens_src = classify_sensitivity_with_source(
+                "",
+                f"{note_info['title']} {note_info['decoded']} {snippet}",
+                meta_security_codes=note_info.get("meta_security") or (),
+            )
+        else:
+            note_sens, note_sens_src = None, None
+        note_meta: Dict[str, Any] = {
+            "full_text": snippet,
+            "raw_decoded_text": note_info["decoded"],
+            "title": note_info["title"],
+            "duplicate_wrapper_count": len(members),
+            **({"dates": distinct_dates} if distinct_dates else {}),
+            **({"sensitivity_source": note_sens_src} if note_sens_src else {}),
+        }
         items.append(
             ClinicalItem(
                 resource_type=note_info["primary_type"],
                 resource_uuid=note_info["primary_uuid"],
                 date=primary_date,
                 clinical_date=primary_date,
-                date_kind="clinical_event",
+                date_kind="clinical_event" if primary_date else "unknown",
                 section="clinical_note",
                 code="clinical-note",
                 display=note_info["title"],
-                text=f"Clinical Note — {note_info['title']}: {snippet}{extra_dates_str}{sens_suffix}",
+                text=f"Clinical Note — {note_info['title']}: {snippet}{extra_dates_str}",
                 mandatory=False,
                 status="current",
                 source_org=note_info["source_org"],
                 sensitivity=note_sens,
                 member_uuids=members,
-                metadata={
-                    "full_text": snippet,
-                    "raw_decoded_text": note_info["decoded"],
-                    "title": note_info["title"],
-                    "duplicate_wrapper_count": len(members),
-                    **({"dates": distinct_dates} if distinct_dates else {}),
-                },
+                metadata=note_meta,
             )
         )
 
@@ -1104,22 +1179,29 @@ def extract_bundle(
         obs_date: str,
         obs_cat: str,
         obs_cats: Sequence[str],
-    ) -> Tuple[List[NumericPoint], List[str]]:
+    ) -> Tuple[List[NumericPoint], List[str], Optional[str]]:
         pts: List[NumericPoint] = []
         comp_sens: List[str] = []
+        comp_src: Optional[str] = None
+        parent_sec_codes = _extract_meta_security_codes(obs_res)
         for comp in obs_res.get("component") or []:
             if not isinstance(comp, Mapping):
                 continue
             c_code, c_disp = _coding_pair(comp.get("code"))
             vq = comp.get("valueQuantity")
             c_val_str = ""
+            c_num_for_rr: Optional[float] = None
             if isinstance(vq, Mapping) and vq.get("value") is not None:
                 c_cmp = str(vq.get("comparator") or "").strip()
                 c_unit = str(vq.get("unit") or vq.get("code") or "").strip()
                 c_val_str = f"{c_cmp}{_format_num(vq.get('value'))} {c_unit}".strip()
-                if obs_date and not c_cmp:
+                if not c_cmp:
                     try:
                         c_num = float(vq["value"])
+                        c_num_for_rr = c_num
+                        c_interp, c_rr, c_abn = _extract_obs_interpretation_and_range(
+                            comp, c_num
+                        )
                         pts.append(
                             NumericPoint(
                                 resource_uuid=obs_uuid,
@@ -1129,6 +1211,9 @@ def extract_bundle(
                                 value=c_num,
                                 unit=c_unit,
                                 category=obs_cat,
+                                interpretation=c_interp,
+                                reference_range=c_rr,
+                                is_abnormal=c_abn,
                             )
                         )
                     except (TypeError, ValueError):
@@ -1137,10 +1222,14 @@ def extract_bundle(
                 _, vc_disp = _coding_pair(comp.get("valueCodeableConcept"))
                 c_val_str = vc_disp
             if enable_privacy_classification:
-                cs = classify_sensitivity(c_code, f"{c_disp} {c_val_str}", obs_cats)
+                cs, csrc = classify_sensitivity_with_source(
+                    c_code, f"{c_disp} {c_val_str}", obs_cats, meta_security_codes=parent_sec_codes
+                )
                 if cs:
                     comp_sens.append(cs)
-        return pts, comp_sens
+                    if cs == "SDOH/PRIVACY-SENSITIVE" or not comp_src:
+                        comp_src = csrc
+        return pts, comp_sens, comp_src
 
     claimed_obs_ids: Set[str] = set()
     for res in resources:
@@ -1151,12 +1240,13 @@ def extract_bundle(
             continue
         rid = str(res.get("id") or "")
         code, disp = _coding_pair(res.get("code"))
-        p_date = _iso_date(res.get("effectiveDateTime") or res.get("issued")) or reference_date
+        p_date = _iso_date(res.get("effectiveDateTime") or res.get("issued"))
         is_survey = bool(_SURVEY_PANEL_PATTERNS.search(disp or ""))
 
         member_uuids: List[str] = [rid]
         child_parts: List[str] = []
         child_sensitivities: List[str] = []
+        child_sens_sources: List[str] = []
 
         for ref_obj in result_refs:
             if not isinstance(ref_obj, Mapping):
@@ -1174,6 +1264,7 @@ def extract_bundle(
                 continue
             o_code, o_disp = _coding_pair(child_obs.get("code"))
             val_str, num_val, unit = _format_obs_value(child_obs)
+            o_interp, o_range, o_abn = _extract_obs_interpretation_and_range(child_obs, num_val)
             o_cats = _categories(child_obs)
             o_date_raw = child_obs.get("effectiveDateTime") or child_obs.get("issued")
             o_date = (
@@ -1181,66 +1272,87 @@ def extract_bundle(
                 or p_date
             )
             o_primary_cat = o_cats[0] if o_cats else ("survey" if is_survey else "laboratory")
-            o_sens = (
-                classify_sensitivity(o_code, f"{o_disp} {val_str}", o_cats)
-                if enable_privacy_classification
-                else None
+            o_sens, o_sens_src = _classify_res_sensitivity(
+                child_obs, o_code, f"{o_disp} {val_str}", o_cats
             )
             if o_sens:
                 child_sensitivities.append(o_sens)
+            if o_sens_src:
+                child_sens_sources.append(o_sens_src)
             short_label = o_disp or o_code or "item"
             if val_str:
-                child_parts.append(f"{short_label}: {val_str}")
+                annot_bits: List[str] = []
+                if o_interp:
+                    annot_bits.append(o_interp)
+                if o_range:
+                    annot_bits.append(f"ref: {o_range}")
+                annot_str = f" ({'; '.join(annot_bits)})" if annot_bits else ""
+                child_parts.append(f"{short_label}: {val_str}{annot_str}")
             if child_obs.get("component"):
-                comp_pts, comp_sens = _extract_obs_components(
-                    child_obs, oid, o_date, o_primary_cat, o_cats
+                comp_pts, comp_sens, comp_src = _extract_obs_components(
+                    child_obs, oid, o_date or "", o_primary_cat, o_cats
                 )
                 numeric_points.extend(comp_pts)
                 child_sensitivities.extend(comp_sens)
-            elif num_val is not None and o_date:
+                if comp_src:
+                    child_sens_sources.append(comp_src)
+            elif num_val is not None:
                 numeric_points.append(
                     NumericPoint(
                         resource_uuid=oid,
-                        date=o_date,
+                        date=o_date or "",
                         code=o_code or short_label,
                         concept=short_label,
                         value=num_val,
                         unit=unit,
                         category=o_primary_cat,
+                        interpretation=o_interp,
+                        reference_range=o_range,
+                        is_abnormal=o_abn,
                     )
                 )
 
-        panel_sens = (
-            (
-                "SDOH/PRIVACY-SENSITIVE"
-                if "SDOH/PRIVACY-SENSITIVE" in child_sensitivities
-                else classify_sensitivity(code, disp)
-            )
-            if enable_privacy_classification
-            else None
-        )
-        sens_suffix = " [sensitivity: SDOH/PRIVACY-SENSITIVE]" if panel_sens == "SDOH/PRIVACY-SENSITIVE" else ""
+        dr_sens, dr_sens_src = _classify_res_sensitivity(res, code, disp)
+        if enable_privacy_classification:
+            if "SDOH/PRIVACY-SENSITIVE" in child_sensitivities or dr_sens == "SDOH/PRIVACY-SENSITIVE":
+                panel_sens: Optional[str] = "SDOH/PRIVACY-SENSITIVE"
+                panel_sens_src: Optional[str] = (
+                    dr_sens_src
+                    if dr_sens == "SDOH/PRIVACY-SENSITIVE" and dr_sens_src
+                    else (child_sens_sources[0] if child_sens_sources else "kb_coded_privacy")
+                )
+            else:
+                panel_sens = dr_sens
+                panel_sens_src = dr_sens_src
+        else:
+            panel_sens = None
+            panel_sens_src = None
         joined_children = "; ".join(child_parts) if child_parts else "completed"
         panel_prefix = "Survey Panel" if is_survey else "Diagnostic Panel"
         panel_kb = resolve_lab_code(code, disp) if not is_survey else {}
+        panel_meta: Dict[str, Any] = {}
+        if panel_kb:
+            panel_meta["kb_resolution"] = panel_kb
+        if panel_sens_src:
+            panel_meta["sensitivity_source"] = panel_sens_src
         items.append(
             ClinicalItem(
                 resource_type="DiagnosticReport",
                 resource_uuid=rid,
                 date=p_date,
                 clinical_date=p_date,
-                date_kind="clinical_event",
+                date_kind="clinical_event" if p_date else "unknown",
                 section="survey_panel" if is_survey else "lab_panel",
                 code=code or disp,
                 display=disp or code or "Diagnostic Report",
-                text=f"{panel_prefix} — {disp or code}: {joined_children}{sens_suffix}",
+                text=f"{panel_prefix} — {disp or code}: {joined_children}",
                 mandatory=False,
                 status=str(res.get("status") or "final").lower(),
                 source_org=resolve_source_org(res),
                 sensitivity=panel_sens,
                 is_routine=is_survey,
                 member_uuids=tuple(dict.fromkeys(member_uuids)),
-                metadata={"kb_resolution": panel_kb} if panel_kb else {},
+                metadata=panel_meta,
             )
         )
 
@@ -1253,35 +1365,41 @@ def extract_bundle(
             continue
         code, disp = _coding_pair(res.get("code"))
         raw_obs_dt = res.get("effectiveDateTime") or res.get("issued")
-        o_date = _iso_date(raw_obs_dt) or reference_date
+        o_date = _iso_date(raw_obs_dt)
         o_ts = (_iso_timestamp(raw_obs_dt) if preserve_intraday_timestamps else None) or o_date
         cats = _categories(res)
         val_str, num_val, unit = _format_obs_value(res)
-        sens = (
-            classify_sensitivity(code, f"{disp} {val_str}", cats)
-            if enable_privacy_classification
-            else None
-        )
+        obs_interp, obs_range, obs_abn = _extract_obs_interpretation_and_range(res, num_val)
+        sens, sens_src = _classify_res_sensitivity(res, code, f"{disp} {val_str}", cats)
 
         primary_cat = cats[0] if cats else "observation"
         has_components = bool(res.get("component"))
         if has_components:
-            comp_pts, comp_sens = _extract_obs_components(res, rid, o_ts or o_date, primary_cat, cats)
+            comp_pts, comp_sens, comp_src = _extract_obs_components(
+                res, rid, o_ts or o_date or "", primary_cat, cats
+            )
             numeric_points.extend(comp_pts)
+            if any(pt.is_abnormal for pt in comp_pts):
+                obs_abn = True
             if "SDOH/PRIVACY-SENSITIVE" in comp_sens:
                 sens = "SDOH/PRIVACY-SENSITIVE"
+                sens_src = comp_src or sens_src
             elif not sens and comp_sens:
                 sens = comp_sens[0]
-        elif num_val is not None and o_date:
+                sens_src = comp_src or sens_src
+        elif num_val is not None:
             numeric_points.append(
                 NumericPoint(
                     resource_uuid=rid,
-                    date=o_ts or o_date,
+                    date=o_ts or o_date or "",
                     code=code or disp,
                     concept=disp or code or "Observation",
                     value=num_val,
                     unit=unit,
                     category=primary_cat,
+                    interpretation=obs_interp,
+                    reference_range=obs_range,
+                    is_abnormal=obs_abn,
                 )
             )
 
@@ -1301,34 +1419,44 @@ def extract_bundle(
             sec = "observation"
             cls_label = "Finding"
 
-        sens_suffix = " [sensitivity: SDOH/PRIVACY-SENSITIVE]" if sens == "SDOH/PRIVACY-SENSITIVE" else ""
         ts_suffix = f" (timestamp: {o_ts})" if (preserve_intraday_timestamps and o_ts and "T" in o_ts) else ""
-        body_val = f": {val_str}" if val_str else ""
+        annot_bits_o: List[str] = []
+        if obs_interp:
+            annot_bits_o.append(f"interp: {obs_interp}")
+        if obs_range:
+            annot_bits_o.append(f"ref: {obs_range}")
+        annot_str_o = f" [{'; '.join(annot_bits_o)}]" if annot_bits_o else ""
+        body_val = f": {val_str}{annot_str_o}" if val_str else ""
         obs_kb = resolve_lab_code(code, disp) if sec in {"vital_sign", "lab_observation"} else {}
+        obs_meta: Dict[str, Any] = {
+            "value": val_str,
+            "numeric": num_val,
+            "unit": unit,
+            "category": primary_cat,
+            "timestamp": o_ts,
+            "is_abnormal": obs_abn,
+            **({"interpretation": obs_interp} if obs_interp else {}),
+            **({"reference_range": obs_range} if obs_range else {}),
+            **({"kb_resolution": obs_kb} if obs_kb else {}),
+            **({"sensitivity_source": sens_src} if sens_src else {}),
+        }
         items.append(
             ClinicalItem(
                 resource_type="Observation",
                 resource_uuid=rid,
                 date=o_date,
                 clinical_date=o_date,
-                date_kind="clinical_event",
+                date_kind="clinical_event" if o_date else "unknown",
                 section=sec,
                 code=code or disp,
                 display=disp or code or "Observation",
-                text=f"{cls_label} — {disp or code}{body_val}{ts_suffix}{sens_suffix}",
+                text=f"{cls_label} — {disp or code}{body_val}{ts_suffix}",
                 mandatory=False,
                 status=str(res.get("status") or "final").lower(),
                 source_org=resolve_source_org(res),
                 sensitivity=sens,
                 is_routine=(sec in {"survey_observation", "vital_sign"}),
-                metadata={
-                    "value": val_str,
-                    "numeric": num_val,
-                    "unit": unit,
-                    "category": primary_cat,
-                    "timestamp": o_ts,
-                    **({"kb_resolution": obs_kb} if obs_kb else {}),
-                },
+                metadata=obs_meta,
             )
         )
 
@@ -1342,9 +1470,10 @@ def extract_bundle(
             res.get("performedDateTime")
             or (res.get("performedPeriod") or {}).get("start")
             or (res.get("performedPeriod") or {}).get("end")
-        ) or reference_date
+        )
         status = str(res.get("status") or "completed").lower()
         is_routine = bool(_ROUTINE_SCREENING_PROCEDURE_PATTERNS.search(disp or ""))
+        proc_sens, proc_sens_src = _classify_res_sensitivity(res, code, disp)
         reasons: List[str] = []
         for rc in res.get("reasonCode") or []:
             _, r_disp = _coding_pair(rc)
@@ -1363,7 +1492,7 @@ def extract_bundle(
                 resource_uuid=rid,
                 date=p_date,
                 clinical_date=p_date,
-                date_kind="clinical_event",
+                date_kind="clinical_event" if p_date else "unknown",
                 section="procedure_routine" if is_routine else "procedure_major",
                 code=code or disp,
                 display=disp or code or "Procedure",
@@ -1371,11 +1500,13 @@ def extract_bundle(
                 mandatory=False,
                 status=status,
                 source_org=resolve_source_org(res),
+                sensitivity=proc_sens,
                 is_routine=is_routine,
+                metadata={"sensitivity_source": proc_sens_src} if proc_sens_src else {},
             )
         )
 
-    # 10. Extract CarePlan, ImagingStudy, Patient-Carried Device, and Encounter
+    # 10. Extract CarePlan, Goal, ImagingStudy, Patient-Carried Device, and Encounter
     for res in resources:
         rtype = str(res.get("resourceType") or "")
         rid = str(res.get("id") or "")
@@ -1383,7 +1514,7 @@ def extract_bundle(
             status = str(res.get("status") or "active").lower()
             cp_date = _iso_date(
                 (res.get("period") or {}).get("start") or res.get("created")
-            ) or reference_date
+            )
             end_date = _iso_date((res.get("period") or {}).get("end"))
             cats: List[str] = []
             for c_item in res.get("category") or []:
@@ -1398,13 +1529,14 @@ def extract_bundle(
                     acts.append(a_disp)
             label = ", ".join(cats) or "Care Plan"
             act_str = f" — activities: {', '.join(acts[:4])}" if acts else ""
+            cp_sens, cp_sens_src = _classify_res_sensitivity(res, "", label)
             items.append(
                 ClinicalItem(
                     resource_type="CarePlan",
                     resource_uuid=rid,
                     date=cp_date,
                     clinical_date=cp_date,
-                    date_kind="clinical_event",
+                    date_kind="clinical_event" if cp_date else "unknown",
                     section="careplan_active" if status == "active" else "careplan_historical",
                     code=label,
                     display=label,
@@ -1413,11 +1545,13 @@ def extract_bundle(
                     status=status,
                     end_date=end_date,
                     source_org=resolve_source_org(res),
+                    sensitivity=cp_sens,
+                    metadata={"sensitivity_source": cp_sens_src} if cp_sens_src else {},
                 )
             )
         elif rtype == "Goal":
             lifecycle = str(res.get("lifecycleStatus") or "active").lower()
-            g_date = _iso_date(res.get("startDate") or res.get("statusDate")) or reference_date
+            g_date = _iso_date(res.get("startDate") or res.get("statusDate"))
             due_dates: List[str] = []
             for tgt in res.get("target") or []:
                 if isinstance(tgt, Mapping):
@@ -1440,13 +1574,14 @@ def extract_bundle(
             is_active_goal = lifecycle in {"active", "accepted", "planned", "proposed", "on-hold"}
             src_org = resolve_source_org(res)
             src_suffix = f" [source: {src_org}]" if src_org else ""
+            g_sens, g_sens_src = _classify_res_sensitivity(res, g_code, g_label)
             items.append(
                 ClinicalItem(
                     resource_type="Goal",
                     resource_uuid=rid,
                     date=g_date,
                     clinical_date=g_date,
-                    date_kind="clinical_event",
+                    date_kind="clinical_event" if g_date else "unknown",
                     section="careplan_active" if is_active_goal else "careplan_historical",
                     code=g_code or g_label,
                     display=g_label,
@@ -1455,10 +1590,12 @@ def extract_bundle(
                     status=lifecycle,
                     end_date=due_dates[0] if due_dates else None,
                     source_org=src_org,
+                    sensitivity=g_sens,
+                    metadata={"sensitivity_source": g_sens_src} if g_sens_src else {},
                 )
             )
         elif rtype == "ImagingStudy":
-            im_date = _iso_date(res.get("started")) or reference_date
+            im_date = _iso_date(res.get("started"))
             _, proc_disp = _coding_pair((res.get("procedureCode") or [{}])[0] if res.get("procedureCode") else {})
             series_list = res.get("series") or []
             body_sites: List[str] = []
@@ -1473,13 +1610,14 @@ def extract_bundle(
                         modalities.append(str(mod.get("display")))
             desc = proc_disp or ", ".join(dict.fromkeys(modalities)) or "Imaging Study"
             site_str = f" ({', '.join(dict.fromkeys(body_sites))})" if body_sites else ""
+            im_sens, im_sens_src = _classify_res_sensitivity(res, "", desc)
             items.append(
                 ClinicalItem(
                     resource_type="ImagingStudy",
                     resource_uuid=rid,
                     date=im_date,
                     clinical_date=im_date,
-                    date_kind="clinical_event",
+                    date_kind="clinical_event" if im_date else "unknown",
                     section="imaging",
                     code=desc,
                     display=desc,
@@ -1487,6 +1625,8 @@ def extract_bundle(
                     mandatory=False,
                     status=str(res.get("status") or "available").lower(),
                     source_org=resolve_source_org(res),
+                    sensitivity=im_sens,
+                    metadata={"sensitivity_source": im_sens_src} if im_sens_src else {},
                 )
             )
         elif rtype == "Device":
@@ -1505,15 +1645,19 @@ def extract_bundle(
                 excluded_counts["Device(clinic_equipment_retained)"] = (
                     excluded_counts.get("Device(clinic_equipment_retained)", 0) + 1
                 )
-            d_date = _iso_date(res.get("manufactureDate")) or reference_date
+            d_date = _iso_date(res.get("manufactureDate"))
             status = str(res.get("status") or "active").lower()
+            dev_sens, dev_sens_src = _classify_res_sensitivity(res, code, disp)
+            dev_meta: Dict[str, Any] = {"is_room_equipment": is_room_equip}
+            if dev_sens_src:
+                dev_meta["sensitivity_source"] = dev_sens_src
             items.append(
                 ClinicalItem(
                     resource_type="Device",
                     resource_uuid=rid,
                     date=d_date,
-                    clinical_date=d_date,
-                    date_kind="clinical_event",
+                    clinical_date=None,
+                    date_kind="administrative" if d_date else "unknown",
                     section="device",
                     code=code or disp,
                     display=disp or code or "Medical Device",
@@ -1521,14 +1665,16 @@ def extract_bundle(
                     mandatory=(status == "active" and not is_room_equip),
                     status=status,
                     source_org=resolve_source_org(res),
+                    sensitivity=dev_sens,
                     is_routine=is_room_equip,
-                    metadata={"is_room_equipment": is_room_equip},
+                    metadata=dev_meta,
                 )
             )
         elif rtype == "Encounter":
             enc_period = res.get("period") or {}
-            e_start = _iso_date(enc_period.get("start")) or reference_date
+            e_start = _iso_date(enc_period.get("start"))
             e_end = _iso_date(enc_period.get("end"))
+            enc_date = e_end or e_start
             enc_class = str((res.get("class") or {}).get("code") or "AMB").upper()
             types = res.get("type") or []
             _, t_disp = _coding_pair(types[0] if types else {})
@@ -1544,6 +1690,7 @@ def extract_bundle(
                     if r_disp:
                         reasons.append(r_disp)
             org = resolve_source_org(res)
+            enc_sens, enc_sens_src = _classify_res_sensitivity(res, enc_class, t_disp or "")
             is_high_acuity = enc_class in {"IMP", "INPATIENT", "EMER", "EMERGENCY"} or any(
                 w in (t_disp or "").lower() for w in ("inpatient", "emergency", "admission", "intensive")
             )
@@ -1554,13 +1701,16 @@ def extract_bundle(
                 quals.append(f"reason: {', '.join(dict.fromkeys(reasons))}")
             if org:
                 quals.append(f"facility: {org}")
+            enc_meta: Dict[str, Any] = {"start": e_start, "end": e_end, "class": enc_class}
+            if enc_sens_src:
+                enc_meta["sensitivity_source"] = enc_sens_src
             items.append(
                 ClinicalItem(
                     resource_type="Encounter",
                     resource_uuid=rid,
-                    date=e_end or e_start,
-                    clinical_date=e_end or e_start,
-                    date_kind="clinical_event",
+                    date=enc_date,
+                    clinical_date=enc_date,
+                    date_kind="clinical_event" if enc_date else "unknown",
                     section="encounter_acuity" if is_high_acuity else "encounter_routine",
                     code=enc_class,
                     display=t_disp or enc_class,
@@ -1569,8 +1719,9 @@ def extract_bundle(
                     status=str(res.get("status") or "finished").lower(),
                     end_date=e_end,
                     source_org=org,
+                    sensitivity=enc_sens,
                     is_routine=not is_high_acuity,
-                    metadata={"start": e_start, "end": e_end, "class": enc_class},
+                    metadata=enc_meta,
                 )
             )
 
@@ -1585,7 +1736,3 @@ def extract_bundle(
         deduplicated_note_count=dedup_note_count,
         total_bundle_entries=len(resources),
     )
-
-
-
-from .fhir_browser import build_fhir_browser_index  # noqa: E402,F401

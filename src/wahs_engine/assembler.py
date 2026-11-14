@@ -21,7 +21,6 @@ import httpx
 from wahs_core import (
     CondensedChartResult,
     ExtractedChart,
-    build_wahs_hub_enrichment_block,
     condense_bundle_to_budget,
     extract_bundle,
 )
@@ -123,6 +122,9 @@ def _parse_fhir_instant(ts: str) -> Tuple[int, float, str]:
         return (0, 0.0, raw)
 
 
+ENRICHMENT_STRUCTURAL_RESERVE_TOKENS: int = 1536
+
+
 def derive_effective_chart_budget(
     spec: ModelSpec,
     options: WahsRequestOptions,
@@ -133,7 +135,10 @@ def derive_effective_chart_budget(
     counter = get_exact_token_counter(spec.tokenizer_family)
     base_framing = counter(system_prompt_header) + 96
     if (options.enable_kb and options.retrieval_strategy != "chart_only") or options.retrieval_strategy == "note_rag":
-        base_framing += 800
+        base_framing += min(
+            ENRICHMENT_STRUCTURAL_RESERVE_TOKENS,
+            max(256, int(spec.context_window * 0.125)),
+        )
     if options.enable_overflow_tools or options.retrieval_strategy == "dynamic_fhir_tools":
         base_framing += 420
 
@@ -156,22 +161,26 @@ def derive_effective_chart_budget(
         clamp_reason = "chart_budget_ceiling"
 
     budget = ceiling_cap
-    if options.retrieval_strategy == "dynamic_fhir_tools" and budget > 2048:
+    if (
+        options.retrieval_strategy == "dynamic_fhir_tools"
+        and options.target_budget_tokens is None
+        and budget > 2048
+    ):
         budget = 2048
-        clamp_reason = "dynamic_fhir_tools_header"
-
-    if options.target_budget_tokens is not None:
+        clamp_reason = "dynamic_fhir_tools_default_budget"
+    elif options.target_budget_tokens is not None:
         req_b = int(options.target_budget_tokens)
-        if req_b <= budget:
+        if req_b <= ceiling_cap:
             budget = req_b
             clamp_reason = "caller_target_budget_tokens"
+        elif (
+            spec.chart_budget_ceiling is not None
+            and ceiling_cap == spec.chart_budget_ceiling
+            and ceiling_cap < window_derived
+        ):
+            clamp_reason = "clamped_to_chart_budget_ceiling"
         else:
-            if options.retrieval_strategy == "dynamic_fhir_tools" and budget == 2048:
-                clamp_reason = "dynamic_fhir_tools_header"
-            elif spec.chart_budget_ceiling is not None and ceiling_cap == spec.chart_budget_ceiling and ceiling_cap < window_derived:
-                clamp_reason = "clamped_to_chart_budget_ceiling"
-            else:
-                clamp_reason = "clamped_to_context_window"
+            clamp_reason = "clamped_to_context_window"
 
     return budget, clamp_reason
 

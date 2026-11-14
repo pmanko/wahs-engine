@@ -255,13 +255,13 @@ def extract_chart_kb_codes(
         sens = getattr(it, "sensitivity", None) or classify_sensitivity(code, disp)
         if sharing_posture == "external_share" and sens == "SDOH/PRIVACY-SENSITIVE":
             continue
-        if getattr(it, "conflict_note", None) or sens == "SDOH/PRIVACY-SENSITIVE":
+        sec = getattr(it, "section", "")
+        if sens == "SDOH/PRIVACY-SENSITIVE" or sec in {"allergy", "condition_active", "med_active"}:
             priority_codes.append(code)
-        elif getattr(it, "section", "") in {
-            "condition_active",
-            "med_active",
+        elif sec in {
             "immunization",
             "lab_panel",
+            "lab_observation",
             "procedure_major",
         }:
             secondary_codes.append(code)
@@ -278,7 +278,10 @@ def extract_chart_kb_codes(
             == "SDOH/PRIVACY-SENSITIVE"
         ):
             continue
-        secondary_codes.append(np_code)
+        if getattr(np, "is_abnormal", False):
+            priority_codes.append(np_code)
+        else:
+            secondary_codes.append(np_code)
 
     return list(dict.fromkeys(priority_codes + secondary_codes))
 

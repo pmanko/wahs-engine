@@ -18,8 +18,8 @@ from wahs_core import (
     estimate_tokens_local,
     extract_bundle,
 )
-from wahs_core.wahs_patient_workspace import build_patient_skills_and_condensation_matrix
 from wahs_engine.assembler import (
+    ENRICHMENT_STRUCTURAL_RESERVE_TOKENS,
     AssembledWahsContext,
     WAHSBundleAssembler,
     _BoundedLRUCache,
@@ -308,10 +308,21 @@ def test_pure_stdlib_condenser_512_safety_core_and_monotonicity() -> None:
                 }
             }
         )
+    # Layer 2 condensed chart must remain purely structural (no pre-baked conflict/sensitivity tags),
+    # while Layer 3 enrichment surfaces the CKD stage conflict edge explicitly.
     res_compact = condense_bundle_to_budget(tight_bundle, target_tokens=620, token_counter=None)
     cond_lines = [ln for ln in res_compact.chart_text.splitlines() if "Condition (" in ln]
     assert cond_lines
-    assert cond_lines[0].count("[stage_conflict:") == 1
+    assert "[stage_conflict:" not in cond_lines[0]
+    assert "[sensitivity:" not in cond_lines[0]
+    extracted_tight = extract_bundle(tight_bundle)
+    enr_tight = build_wahs_hub_enrichment_block(
+        "What stage of kidney disease do I have?",
+        extracted=extracted_tight,
+        condensed=res_compact,
+    )
+    assert "CONFLICTS_WITH" in enr_tight.enrichment_text
+    assert "stage" in enr_tight.enrichment_text.lower()
 
     # Argument validation guards
     for bad_budget in (0, -100, True):
@@ -446,17 +457,11 @@ def test_workspace_canonical_zero_omitted_budget_waits_for_full_notes() -> None:
         )
     bundle = {"resourceType": "Bundle", "type": "collection", "entry": entries}
 
-    ws = build_patient_skills_and_condensation_matrix(bundle)
-    hier = ws["condensation_matrix"]["hierarchical"]
-    assert hier["2048"]["omitted_records_count"] == 0
-    assert hier["2048"]["tier"] == 2
-    assert "alias_of_budget" not in hier["2048"]
-
-    # 8192 has full un-excerpted notes (tier 1), so 16384+ becomes alias_of_budget == "4096" or "8192"
-    first_alias_target = hier["32768"].get("alias_of_budget")
-    assert first_alias_target in {"4096", "8192"}
-    assert hier[first_alias_target]["tier"] == 1
-    assert hier[first_alias_target]["omitted_records_count"] == 0
+    for b_toks in (2048, 8192, 32768):
+        res_hier = condense_bundle_to_budget(bundle, target_tokens=b_toks)
+        assert res_hier.completeness_manifest["omitted_clinical_items_count"] == 0
+        assert res_hier.tier in {1, 2}
+        assert res_hier.actual_tokens <= b_toks
 
 
 def test_hub_enrichment_binary_search_respects_exact_bpe_counters() -> None:
@@ -583,13 +588,13 @@ def test_derive_effective_chart_budget_all_branches() -> None:
     b6, r6 = derive_effective_chart_budget(
         spec_capped, WahsRequestOptions(retrieval_strategy="dynamic_fhir_tools")
     )
-    assert (b6, r6) == (2048, "dynamic_fhir_tools_header")
+    assert (b6, r6) == (2048, "dynamic_fhir_tools_default_budget")
 
     b7, r7 = derive_effective_chart_budget(
         spec_capped,
         WahsRequestOptions(retrieval_strategy="dynamic_fhir_tools", target_budget_tokens=8000),
     )
-    assert (b7, r7) == (2048, "dynamic_fhir_tools_header")
+    assert (b7, r7) == (8000, "caller_target_budget_tokens")
 
     b8, r8 = derive_effective_chart_budget(
         spec_capped,
@@ -597,13 +602,13 @@ def test_derive_effective_chart_budget_all_branches() -> None:
     )
     assert (b8, r8) == (1024, "caller_target_budget_tokens")
 
-    # KB (+800) + overflow tools (+420) deductions reduce uncapped window budget cleanly
+    # KB (+ENRICHMENT_STRUCTURAL_RESERVE_TOKENS) + overflow tools (+420) deductions reduce uncapped window budget cleanly
     b_chart_only, _ = derive_effective_chart_budget(
         spec_uncapped, WahsRequestOptions(retrieval_strategy="chart_only", enable_overflow_tools=False)
     )
     b_kb, _ = derive_effective_chart_budget(spec_uncapped, WahsRequestOptions(enable_kb=True, enable_overflow_tools=False))
     b_kb_tools, _ = derive_effective_chart_budget(spec_uncapped, WahsRequestOptions(enable_kb=True, enable_overflow_tools=True))
-    assert b_chart_only - b_kb == 800
+    assert b_chart_only - b_kb == ENRICHMENT_STRUCTURAL_RESERVE_TOKENS
     assert b_kb - b_kb_tools == 420
 
     tiny_bad = ModelSpec(

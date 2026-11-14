@@ -65,7 +65,7 @@ class OpenAIChatCompletionRequest(BaseModel):
     messages: List[ChatMessage] = Field(..., min_length=1)
     stream: bool = False
     temperature: float = Field(default=0.1, ge=0.0, le=2.0)
-    max_tokens: Optional[int] = Field(default=1024, ge=1, le=16384)
+    max_tokens: Optional[int] = Field(default=None, ge=1, le=16384)
     top_p: Optional[float] = None
     seed: Optional[int] = None
     stop: Optional[Any] = None
