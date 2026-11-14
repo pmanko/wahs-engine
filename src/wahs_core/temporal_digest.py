@@ -117,6 +117,8 @@ def _clinical_item_date(item: ClinicalItem) -> Optional[str]:
 def _any_non_patient_date(item: ClinicalItem) -> Optional[str]:
     if item.section in {"patient", "manifest"}:
         return None
+    if item.resource_type in {"Goal", "CarePlan"}:
+        return _iso10(item.clinical_date or item.date)
     return _iso10(item.clinical_date or item.date or item.end_date)
 
 
@@ -415,6 +417,7 @@ def build_temporal_digest(
     # 1. Resolve reference date anchor strictly from completed clinical events (never admin/future).
     completed_clinical_dates: List[Tuple[str, ClinicalItem]] = []
     fallback_clinical_dates: List[str] = []
+    active_careplans_dated: List[Tuple[str, ClinicalItem]] = []
     upcoming_items: List[Tuple[str, ClinicalItem]] = []
     encounters_completed: List[Tuple[str, ClinicalItem]] = []
 
@@ -426,9 +429,23 @@ def build_temporal_digest(
             continue
         c_dt = _clinical_item_date(it)
         any_dt = _any_non_patient_date(it)
+        is_visit_item = (
+            it.section in {"encounter_acuity", "encounter_routine"}
+            or it.resource_type in {"Encounter", "Appointment"}
+        )
 
         if st in _FUTURE_APPT_STATUSES:
-            upcoming_items.append((any_dt or "date TBD", it))
+            if is_visit_item:
+                upcoming_items.append((any_dt or "date TBD", it))
+                continue
+            if it.resource_type == "Goal":
+                continue
+
+        if it.resource_type == "Goal" and st in {"planned", "proposed"}:
+            continue
+
+        if it.resource_type == "CarePlan" and st == "active" and c_dt is not None:
+            active_careplans_dated.append((c_dt, it))
             continue
 
         if c_dt is not None:
@@ -440,11 +457,18 @@ def build_temporal_digest(
             fallback_clinical_dates.append(any_dt)
 
     if completed_clinical_dates:
-        reference_date = max(dt for dt, _ in completed_clinical_dates)
+        realized_anchor: Optional[str] = max(dt for dt, _ in completed_clinical_dates)
     elif fallback_clinical_dates:
-        reference_date = max(fallback_clinical_dates)
+        realized_anchor = max(fallback_clinical_dates)
     else:
-        reference_date = _iso10(extracted.reference_date)
+        realized_anchor = None
+
+    if realized_anchor is not None:
+        reference_date = realized_anchor
+    elif active_careplans_dated:
+        reference_date = max(dt for dt, _ in active_careplans_dated)
+    else:
+        reference_date = None if is_external else _iso10(extracted.reference_date)
 
     # Reclassify any Encounter or active CarePlan dated strictly after reference_date as upcoming.
     filtered_completed_encounters: List[Tuple[str, ClinicalItem]] = []
@@ -457,6 +481,15 @@ def build_temporal_digest(
                     seen_upcoming_uuids.add(it.resource_uuid)
         else:
             filtered_completed_encounters.append((dt, it))
+
+    for cp_dt, cp_it in active_careplans_dated:
+        if realized_anchor is not None and cp_dt > realized_anchor:
+            if not cp_it.resource_uuid or cp_it.resource_uuid not in seen_upcoming_uuids:
+                upcoming_items.append((cp_dt, cp_it))
+                if cp_it.resource_uuid:
+                    seen_upcoming_uuids.add(cp_it.resource_uuid)
+        else:
+            completed_clinical_dates.append((cp_dt, cp_it))
 
     ref_obj = _parse_iso_date(reference_date)
     past_6m_start = _shift_months(ref_obj, -6).isoformat() if ref_obj else None
@@ -596,7 +629,10 @@ def build_temporal_digest(
         up_parts = []
         for up_dt, up_it in up_sorted[:4]:
             up_cite = _cite_for_uuid(uuid_to_cit, up_it.resource_uuid, up_it.member_uuids)
-            up_parts.append(f"{(up_it.display or up_it.resource_type).strip()} ({up_dt}, status: {up_it.status}){up_cite}")
+            up_label = (up_it.display or up_it.resource_type).strip()
+            if up_it.resource_type == "CarePlan" and not up_label.lower().startswith("careplan"):
+                up_label = f"CarePlan: {up_label}"
+            up_parts.append(f"{up_label} ({up_dt}, status: {up_it.status}){up_cite}")
         header_lines.append(f"- Upcoming/Scheduled Visits ({len(upcoming_items)}): " + "; ".join(up_parts))
     else:
         header_lines.append("- Upcoming/Scheduled Visits: none documented in chart.")

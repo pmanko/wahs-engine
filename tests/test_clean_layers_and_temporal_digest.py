@@ -846,3 +846,121 @@ def test_we8_same_day_trend_guard_timezone_ordering_encounter_status_and_admin_r
     assert dig_adm.reference_date is None
     assert "Reference Date Anchor: undetermined" in dig_adm.digest_text
 
+
+
+def test_external_share_sensitive_only_chart_does_not_leak_reference_date() -> None:
+    from wahs_core import build_temporal_digest, condense_bundle_to_budget, extract_bundle
+
+    bundle = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "p-ext-1", "birthDate": "1980-01-01"}},
+            {
+                "resource": {
+                    "resourceType": "Observation",
+                    "id": "obs-sdv-1",
+                    "meta": {
+                        "security": [
+                            {"system": "http://terminology.hl7.org/CodeSystem/v3-ActCode", "code": "SDV"}
+                        ]
+                    },
+                    "status": "final",
+                    "effectiveDateTime": "2026-09-10",
+                    "code": {
+                        "coding": [
+                            {
+                                "system": "http://loinc.org",
+                                "code": "68518-0",
+                                "display": "Intimate partner abuse screening",
+                            }
+                        ],
+                        "text": "Intimate partner violence screening",
+                    },
+                    "valueString": "Positive",
+                }
+            },
+        ],
+    }
+    ext = extract_bundle(bundle)
+    condensed = condense_bundle_to_budget(ext, target_tokens=8192, sharing_posture="external_share")
+    digest = build_temporal_digest(ext, condensed=condensed, sharing_posture="external_share")
+    assert digest.reference_date is None
+    assert "2026-09-10" not in digest.digest_text
+    assert "undetermined" in digest.digest_text.lower()
+
+
+def test_planned_goal_with_future_due_date_not_in_upcoming_visits() -> None:
+    from wahs_core import build_temporal_digest, condense_bundle_to_budget, extract_bundle
+
+    bundle = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "p-goal-1", "birthDate": "1972-04-04"}},
+            {
+                "resource": {
+                    "resourceType": "Encounter",
+                    "id": "enc-2025",
+                    "status": "finished",
+                    "period": {"start": "2025-11-01"},
+                    "type": [{"text": "Primary Care Visit"}],
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Goal",
+                    "id": "goal-future-1",
+                    "lifecycleStatus": "planned",
+                    "description": {"text": "Reduce HbA1c below 7.0%"},
+                    "target": [{"dueDate": "2027-03-01"}],
+                }
+            },
+        ],
+    }
+    ext = extract_bundle(bundle)
+    condensed = condense_bundle_to_budget(ext, target_tokens=8192)
+    digest = build_temporal_digest(ext, condensed=condensed)
+    assert digest.reference_date == "2025-11-01"
+    assert "- Upcoming/Scheduled Visits: none documented in chart." in digest.digest_text
+    assert "goal-future-1" not in digest.digest_text
+    assert "Reduce HbA1c" not in digest.digest_text
+
+
+def test_active_future_careplan_reclassified_to_upcoming_without_inflating_anchor() -> None:
+    from wahs_core import build_temporal_digest, condense_bundle_to_budget, extract_bundle
+
+    bundle = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "p-cp-1", "birthDate": "1968-02-02"}},
+            {
+                "resource": {
+                    "resourceType": "Encounter",
+                    "id": "enc-2025-cp",
+                    "status": "finished",
+                    "period": {"start": "2025-11-01"},
+                    "type": [{"text": "Outpatient Clinic Visit"}],
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "CarePlan",
+                    "id": "cp-2026-1",
+                    "status": "active",
+                    "category": [{"text": "Oncology Survivorship Plan"}],
+                    "title": "Oncology Survivorship Plan",
+                    "period": {"start": "2026-06-15", "end": "2027-06-15"},
+                }
+            },
+        ],
+    }
+    ext = extract_bundle(bundle)
+    condensed = condense_bundle_to_budget(ext, target_tokens=8192)
+    digest = build_temporal_digest(ext, condensed=condensed)
+    assert digest.reference_date == "2025-11-01"
+    upcoming_lines = [line for line in digest.digest_text.splitlines() if line.startswith("- Upcoming/Scheduled Visits (1):")]
+    assert len(upcoming_lines) == 1
+    assert "CarePlan: Oncology Survivorship Plan" in upcoming_lines[0]
+    assert "2026-06-15" in upcoming_lines[0]
