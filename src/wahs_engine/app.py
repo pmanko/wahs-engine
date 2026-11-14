@@ -11,6 +11,8 @@ from fastapi.responses import StreamingResponse
 import httpx
 import uvicorn
 
+from wahs_core import build_temporal_digest
+
 from .assembler import WAHSBundleAssembler
 from .config import WahsEngineSettings
 from .jwt_claims import VerifiedCallerIdentity, decode_and_bind_jwt, extract_bearer_token
@@ -102,6 +104,29 @@ def create_app(
             requested_model=requested_model,
             force_refresh=force_refresh,
         )
+        last_q = next(
+            (
+                str(m.content or "").strip()
+                for m in reversed(req.messages)
+                if (m.role or "").lower() == "user" and str(m.content or "").strip()
+            ),
+            "",
+        )
+        effective_temporal_digest = (
+            bool(options.enable_temporal_digest) and options.retrieval_strategy != "chart_only"
+        )
+        temporal_summary: Dict[str, Any]
+        if effective_temporal_digest:
+            temporal_summary = dict(
+                build_temporal_digest(
+                    ctx.extracted,
+                    ctx.condensed,
+                    question=last_q,
+                    sharing_posture=options.sharing_posture,
+                ).summary
+            )
+        else:
+            temporal_summary = {"enabled": False}
         return {
             "patient_id": ctx.patient_id,
             "patient_name": ctx.patient_name,
@@ -109,12 +134,14 @@ def create_app(
             "prefix_cache_key_hash": ctx.prefix_cache_key_hash,
             "security_audit": ctx.security_audit,
             "chart_text": ctx.condensed.chart_text,
+            "temporal_digest": temporal_summary,
             "x_wahs": build_x_wahs_envelope(
                 ctx=ctx,
                 requested_model=requested_model,
                 upstream_model=spec.upstream_model,
                 options=options,
                 engine_version=cfg.engine_version,
+                temporal_digest_meta=temporal_summary,
             ),
         }
 

@@ -134,7 +134,10 @@ def derive_effective_chart_budget(
     """Derive exact model-window-aware chart token budget (`at-most` semantics for request overrides)."""
     counter = get_exact_token_counter(spec.tokenizer_family)
     base_framing = counter(system_prompt_header) + 96
-    if (options.enable_kb and options.retrieval_strategy != "chart_only") or options.retrieval_strategy == "note_rag":
+    if (
+        (options.enable_kb or options.enable_temporal_digest)
+        and options.retrieval_strategy != "chart_only"
+    ) or options.retrieval_strategy == "note_rag":
         base_framing += min(
             ENRICHMENT_STRUCTURAL_RESERVE_TOKENS,
             max(256, int(spec.context_window * 0.125)),

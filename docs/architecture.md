@@ -27,16 +27,17 @@
   - **Stage B**: Strictly prioritizes mandatory IPS core items, trajectories, active care plans, and newest-first full clinical notes into the exact caller tokenizer budget (`chart_only` remains 100% free of pre-baked conflict/sensitivity tags).
 - Assigns stable `[1]..[N]` citations mapped to `resourceUuid` / `memberUuids` and emits a typed `completeness_manifest` (`omitted_clinical_items_count`, `omitted_by_section`).
 
-### Layer 3: Enrichment & Overflow Retrieval (`clinical_graph.py`, `wahs_tools.py`)
+### Layer 3: Enrichment, Temporal Digest & Overflow Retrieval (`clinical_graph.py`, `temporal_digest.py`, `wahs_tools.py`)
 - Consumes typed `ExtractedChart` + `CondensedChartResult` directly (never regex-parsing rendered chart text):
+  - **Deterministic Temporal Digest (`temporal_digest.py`)**: Separates completed clinical event dates from administrative/coverage dates and planned/future encounters, establishes an explicit `reference_date` anchor ("chart now") with 6-month / 12-month lookback bounds, summarizes chronological (`oldest -> newest`) longitudinal numeric series with a strict **no-trend-from-one-point guard** (`n == 1` emits `trend not supported`), and surfaces active vs. stopped medication timelines. Controlled via `wahs.enable_temporal_digest` (default `true`; strictly excluded from `chart_only`), exposed in `x_wahs.temporal_digest` and `/v1/wahs/context/preview`.
   - **Tier-0 Overflow Recovery**: Surfaces high-relevance omitted items with sequential `[N]` mappings when `omitted_clinical_items_count > 0`.
   - **Patient Clinical Entity Graph**: Infers typed edges (`CROSS_REACTS_WITH`, `CONTRAINDICATED_OR_DOSE_ADJUST_IN`, `CONFLICTS_WITH`, `CONTRADICTED_OR_MODIFIED_BY_NOTE`, `MONITORED_BY`, `TREATS`) using Layer-0 rules.
   - **Clinical KB Lookup**: Attaches complete guideline summaries matching patient codes and the active question.
   - **On-Demand Tools (`wahs_tools.py`)**: `search_chart_entries`, `get_lab_history`, `read_clinical_note`, and BM25 `retrieve_clinical_note_passages` (`note_rag`).
 
 ## Model-Window Budgeting & Streaming (`wahs_engine/`)
-- **`assembler.py`**: Derives effective chart budgets (`derive_effective_chart_budget`) from the model's `context_window` minus dynamic reserves (`ENRICHMENT_STRUCTURAL_RESERVE_TOKENS`, tool schema reserve, output/conversation reserves). `dynamic_fhir_tools` defaults to a `2048`-token IPS header only when `target_budget_tokens` is omitted.
-- **`schemas.py` & `upstream.py`**: `max_tokens` defaults to `None` (no silent `1024` output truncation); enrichment receives remaining context-window headroom (`ctx_window - effective_max_tokens - current_toks - 128`); `stream=True` and `stream=False` share the same manifest-driven bounded overflow tool execution loop.
+- **`assembler.py`**: Derives effective chart budgets (`derive_effective_chart_budget`) from the model's `context_window` minus dynamic reserves (`ENRICHMENT_STRUCTURAL_RESERVE_TOKENS`, tool schema reserve, output/conversation reserves). `dynamic_fhir_tools` defaults to a `2048`-token IPS header only when `target_budget_tokens` is omitted. `messages[0]` remains invariant across turns so KV-prefix hashes match `/v1/wahs/context/preview`.
+- **`schemas.py` & `upstream.py`**: `max_tokens` defaults to `None` (no silent `1024` output truncation); Temporal Digest and Context Enrichment share remaining context-window headroom (`ctx_window - effective_max_tokens - minimal_turn_toks - 128`) on `messages[-1]` across `condensation_kb`, `note_rag`, and `dynamic_fhir_tools` (and remain completely disabled in `chart_only`); `stream=True` supports native SSE tool-call accumulation for overflow tools while delegating `dynamic_fhir_tools` multi-round orchestration via `complete()`.
 
 ## Privacy Gate Scope & Limitations
 - Privacy segmentation under `sharing_posture == "external_share"` prioritizes upstream FHIR `meta.security` labels, curated LOINC/SNOMED codes, and lexical fallbacks (`kb_data/clinical_exclusivity_and_privacy.json`).

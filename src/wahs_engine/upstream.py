@@ -14,6 +14,7 @@ from fastapi import HTTPException
 import httpx
 
 from wahs_core import (
+    build_temporal_digest,
     build_wahs_hub_enrichment_block,
     extract_clean_user_query,
     get_lab_history,
@@ -234,6 +235,30 @@ def _should_allow_overflow_tools(
     return allow, omitted_total, omitted_by_cat
 
 
+def _uuid_to_citation_from_map(citation_map: Mapping[str, Any]) -> Dict[str, int]:
+    """Extract UUID -> [N] mapping (including memberIds) from assembled `citation_map`."""
+    out: Dict[str, int] = {}
+    for k_str, entry in citation_map.items():
+        if not isinstance(entry, Mapping):
+            continue
+        idx_raw = entry.get("index")
+        c_idx = (
+            int(idx_raw)
+            if isinstance(idx_raw, int)
+            else (int(k_str) if str(k_str).isdigit() else 0)
+        )
+        if c_idx <= 0:
+            continue
+        eid = str(entry.get("id") or "").strip()
+        if eid:
+            out.setdefault(eid, c_idx)
+        for m_id in entry.get("memberIds") or ():
+            ms = str(m_id or "").strip()
+            if ms:
+                out.setdefault(ms, c_idx)
+    return out
+
+
 def build_x_wahs_envelope(
     *,
     ctx: AssembledWahsContext,
@@ -244,6 +269,7 @@ def build_x_wahs_envelope(
     overflow_recovered: int = 0,
     kb_meta: Optional[Dict[str, Any]] = None,
     note_rag_meta: Optional[Dict[str, Any]] = None,
+    temporal_digest_meta: Optional[Dict[str, Any]] = None,
     tool_calls_log: Optional[List[Dict[str, Any]]] = None,
     timings: Optional[Dict[str, Any]] = None,
     exact_prompt_tokens: int = 0,
@@ -302,6 +328,11 @@ def build_x_wahs_envelope(
             "kb_enrichment": kb_meta,
             "human_review_required": True,
         },
+        "temporal_digest": (
+            dict(temporal_digest_meta)
+            if temporal_digest_meta is not None
+            else {"enabled": False}
+        ),
     }
     if note_rag_meta is not None:
         env["note_rag"] = note_rag_meta
@@ -509,7 +540,15 @@ def prepare_upstream_messages(
     spec: Optional[ModelSpec] = None,
     effective_max_tokens: int = 1024,
     tools: Optional[Sequence[Mapping[str, Any]]] = None,
-) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], int, Optional[Dict[str, Any]], int, int]:
+) -> Tuple[
+    List[Dict[str, Any]],
+    Optional[Dict[str, Any]],
+    int,
+    Optional[Dict[str, Any]],
+    Dict[str, Any],
+    int,
+    int,
+]:
     tok_family = spec.tokenizer_family if spec is not None else ctx.tokenizer_family
     ctx_window = spec.context_window if spec is not None else ctx.context_window
     exact_counter = get_exact_token_counter(tok_family)
@@ -552,26 +591,39 @@ def prepare_upstream_messages(
 
     kb_meta: Optional[Dict[str, Any]] = None
     note_rag_meta: Optional[Dict[str, Any]] = None
+    temporal_meta: Dict[str, Any] = {"enabled": False}
     overflow_recovered = 0
     effective_kb = bool(options.enable_kb) and options.retrieval_strategy != "chart_only"
+    effective_temporal_digest = (
+        bool(options.enable_temporal_digest) and options.retrieval_strategy != "chart_only"
+    )
 
+    total_headroom = 0
+    if effective_kb or effective_temporal_digest:
+        minimal_turn_toks = count_chat_messages_tokens(
+            [messages[0], messages[-1]], tools=tools, tokenizer_family=tok_family
+        )
+        window_slack = max(
+            384, ctx_window - effective_max_tokens - minimal_turn_toks - 128
+        )
+        total_headroom = min(
+            window_slack, max(1280, int(ctx.condensed.target_tokens * 0.25))
+        )
+
+    kb_enrichment_text = ""
     if effective_kb:
         try:
-            minimal_turn_toks = count_chat_messages_tokens(
-                [messages[0], messages[-1]], tools=tools, tokenizer_family=tok_family
-            )
-            window_slack = max(
-                256, ctx_window - effective_max_tokens - minimal_turn_toks - 128
-            )
-            enrichment_max_tokens = min(
-                window_slack, max(1280, int(ctx.condensed.target_tokens * 0.25))
+            kb_budget = (
+                max(256, total_headroom - max(192, min(768, total_headroom // 2)))
+                if effective_temporal_digest
+                else max(256, total_headroom)
             )
             enrichment = build_wahs_hub_enrichment_block(
                 messages,
                 extracted=ctx.extracted,
                 condensed=ctx.condensed,
                 citation_map=ctx.citation_map,
-                max_tokens=enrichment_max_tokens,
+                max_tokens=kb_budget,
                 sharing_posture=options.sharing_posture,
                 token_counter=exact_counter,
                 max_overflow_recover=(
@@ -603,13 +655,11 @@ def prepare_upstream_messages(
                             ),
                         }
             if enrichment.enrichment_text:
-                messages[-1] = {
-                    "role": messages[-1]["role"],
-                    "content": f"{messages[-1]['content'].rstrip()}\n\n{enrichment.enrichment_text}",
-                }
+                kb_enrichment_text = enrichment.enrichment_text
         except Exception as exc:
             logger.warning("WAHS KB enrichment skipped: %s", exc)
 
+    rag_block = ""
     if options.retrieval_strategy == "note_rag":
         try:
             rag_res = retrieve_clinical_note_passages(
@@ -654,13 +704,31 @@ def prepare_upstream_messages(
                     "Note Precedence: Reconcile retrieved passages by date—newer Discharge Summaries, Addenda, or hold/stop instructions supersede older admission or baseline notes. Answer strictly what the user asked without listing unrelated conditions.\n"
                     + "\n".join(rag_lines)
                 )
-                messages[-1] = {
-                    "role": messages[-1]["role"],
-                    "content": f"{messages[-1]['content'].rstrip()}\n\n{rag_block}",
-                }
         except Exception as exc:
             logger.warning("WAHS Note RAG skipped: %s", exc)
 
+    temporal_digest_block = ""
+    if effective_temporal_digest:
+        try:
+            kb_toks_used = int((kb_meta or {}).get("enrichment_tokens") or 0)
+            digest_budget = max(192, total_headroom - kb_toks_used)
+            extra_cits = _uuid_to_citation_from_map(ctx.citation_map)
+            temporal_res = build_temporal_digest(
+                ctx.extracted,
+                ctx.condensed,
+                question=raw_last_user_query,
+                sharing_posture=options.sharing_posture,
+                extra_uuid_to_citation=extra_cits,
+                max_tokens=digest_budget,
+                token_counter=exact_counter,
+            )
+            temporal_meta = dict(temporal_res.summary)
+            temporal_digest_block = temporal_res.digest_text
+        except Exception as exc:
+            logger.warning("WAHS Temporal Digest skipped: %s", exc)
+            temporal_meta = {"enabled": False, "error": str(exc)}
+
+    tool_hint = ""
     if options.retrieval_strategy == "dynamic_fhir_tools":
         tool_hint = (
             "=== DYNAMIC FHIR CHART TOOLS ACTIVE ===\n"
@@ -670,9 +738,16 @@ def prepare_upstream_messages(
             "call `search_chart_entries`, `read_clinical_note`, or `get_lab_history` first, then synthesize "
             "your final patient-friendly answer citing each item's `[N]` (`citation_tag`) inline."
         )
+
+    attached_blocks = [
+        b
+        for b in (temporal_digest_block, kb_enrichment_text, rag_block, tool_hint)
+        if b
+    ]
+    if attached_blocks:
         messages[-1] = {
             "role": messages[-1]["role"],
-            "content": f"{messages[-1]['content'].rstrip()}\n\n{tool_hint}",
+            "content": f"{messages[-1]['content'].rstrip()}\n\n" + "\n\n".join(attached_blocks),
         }
 
     exact_prompt_tokens, history_trimmed_turns = _trim_history_to_fit(
@@ -687,6 +762,7 @@ def prepare_upstream_messages(
         kb_meta,
         overflow_recovered,
         note_rag_meta,
+        temporal_meta,
         exact_prompt_tokens,
         history_trimmed_turns,
     )
@@ -892,6 +968,7 @@ class SouthboundOpenAIClient:
             kb_meta,
             overflow_recovered,
             note_rag_meta,
+            temporal_digest_meta,
             exact_prompt_tokens,
             history_trimmed_turns,
         ) = prepare_upstream_messages(
@@ -1047,6 +1124,7 @@ class SouthboundOpenAIClient:
             overflow_recovered=overflow_recovered,
             kb_meta=kb_meta,
             note_rag_meta=note_rag_meta,
+            temporal_digest_meta=temporal_digest_meta,
             tool_calls_log=tool_calls_log if (allow_tools or tool_calls_log) else None,
             timings=timings_envelope,
             exact_prompt_tokens=exact_prompt_tokens,
@@ -1143,6 +1221,7 @@ class SouthboundOpenAIClient:
             kb_meta,
             overflow_recovered,
             note_rag_meta,
+            temporal_digest_meta,
             exact_prompt_tokens,
             history_trimmed_turns,
         ) = prepare_upstream_messages(
@@ -1313,6 +1392,7 @@ class SouthboundOpenAIClient:
             overflow_recovered=overflow_recovered,
             kb_meta=kb_meta,
             note_rag_meta=note_rag_meta,
+            temporal_digest_meta=temporal_digest_meta,
             tool_calls_log=tool_calls_log if (allow_tools or tool_calls_log) else None,
             timings={
                 "engine_prep_ms": engine_prep_ms,

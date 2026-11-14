@@ -38,6 +38,13 @@ class WahsRequestOptions(BaseModel):
     user_sub: Optional[str] = None
     fhir_bundle: Optional[Dict[str, Any]] = None
     enable_kb: bool = True
+    enable_temporal_digest: bool = Field(
+        default=True,
+        description=(
+            "Inject deterministic chart-derived temporal anchor, encounter horizon, "
+            "and longitudinal numeric series into Layer-3 enrichment (disabled in chart_only baseline)."
+        ),
+    )
     enable_overflow_tools: bool = True
     refresh: bool = False
     allow_partial_external_share: bool = False

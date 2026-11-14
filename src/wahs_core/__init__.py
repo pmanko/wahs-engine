@@ -48,6 +48,7 @@ from .normalizers import (
     is_non_medical_admin_code,
     normalize_drug_ingredient,
 )
+from .temporal_digest import TemporalDigestResult, build_temporal_digest
 from .wahs_tools import (
     get_lab_history,
     read_clinical_note,
@@ -66,10 +67,12 @@ __all__ = [
     "ExtractedChart",
     "HubEnrichmentResult",
     "NumericPoint",
+    "TemporalDigestResult",
     "WAHS_CORPUS_PATH",
     "__version__",
     "annotate_immunization_anomalies",
     "audit_cohort_code_coverage",
+    "build_temporal_digest",
     "build_wahs_hub_enrichment_block",
     "classify_sensitivity",
     "classify_sensitivity_with_source",
