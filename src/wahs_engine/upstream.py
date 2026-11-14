@@ -698,6 +698,7 @@ def _build_southbound_payload(
     messages: Sequence[Mapping[str, Any]],
     req: OpenAIChatCompletionRequest,
     spec: ModelSpec,
+    effective_max_tokens: int,
     stream: bool,
     tools: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
@@ -706,10 +707,9 @@ def _build_southbound_payload(
         "model": upstream_model,
         "messages": list(messages),
         "temperature": req.temperature,
+        "max_tokens": int(effective_max_tokens),
         "stream": stream,
     }
-    if req.max_tokens is not None:
-        payload["max_tokens"] = int(req.max_tokens)
     _apply_provider_southbound_params(payload, spec)
     if req.seed is not None:
         payload["seed"] = req.seed
@@ -876,6 +876,7 @@ class SouthboundOpenAIClient:
             messages=messages,
             req=req,
             spec=spec,
+            effective_max_tokens=effective_max_tokens,
             stream=False,
             tools=tools_spec,
         )
@@ -933,6 +934,7 @@ class SouthboundOpenAIClient:
                     messages=followup_msgs,
                     req=req,
                     spec=spec,
+                    effective_max_tokens=effective_max_tokens,
                     stream=False,
                     tools=next_tools,
                 )
@@ -1156,6 +1158,7 @@ class SouthboundOpenAIClient:
                     messages=followup_msgs,
                     req=req,
                     spec=spec,
+                    effective_max_tokens=effective_max_tokens,
                     stream=True,
                     tools=current_tools,
                 )

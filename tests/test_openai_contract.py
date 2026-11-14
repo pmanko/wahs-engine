@@ -163,6 +163,7 @@ async def test_openai_models_streaming_sse_vanilla_caller_and_overflow_tool_loop
             assert x_wahs["citation_map"]
             assert x_wahs["ai_provenance"]["profile"].endswith("/AI-Provenance")
             assert x_wahs["ai_provenance"]["recorded_model"] == "ollama/gemma4:12b"
+            assert llm_calls[0]["max_tokens"] == 1024
             assert llm_calls[-1]["model"] == "ollama/gemma4:12b"
 
             # 3. Tight-budget non-streaming request (budget=512 -> omitted_clinical_items > 0 -> exercises Tier-0 tool loop!)

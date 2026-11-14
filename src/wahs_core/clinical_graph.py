@@ -1133,10 +1133,32 @@ class ClinicalEntityGraph:
             probes = _med_name_probes(m)
             if not probes:
                 continue
+            m_date = (m.date_str or "")[:10]
+            latest_resume_date = ""
             matched_m = False
             for n in notes_sorted:
                 raw_note = n.raw_line or ""
-                n_low = (raw_note or n.value_summary or "").lower()
+                note_body = raw_note or n.value_summary or ""
+                n_low = note_body.lower()
+                n_date = (n.date_str or "")[:10]
+                if m_date and n_date and n_date < m_date:
+                    continue
+                if n_low and any(rc in n_low for rc in resume_cues):
+                    for r_sent in re.split(r"(?<=[.!?;])\s+|\n+", note_body):
+                        rs_low = r_sent.lower()
+                        if (
+                            any(rc in rs_low for rc in resume_cues)
+                            and not re.search(
+                                r"\b(?:do\s+not|don't|never|avoid|cannot)\s+(?:continue|resume|restart)\b",
+                                rs_low,
+                            )
+                            and (probes & set(re.findall(r"[a-z][a-z0-9-]{3,}", rs_low)))
+                        ):
+                            if n_date > latest_resume_date:
+                                latest_resume_date = n_date
+                            break
+                if latest_resume_date and n_date and n_date < latest_resume_date:
+                    continue
                 if not n_low or not any(cue in n_low for cue in hold_cues):
                     continue
                 n_toks = set(re.findall(r"[a-z][a-z0-9-]{3,}", n_low))

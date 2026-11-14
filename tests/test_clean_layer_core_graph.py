@@ -189,6 +189,97 @@ def test_extract_bundle_reference_date_skips_future_cancelled_and_coverage() -> 
     assert ext.reference_date == "2026-01-15"
 
 
+def test_active_med_hold_note_respects_order_date_and_newer_resume_note() -> None:
+    import base64
+    from wahs_core import ClinicalEntityGraph, extract_bundle
+
+    def _note_entry(nid: str, ndate: str, text: str) -> Dict[str, Any]:
+        return {
+            "resource": {
+                "resourceType": "DocumentReference",
+                "id": nid,
+                "status": "current",
+                "date": ndate,
+                "type": {"text": f"Note {nid}"},
+                "content": [
+                    {
+                        "attachment": {
+                            "contentType": "text/plain",
+                            "data": base64.b64encode(text.encode("utf-8")).decode("ascii"),
+                        }
+                    }
+                ],
+            }
+        }
+
+    # (a) 2020 hold note must be ignored for a 2026 active order
+    bundle_old_hold = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "p-hold-1", "birthDate": "1965-01-01"}},
+            {
+                "resource": {
+                    "resourceType": "MedicationRequest",
+                    "id": "med-met-1",
+                    "status": "active",
+                    "authoredOn": "2026-05-01",
+                    "medicationCodeableConcept": {"text": "Metformin 500 MG Oral Tablet"},
+                }
+            },
+            _note_entry("doc-2020", "2020-02-10", "Holding metformin perioperatively prior to contrast."),
+        ],
+    }
+    ext_old = extract_bundle(bundle_old_hold)
+    g_old = ClinicalEntityGraph.from_extracted_chart(ext_old)
+    assert not any(e.edge_type == "CONTRADICTED_OR_MODIFIED_BY_NOTE" for e in g_old.edges)
+
+    # (b) 2026-10-05 hold superseded by 2026-10-12 resume note must not emit hold contradiction
+    bundle_resumed = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "p-hold-2", "birthDate": "1965-01-01"}},
+            {
+                "resource": {
+                    "resourceType": "MedicationRequest",
+                    "id": "med-met-2",
+                    "status": "active",
+                    "authoredOn": "2026-10-01",
+                    "medicationCodeableConcept": {"text": "Metformin 500 MG Oral Tablet"},
+                }
+            },
+            _note_entry("doc-hold", "2026-10-05", "Hold metformin during inpatient procedure."),
+            _note_entry("doc-resume", "2026-10-12", "Patient stable; resume metformin 500 mg daily."),
+        ],
+    }
+    ext_res = extract_bundle(bundle_resumed)
+    g_res = ClinicalEntityGraph.from_extracted_chart(ext_res)
+    assert not any(e.edge_type == "CONTRADICTED_OR_MODIFIED_BY_NOTE" for e in g_res.edges)
+
+    # (c) Un-superseded 2026-10-15 hold note on 2026-10-01 active order DOES emit contradiction
+    bundle_active_hold = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "p-hold-3", "birthDate": "1965-01-01"}},
+            {
+                "resource": {
+                    "resourceType": "MedicationRequest",
+                    "id": "med-met-3",
+                    "status": "active",
+                    "authoredOn": "2026-10-01",
+                    "medicationCodeableConcept": {"text": "Metformin 500 MG Oral Tablet"},
+                }
+            },
+            _note_entry("doc-new-hold", "2026-10-15", "Holding metformin due to worsening eGFR."),
+        ],
+    }
+    ext_ah = extract_bundle(bundle_active_hold)
+    g_ah = ClinicalEntityGraph.from_extracted_chart(ext_ah)
+    assert any(e.edge_type == "CONTRADICTED_OR_MODIFIED_BY_NOTE" for e in g_ah.edges)
+
+
 def test_wahs_core_stdlib_purity_in_subprocess() -> None:
     proc = subprocess.run(
         [
