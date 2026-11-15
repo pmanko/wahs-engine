@@ -78,6 +78,7 @@ def _fields(row: Dict[str, Any]) -> Dict[str, Any]:
         "id": row.get("id", ""),
         "title": row.get("title", ""),
         "text": row.get("text", ""),
+        "tags": [str(t) for t in (row.get("tags") or []) if t],
         "source": row.get("source", ""),
         "version": row.get("version", ""),
         "url": row.get("url", ""),
@@ -103,13 +104,22 @@ class _Index:
             conn = sqlite3.connect(":memory:", check_same_thread=False)
             conn.execute(
                 "CREATE VIRTUAL TABLE kb USING fts5("
-                "id UNINDEXED, title, text, source UNINDEXED, version UNINDEXED, "
+                "id UNINDEXED, title, text, tags, source UNINDEXED, version UNINDEXED, "
                 "url UNINDEXED, license UNINDEXED, tokenize='porter')"
             )
             for r in self.rows:
                 conn.execute(
-                    "INSERT INTO kb (id,title,text,source,version,url,license) VALUES (?,?,?,?,?,?,?)",
-                    (r["id"], r["title"], r["text"], r["source"], r["version"], r["url"], r["license"]),
+                    "INSERT INTO kb (id,title,text,tags,source,version,url,license) VALUES (?,?,?,?,?,?,?,?)",
+                    (
+                        r["id"],
+                        r["title"],
+                        r["text"],
+                        " ".join(r["tags"]),
+                        r["source"],
+                        r["version"],
+                        r["url"],
+                        r["license"],
+                    ),
                 )
             conn.commit()
             self.conn = conn
@@ -139,10 +149,12 @@ class _Index:
         if not terms and not code_set:
             return []
 
+        row_by_id = {r["id"]: r for r in self.rows}
         fts_limit = max(len(self.rows), k * 3, 10) if code_set else max(k * 3, 10)
         fts_results: List[Dict[str, Any]] = []
-        if terms and self.conn is not None:
-            match = " OR ".join(terms)
+        fts_safe_terms = [f'"{t}"' for t in dict.fromkeys(terms) if t]
+        if fts_safe_terms and self.conn is not None:
+            match = " OR ".join(fts_safe_terms)
             try:
                 cur = self.conn.execute(
                     "SELECT id,title,text,source,version,url,license, bm25(kb) AS score "
@@ -150,7 +162,12 @@ class _Index:
                     (match, fts_limit),
                 )
                 cols = ["id", "title", "text", "source", "version", "url", "license", "score"]
-                fts_results = [dict(zip(cols, row)) for row in cur.fetchall()]
+                for row in cur.fetchall():
+                    item = dict(zip(cols, row))
+                    meta = row_by_id.get(item["id"], {})
+                    item["tags"] = list(meta.get("tags") or [])
+                    item["codes"] = list(meta.get("codes") or [])
+                    fts_results.append(item)
             except sqlite3.OperationalError as e:
                 logger.warning("KB FTS5 search failed for %r: %s", query, e)
                 fts_results = []
@@ -158,7 +175,7 @@ class _Index:
             # keyword-overlap fallback: count distinct query terms present per snippet
             scored = []
             for r in self.rows:
-                hay = f"{r['title']} {r['text']}".lower()
+                hay = f"{r['title']} {r['text']} {' '.join(r.get('tags') or [])}".lower()
                 hits = sum(1 for t in set(terms) if t in hay)
                 if hits:
                     scored.append((hits, r))
@@ -168,6 +185,8 @@ class _Index:
                     "id": r["id"],
                     "title": r["title"],
                     "text": r["text"],
+                    "tags": list(r.get("tags") or []),
+                    "codes": list(r.get("codes") or []),
                     "source": r["source"],
                     "version": r["version"],
                     "url": r["url"],
@@ -216,6 +235,8 @@ class _Index:
                         "id": r["id"],
                         "title": r["title"],
                         "text": r["text"],
+                        "tags": list(r.get("tags") or []),
+                        "codes": list(r.get("codes") or []),
                         "source": r["source"],
                         "version": r["version"],
                         "url": r["url"],

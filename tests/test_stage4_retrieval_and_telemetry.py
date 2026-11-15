@@ -278,7 +278,7 @@ def test_note_rag_and_dynamic_fhir_tools_with_seed_and_timings() -> None:
     assert x_rag["timings"]["prompt_ms"] == pytest.approx(160.0)
     assert x_rag["timings"]["predicted_ms"] == pytest.approx(95.0)
 
-    # 2. Test `dynamic_fhir_tools` multi-round tool execution + cumulative timings
+    # 2. Test `dynamic_fhir_tools` default 2k IPS header when `target_budget_tokens` is omitted
     resp_tools = client.post(
         "/v1/chat/completions",
         json={
@@ -293,7 +293,6 @@ def test_note_rag_and_dynamic_fhir_tools_with_seed_and_timings() -> None:
             ],
             "wahs": {
                 "fhir_bundle": bundle,
-                "target_budget_tokens": 8192,
                 "retrieval_strategy": "dynamic_fhir_tools",
             },
         },
@@ -302,14 +301,30 @@ def test_note_rag_and_dynamic_fhir_tools_with_seed_and_timings() -> None:
     data_tools = resp_tools.json()
     x_tools = data_tools["x_wahs"]
     assert x_tools["retrieval_strategy"] == "dynamic_fhir_tools"
-    # Compact IPS header budget <= 2048 even when requested_budget_tokens == 8192
+    # Compact IPS header defaults to <= 2048 when caller omits target_budget_tokens
     assert x_tools["condensation"]["budget_tokens"] == 2048
-    assert x_tools["condensation"]["requested_budget_tokens"] == 8192
+    assert x_tools["condensation"]["requested_budget_tokens"] is None
     assert len(x_tools["tool_calls"]) == 1
     assert x_tools["tool_calls"][0]["name"] == "read_clinical_note"
     assert x_tools["timings"]["llm_rounds"] == 2
     assert x_tools["timings"]["prompt_ms"] == pytest.approx(300.0)
     assert x_tools["timings"]["predicted_ms"] == pytest.approx(180.0)
+
+    # Explicit target_budget_tokens on dynamic_fhir_tools is respected (at-most ceiling)
+    resp_tools_4k = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gemma-e4b",
+            "messages": [{"role": "user", "content": "Dynamic tool 4k test."}],
+            "wahs": {
+                "fhir_bundle": bundle,
+                "target_budget_tokens": 4096,
+                "retrieval_strategy": "dynamic_fhir_tools",
+            },
+        },
+    )
+    assert resp_tools_4k.status_code == 200
+    assert resp_tools_4k.json()["x_wahs"]["condensation"]["budget_tokens"] == 4096
 
 
 def test_external_share_blocks_tier0_overflow_recovery_across_all_strategies() -> None:

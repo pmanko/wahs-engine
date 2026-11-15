@@ -15,8 +15,8 @@ import httpx
 
 from wahs_core import (
     build_wahs_hub_enrichment_block,
+    extract_clean_user_query,
     get_lab_history,
-    parse_omitted_clinical_items,
     read_clinical_note,
     retrieve_clinical_note_passages,
     search_chart_entries,
@@ -205,6 +205,35 @@ def _register_or_get_citation_index(
     return next_idx
 
 
+def _omitted_manifest_stats(ctx: AssembledWahsContext) -> Tuple[int, Dict[str, int]]:
+    manifest = ctx.condensed.completeness_manifest or {}
+    omitted_total = int(
+        manifest.get("omitted_clinical_items_count")
+        or manifest.get("omitted_clinical_items")
+        or 0
+    )
+    raw_by_sec = manifest.get("omitted_by_section")
+    omitted_by_cat = (
+        {str(k): int(v) for k, v in raw_by_sec.items() if int(v or 0) > 0}
+        if isinstance(raw_by_sec, Mapping)
+        else {}
+    )
+    return omitted_total, omitted_by_cat
+
+
+def _should_allow_overflow_tools(
+    ctx: AssembledWahsContext,
+    options: WahsRequestOptions,
+) -> Tuple[bool, int, Dict[str, int]]:
+    omitted_total, omitted_by_cat = _omitted_manifest_stats(ctx)
+    allow = options.retrieval_strategy == "dynamic_fhir_tools" or (
+        options.enable_overflow_tools
+        and omitted_total > 0
+        and options.retrieval_strategy != "chart_only"
+    )
+    return allow, omitted_total, omitted_by_cat
+
+
 def build_x_wahs_envelope(
     *,
     ctx: AssembledWahsContext,
@@ -222,7 +251,7 @@ def build_x_wahs_envelope(
     suspected_upstream_truncation: bool = False,
     history_trimmed_turns: int = 0,
 ) -> Dict[str, Any]:
-    omitted_total, omitted_by_cat = parse_omitted_clinical_items(ctx.condensed.chart_text)
+    omitted_total, omitted_by_cat = _omitted_manifest_stats(ctx)
     effective_kb = bool(options.enable_kb) and options.retrieval_strategy != "chart_only"
     budget_effective = ctx.budget_effective or ctx.condensed.target_tokens
     env: Dict[str, Any] = {
@@ -417,24 +446,32 @@ def _trim_history_to_fit(
     context_window: int,
     max_output_tokens: int,
 ) -> Tuple[int, int]:
-    """Trim oldest conversation turns (preserving `messages[0]` verbatim and the latest user turn).
+    """Trim oldest conversation turns (preserving `messages[0]` and the latest user turn + tail).
 
     Returns ``(exact_prompt_tokens, history_trimmed_turns)``. Raises HTTP 422 if the prompt still
     exceeds ``context_window - max_output_tokens`` after trimming all prior turns.
     """
     prompt_limit = int(context_window) - int(max_output_tokens)
     trimmed = 0
-    while len(messages) > 2:
+    while True:
         exact_toks = count_chat_messages_tokens(
             messages, tools=tools, tokenizer_family=tokenizer_family
         )
         if exact_toks <= prompt_limit:
             return exact_toks, trimmed
+        last_user_idx = max(
+            (i for i, m in enumerate(messages) if m.get("role") == "user"),
+            default=1,
+        )
+        if last_user_idx <= 1:
+            break
         messages.pop(1)
         trimmed += 1
-        if len(messages) > 2 and messages[1].get("role") == "assistant":
+        last_user_idx -= 1
+        while last_user_idx > 1 and messages[1].get("role") != "user":
             messages.pop(1)
             trimmed += 1
+            last_user_idx -= 1
 
     exact_toks = count_chat_messages_tokens(
         messages, tools=tools, tokenizer_family=tokenizer_family
@@ -504,6 +541,9 @@ def prepare_upstream_messages(
     raw_last_user_query = next(
         (t["content"] for t in reversed(turns) if t["role"] == "user"), ""
     )
+    clean_last_user_query = (
+        extract_clean_user_query(raw_last_user_query) or raw_last_user_query
+    )
 
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": ctx.system_prompt},
@@ -517,15 +557,33 @@ def prepare_upstream_messages(
 
     if effective_kb:
         try:
+            minimal_turn_toks = count_chat_messages_tokens(
+                [messages[0], messages[-1]], tools=tools, tokenizer_family=tok_family
+            )
+            window_slack = max(
+                256, ctx_window - effective_max_tokens - minimal_turn_toks - 128
+            )
+            enrichment_max_tokens = min(
+                window_slack, max(1280, int(ctx.condensed.target_tokens * 0.25))
+            )
             enrichment = build_wahs_hub_enrichment_block(
                 messages,
                 extracted=ctx.extracted,
-                max_tokens=800,
+                condensed=ctx.condensed,
+                citation_map=ctx.citation_map,
+                max_tokens=enrichment_max_tokens,
                 sharing_posture=options.sharing_posture,
                 token_counter=exact_counter,
+                max_overflow_recover=(
+                    0 if options.retrieval_strategy == "dynamic_fhir_tools" else 5
+                ),
             )
             kb_meta = enrichment.to_metadata_dict()
-            overflow_recovered = int(kb_meta.get("overflow_items_recovered") or 0)
+            overflow_recovered = int(
+                kb_meta.get("overflow_recovered_count")
+                or kb_meta.get("overflow_items_recovered")
+                or 0
+            )
             for rm in kb_meta.get("recovered_mappings") or []:
                 if isinstance(rm, Mapping) and rm.get("resourceUuid"):
                     idx_rm = rm.get("index")
@@ -556,7 +614,7 @@ def prepare_upstream_messages(
         try:
             rag_res = retrieve_clinical_note_passages(
                 ctx.extracted,
-                raw_last_user_query,
+                clean_last_user_query,
                 sharing_posture=options.sharing_posture,
                 top_k=5,
             )
@@ -606,7 +664,7 @@ def prepare_upstream_messages(
     if options.retrieval_strategy == "dynamic_fhir_tools":
         tool_hint = (
             "=== DYNAMIC FHIR CHART TOOLS ACTIVE ===\n"
-            "The Condensed Clinical Record above is a compact 2k-token IPS safety header. "
+            "The Condensed Clinical Record above is a compact IPS safety header. "
             "Whenever the question asks about prior hospital admissions, clinical notes, procedures, "
             "microbiology/pathology reports, or specific longitudinal lab dates not shown in full above, "
             "call `search_chart_entries`, `read_clinical_note`, or `get_lab_history` first, then synthesize "
@@ -632,6 +690,136 @@ def prepare_upstream_messages(
         exact_prompt_tokens,
         history_trimmed_turns,
     )
+
+
+def _build_southbound_payload(
+    *,
+    upstream_model: str,
+    messages: Sequence[Mapping[str, Any]],
+    req: OpenAIChatCompletionRequest,
+    spec: ModelSpec,
+    effective_max_tokens: int,
+    stream: bool,
+    tools: Optional[Sequence[Mapping[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Build southbound OpenAI `/v1/chat/completions` request payload."""
+    payload: Dict[str, Any] = {
+        "model": upstream_model,
+        "messages": list(messages),
+        "temperature": req.temperature,
+        "max_tokens": int(effective_max_tokens),
+        "stream": stream,
+    }
+    _apply_provider_southbound_params(payload, spec)
+    if req.seed is not None:
+        payload["seed"] = req.seed
+    if tools is not None:
+        payload["tools"] = list(tools)
+        payload["tool_choice"] = "auto"
+    return payload
+
+
+def _accumulate_stream_tool_calls(
+    by_index: Dict[int, Dict[str, Any]],
+    tc_deltas: Sequence[Any],
+) -> None:
+    """Assemble streamed OpenAI `delta.tool_calls` fragments indexed by call index."""
+    for pos, raw_tc in enumerate(tc_deltas):
+        if not isinstance(raw_tc, Mapping):
+            continue
+        idx = int(raw_tc.get("index") if raw_tc.get("index") is not None else pos)
+        entry = by_index.setdefault(
+            idx,
+            {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+        )
+        if raw_tc.get("id"):
+            entry["id"] = str(raw_tc["id"])
+        if raw_tc.get("type"):
+            entry["type"] = str(raw_tc["type"])
+        fn = raw_tc.get("function")
+        if isinstance(fn, Mapping):
+            if fn.get("name"):
+                name_piece = str(fn["name"])
+                if name_piece != entry["function"]["name"]:
+                    entry["function"]["name"] = str(entry["function"]["name"]) + name_piece
+            if fn.get("arguments") is not None:
+                entry["function"]["arguments"] = str(entry["function"]["arguments"]) + str(
+                    fn["arguments"]
+                )
+
+
+def _normalize_tool_calls_with_ids(
+    tool_calls: Sequence[Mapping[str, Any]],
+    *,
+    round_idx: int,
+) -> List[Dict[str, Any]]:
+    """Copy tool call dicts and ensure each has a stable, non-empty ``id`` for pairing."""
+    out: List[Dict[str, Any]] = []
+    for idx, tc in enumerate(tool_calls):
+        item = dict(tc) if isinstance(tc, Mapping) else {}
+        item["id"] = str(item.get("id") or f"call_{round_idx + 1}_{idx + 1}")
+        out.append(item)
+    return out
+
+
+def _execute_tool_call_batch(
+    ctx: AssembledWahsContext,
+    options: WahsRequestOptions,
+    tool_calls: Sequence[Mapping[str, Any]],
+    *,
+    round_idx: int,
+    tool_calls_log: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Execute up to 4 overflow tool calls and pair every call ID with a ``tool`` message."""
+    tool_msgs: List[Dict[str, Any]] = []
+    recovered_total = 0
+    for tc_idx, tc in enumerate(tool_calls):
+        fn = (tc.get("function") or {}) if isinstance(tc, Mapping) else {}
+        fn_name = str(fn.get("name") or "")
+        tc_id = str(
+            (tc.get("id") if isinstance(tc, Mapping) else None)
+            or f"call_{round_idx + 1}_{tc_idx + 1}"
+        )
+        if tc_idx >= 4:
+            tool_msgs.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc_id,
+                    "name": fn_name,
+                    "content": json.dumps(
+                        {
+                            "error": "tool_call_limit_exceeded",
+                            "message": "Maximum 4 tool calls executed per round; prioritize key lookups.",
+                        }
+                    ),
+                }
+            )
+            continue
+        try:
+            fn_args = json.loads(fn.get("arguments") or "{}")
+        except Exception:
+            fn_args = {}
+        tool_out, rec_count = _execute_local_overflow_tool(
+            ctx, fn_name, fn_args, sharing_posture=options.sharing_posture
+        )
+        recovered_total += rec_count
+        tool_calls_log.append(
+            {
+                "round": round_idx + 1,
+                "name": fn_name,
+                "arguments": fn_args,
+                "results_returned": rec_count,
+            }
+        )
+        tool_msgs.append(
+            {
+                "role": "tool",
+                "tool_call_id": tc_id,
+                "name": fn_name,
+                "content": tool_out,
+            }
+        )
+    return tool_msgs, recovered_total
 
 
 class SouthboundOpenAIClient:
@@ -691,13 +879,12 @@ class SouthboundOpenAIClient:
         requested_model = (req.model or self.settings.default_model).strip()
         spec = self.settings.resolve_model_spec(requested_model)
         upstream_model = spec.upstream_model
-        effective_max_tokens = int(req.max_tokens or spec.default_max_output_tokens)
-        omitted_total, _ = parse_omitted_clinical_items(ctx.condensed.chart_text)
-        allow_tools = options.retrieval_strategy == "dynamic_fhir_tools" or (
-            options.enable_overflow_tools
-            and omitted_total > 0
-            and options.retrieval_strategy != "chart_only"
+        effective_max_tokens = (
+            int(req.max_tokens)
+            if req.max_tokens is not None
+            else int(spec.default_max_output_tokens)
         )
+        allow_tools, _, _ = _should_allow_overflow_tools(ctx, options)
         tools_spec = _OVERFLOW_TOOLS_SPEC if allow_tools else None
 
         (
@@ -717,18 +904,15 @@ class SouthboundOpenAIClient:
         )
         engine_prep_ms = round(assemble_ms + (time.perf_counter() - prep_t0) * 1000.0, 2)
 
-        payload: Dict[str, Any] = {
-            "model": upstream_model,
-            "messages": messages,
-            "temperature": req.temperature,
-            "max_tokens": effective_max_tokens,
-            "stream": False,
-        }
-        _apply_provider_southbound_params(payload, spec)
-        if req.seed is not None:
-            payload["seed"] = req.seed
-        if tools_spec is not None:
-            payload["tools"] = tools_spec
+        payload = _build_southbound_payload(
+            upstream_model=upstream_model,
+            messages=messages,
+            req=req,
+            spec=spec,
+            effective_max_tokens=effective_max_tokens,
+            stream=False,
+            tools=tools_spec,
+        )
 
         tool_calls_log: List[Dict[str, Any]] = []
         prompt_ms_total = 0.0
@@ -771,58 +955,35 @@ class SouthboundOpenAIClient:
                 tool_calls = (msg0.get("tool_calls") or []) if isinstance(msg0, Mapping) else []
                 if not tool_calls or not allow_tools:
                     break
-                followup_msgs.append(dict(msg0))
-                for tc in tool_calls[:4]:
-                    fn = (tc.get("function") or {}) if isinstance(tc, Mapping) else {}
-                    fn_name = str(fn.get("name") or "")
-                    try:
-                        fn_args = json.loads(fn.get("arguments") or "{}")
-                    except Exception:
-                        fn_args = {}
-                    tool_out, rec_count = _execute_local_overflow_tool(
-                        ctx, fn_name, fn_args, sharing_posture=options.sharing_posture
-                    )
-                    overflow_recovered += rec_count
-                    tool_calls_log.append(
-                        {
-                            "round": round_idx + 1,
-                            "name": fn_name,
-                            "arguments": fn_args,
-                            "results_returned": rec_count,
-                        }
-                    )
-                    followup_msgs.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": str(tc.get("id") or f"call_{round_idx + 1}"),
-                            "name": fn_name,
-                            "content": tool_out,
-                        }
-                    )
-                next_tools = _OVERFLOW_TOOLS_SPEC if round_idx + 1 < max_tool_rounds else None
-                next_payload: Dict[str, Any] = {
-                    "model": upstream_model,
-                    "messages": followup_msgs,
-                    "temperature": req.temperature,
-                    "max_tokens": effective_max_tokens,
-                    "stream": False,
-                }
-                _apply_provider_southbound_params(next_payload, spec)
-                if req.seed is not None:
-                    next_payload["seed"] = req.seed
-                if next_tools is not None:
-                    next_payload["tools"] = next_tools
-                round_toks = count_chat_messages_tokens(
-                    followup_msgs, tools=next_tools, tokenizer_family=spec.tokenizer_family
+                normalized_calls = _normalize_tool_calls_with_ids(
+                    tool_calls, round_idx=round_idx
                 )
-                if round_toks > (spec.context_window - effective_max_tokens):
-                    raise HTTPException(
-                        status_code=422,
-                        detail=(
-                            f"Tool follow-up prompt ({round_toks} exact {spec.tokenizer_family} tokens) "
-                            f"+ max_tokens ({effective_max_tokens}) exceeds model context_window ({spec.context_window})."
-                        ),
-                    )
+                assistant_msg = dict(msg0)
+                assistant_msg["tool_calls"] = normalized_calls
+                followup_msgs.append(assistant_msg)
+                tool_msgs, rec_delta = _execute_tool_call_batch(
+                    ctx, options, normalized_calls, round_idx=round_idx, tool_calls_log=tool_calls_log
+                )
+                overflow_recovered += rec_delta
+                followup_msgs.extend(tool_msgs)
+                next_tools = _OVERFLOW_TOOLS_SPEC if round_idx + 1 < max_tool_rounds else None
+                _, extra_trimmed = _trim_history_to_fit(
+                    followup_msgs,
+                    tools=next_tools,
+                    tokenizer_family=spec.tokenizer_family,
+                    context_window=spec.context_window,
+                    max_output_tokens=effective_max_tokens,
+                )
+                history_trimmed_turns += extra_trimmed
+                next_payload = _build_southbound_payload(
+                    upstream_model=upstream_model,
+                    messages=followup_msgs,
+                    req=req,
+                    spec=spec,
+                    effective_max_tokens=effective_max_tokens,
+                    stream=False,
+                    tools=next_tools,
+                )
                 resp_next = await client.post(
                     self.settings.upstream_chat_completions_url,
                     headers=self._headers(),
@@ -920,7 +1081,8 @@ class SouthboundOpenAIClient:
         ctx = copy.copy(ctx)
         ctx.citation_map = copy.deepcopy(ctx.citation_map)
 
-        if options.retrieval_strategy == "dynamic_fhir_tools":
+        allow_tools, _, _ = _should_allow_overflow_tools(ctx, options)
+        if allow_tools and options.retrieval_strategy == "dynamic_fhir_tools":
             completed = await self.complete(
                 ctx=ctx,
                 req=req.model_copy(update={"stream": False}),
@@ -970,7 +1132,12 @@ class SouthboundOpenAIClient:
         requested_model = (req.model or self.settings.default_model).strip()
         spec = self.settings.resolve_model_spec(requested_model)
         upstream_model = spec.upstream_model
-        effective_max_tokens = int(req.max_tokens or spec.default_max_output_tokens)
+        effective_max_tokens = (
+            int(req.max_tokens)
+            if req.max_tokens is not None
+            else int(spec.default_max_output_tokens)
+        )
+        tools_spec = _OVERFLOW_TOOLS_SPEC if allow_tools else None
         (
             messages,
             kb_meta,
@@ -984,22 +1151,11 @@ class SouthboundOpenAIClient:
             options=options,
             spec=spec,
             effective_max_tokens=effective_max_tokens,
-            tools=None,
+            tools=tools_spec,
         )
         engine_prep_ms = round(assemble_ms + (time.perf_counter() - prep_t0) * 1000.0, 2)
         completion_id = f"chatcmpl-wahs-{uuid.uuid4().hex[:12]}"
         created = int(time.time())
-
-        payload: Dict[str, Any] = {
-            "model": upstream_model,
-            "messages": messages,
-            "temperature": req.temperature,
-            "max_tokens": effective_max_tokens,
-            "stream": True,
-        }
-        _apply_provider_southbound_params(payload, spec)
-        if req.seed is not None:
-            payload["seed"] = req.seed
 
         # Standard initial assistant role chunk (`@ai-sdk/openai-compatible` compatible)
         role_chunk = {
@@ -1011,64 +1167,132 @@ class SouthboundOpenAIClient:
         }
         yield f"data: {json.dumps(role_chunk)}\n\n"
 
-        stripper = _StreamingThinkStripper()
         owns_client = self._external_client is None
         client = self._external_client or httpx.AsyncClient(timeout=self.settings.llm_timeout_seconds)
         llm_t0 = time.perf_counter()
         upstream_finish_reason = "stop"
         upstream_usage: Dict[str, Any] = {}
+        tool_calls_log: List[Dict[str, Any]] = []
+        followup_msgs = list(messages)
+        max_tool_rounds = 2 if allow_tools else 0
+        llm_rounds = 0
         try:
-            async with client.stream(
-                "POST",
-                self.settings.upstream_chat_completions_url,
-                headers=self._headers(),
-                json=payload,
-            ) as resp:
-                resp.raise_for_status()
-                async for raw_line in resp.aiter_lines():
-                    line = raw_line.strip()
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data_str = line[5:].strip()
-                    if data_str == "[DONE]":
-                        break
-                    try:
-                        chunk_obj = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
-                    if isinstance(chunk_obj, Mapping) and isinstance(chunk_obj.get("usage"), Mapping):
-                        upstream_usage = dict(chunk_obj["usage"])
-                    choice = ((chunk_obj.get("choices") or [{}])[0]) if isinstance(chunk_obj, Mapping) else {}
-                    if isinstance(choice, Mapping) and choice.get("finish_reason"):
-                        upstream_finish_reason = str(choice["finish_reason"])
-                    delta = (choice.get("delta") or {}) if isinstance(choice, Mapping) else {}
-                    piece = stripper.feed(str(delta.get("content") or ""))
-                    if piece:
-                        out_chunk = {
-                            "id": completion_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": requested_model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {"content": piece},
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-                        yield f"data: {json.dumps(out_chunk)}\n\n"
+            for round_idx in range(max_tool_rounds + 1):
+                current_tools = tools_spec if round_idx < max_tool_rounds else None
+                if round_idx > 0:
+                    _, extra_trimmed = _trim_history_to_fit(
+                        followup_msgs,
+                        tools=current_tools,
+                        tokenizer_family=spec.tokenizer_family,
+                        context_window=spec.context_window,
+                        max_output_tokens=effective_max_tokens,
+                    )
+                    history_trimmed_turns += extra_trimmed
+                payload = _build_southbound_payload(
+                    upstream_model=upstream_model,
+                    messages=followup_msgs,
+                    req=req,
+                    spec=spec,
+                    effective_max_tokens=effective_max_tokens,
+                    stream=True,
+                    tools=current_tools,
+                )
+                stripper = _StreamingThinkStripper()
+                tool_calls_by_idx: Dict[int, Dict[str, Any]] = {}
+                round_raw_parts: List[str] = []
+                can_stream_live = current_tools is None
+                buffered_pieces: List[str] = []
 
-            tail = stripper.flush()
-            if tail:
-                tail_chunk = {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": requested_model,
-                    "choices": [{"index": 0, "delta": {"content": tail}, "finish_reason": None}],
-                }
-                yield f"data: {json.dumps(tail_chunk)}\n\n"
+                def _content_sse(text_piece: str) -> str:
+                    out_chunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": requested_model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": text_piece},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    return f"data: {json.dumps(out_chunk)}\n\n"
+
+                llm_rounds += 1
+                async with client.stream(
+                    "POST",
+                    self.settings.upstream_chat_completions_url,
+                    headers=self._headers(),
+                    json=payload,
+                ) as resp:
+                    resp.raise_for_status()
+                    async for raw_line in resp.aiter_lines():
+                        line = raw_line.strip()
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data_str = line[5:].strip()
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            chunk_obj = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+                        if isinstance(chunk_obj, Mapping) and isinstance(chunk_obj.get("usage"), Mapping):
+                            upstream_usage = dict(chunk_obj["usage"])
+                        choice = (
+                            ((chunk_obj.get("choices") or [{}])[0])
+                            if isinstance(chunk_obj, Mapping)
+                            else {}
+                        )
+                        if isinstance(choice, Mapping) and choice.get("finish_reason"):
+                            upstream_finish_reason = str(choice["finish_reason"])
+                        delta = (choice.get("delta") or {}) if isinstance(choice, Mapping) else {}
+                        tc_deltas = delta.get("tool_calls") if isinstance(delta, Mapping) else None
+                        if isinstance(tc_deltas, list):
+                            _accumulate_stream_tool_calls(tool_calls_by_idx, tc_deltas)
+                        raw_content = str(delta.get("content") or "") if isinstance(delta, Mapping) else ""
+                        if raw_content:
+                            round_raw_parts.append(raw_content)
+                        piece = stripper.feed(raw_content)
+                        if piece:
+                            if can_stream_live:
+                                yield _content_sse(piece)
+                            else:
+                                buffered_pieces.append(piece)
+
+                tail = stripper.flush()
+                if tail:
+                    if can_stream_live:
+                        yield _content_sse(tail)
+                    else:
+                        buffered_pieces.append(tail)
+
+                if tool_calls_by_idx and round_idx < max_tool_rounds:
+                    assembled_calls = _normalize_tool_calls_with_ids(
+                        [tool_calls_by_idx[k] for k in sorted(tool_calls_by_idx)],
+                        round_idx=round_idx,
+                    )
+                    followup_msgs.append(
+                        {
+                            "role": "assistant",
+                            "content": "".join(round_raw_parts) or None,
+                            "tool_calls": assembled_calls,
+                        }
+                    )
+                    tool_msgs, rec_delta = _execute_tool_call_batch(
+                        ctx,
+                        options,
+                        assembled_calls,
+                        round_idx=round_idx,
+                        tool_calls_log=tool_calls_log,
+                    )
+                    overflow_recovered += rec_delta
+                    followup_msgs.extend(tool_msgs)
+                    continue
+                for buffered_piece in buffered_pieces:
+                    yield _content_sse(buffered_piece)
+                break
         finally:
             if owns_client:
                 await client.aclose()
@@ -1076,7 +1300,7 @@ class SouthboundOpenAIClient:
         upstream_llm_ms = round((time.perf_counter() - llm_t0) * 1000.0, 2)
         upstream_prompt_tokens = int(upstream_usage.get("prompt_tokens") or 0)
         suspected_truncation = _compute_suspected_truncation(
-            llm_rounds=1,
+            llm_rounds=max(1, llm_rounds),
             upstream_prompt_tokens=upstream_prompt_tokens,
             exact_prompt_tokens=exact_prompt_tokens,
         )
@@ -1089,10 +1313,12 @@ class SouthboundOpenAIClient:
             overflow_recovered=overflow_recovered,
             kb_meta=kb_meta,
             note_rag_meta=note_rag_meta,
+            tool_calls_log=tool_calls_log if (allow_tools or tool_calls_log) else None,
             timings={
                 "engine_prep_ms": engine_prep_ms,
                 "upstream_llm_ms": upstream_llm_ms,
                 "total_latency_ms": round(engine_prep_ms + upstream_llm_ms, 2),
+                "llm_rounds": max(1, llm_rounds),
             },
             exact_prompt_tokens=exact_prompt_tokens,
             upstream_prompt_tokens=upstream_prompt_tokens,

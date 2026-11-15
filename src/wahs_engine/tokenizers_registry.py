@@ -114,8 +114,12 @@ def count_chat_messages_tokens(
         if msg.get("name"):
             total += counter(str(msg["name"]))
 
+    tok_lower = (tokenizer_family or "gemma4").lower()
     if msg_count > 0:
-        total += 8 + (5 * msg_count)
+        if "gemma" in tok_lower:
+            total += 8 + (5 * msg_count)
+        else:
+            total += 3 + (4 * msg_count)
 
     if tools:
         serialized_tools = json.dumps(list(tools), separators=(",", ":"), default=str)

@@ -689,5 +689,60 @@
       "plain_description": "Diastolic arterial blood pressure (bottom number) measuring pressure in the arteries when the heart rests between beats.",
       "reference_range": "Normal: < 80 mm[Hg]; Hypertension: >= 80–90 mm[Hg]"
     }
-  }
+  },
+  "hl7_restricted_security_codes": [
+    "R",
+    "V",
+    "ETH",
+    "PSY",
+    "SDV",
+    "HIV",
+    "SUD",
+    "42CFRPART2",
+    "SEX",
+    "DOMVIO",
+    "BH"
+  ],
+  "non_medical_administrative_codes": [
+    "314529007",
+    "160903007",
+    "160904001",
+    "73438004",
+    "741062008",
+    "224299000",
+    "473461003",
+    "73595000"
+  ],
+  "sensitive_screening_loinc_codes": {
+    "68518-0": "AUDIT-C alcohol screening score",
+    "72109-2": "AUDIT-C panel",
+    "82667-7": "DAST-10 drug abuse screening",
+    "76499-3": "HARK intimate partner violence screening",
+    "93038-8": "PRAPARE interpersonal safety / stress screen"
+  },
+  "lexical_sensitivity_patterns": [
+    "\\bcriminal\\s+record\\b",
+    "\\bincarcerat(?:ed|ion)\\b",
+    "\\bfelony\\b",
+    "\\bintimate\\s+partner\\s+(?:abuse|violence)\\b",
+    "\\bipv\\b",
+    "\\bdomestic\\s+(?:abuse|violence)\\b",
+    "\\bviolence\\s+in\\s+the\\s+environment\\b",
+    "\\bunhealthy\\s+alcohol\\b",
+    "\\balcohol\\s+abuse\\b",
+    "\\bdrug\\s+abuse\\b",
+    "\\bsubstance\\s+(?:abuse|use)\\b",
+    "\\bdast[- ]?10\\b",
+    "\\baudit[- ]?c\\b",
+    "\\bsexual\\s+assault\\b",
+    "\\blimited\\s+social\\s+contact\\b",
+    "\\bsocial\\s+isolation\\b"
+  ],
+  "clinic_room_device_patterns": [
+    "\\bdental\\s+x-ray\\s+system\\b",
+    "\\bradiography\\s+system\\b",
+    "\\boperating\\s+room\\b",
+    "\\bhospital\\s+bed\\b",
+    "\\bexamination\\s+table\\b"
+  ]
 }

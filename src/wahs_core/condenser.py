@@ -16,7 +16,6 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass
-from datetime import date, timedelta
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from .chart_serializer import render_chart
@@ -25,7 +24,6 @@ from .extractors import (
     ExtractedChart,
     NumericPoint,
     extract_bundle,
-    extract_bundle_lossless,
 )
 from .normalizers import classify_sensitivity
 
@@ -96,16 +94,6 @@ def _int_date(d: Optional[str]) -> int:
     return int(d.replace("-", ""))
 
 
-def _cutoff_iso(reference_date: Optional[str], days: int) -> str:
-    if not reference_date:
-        return "0000-00-00"
-    try:
-        ref = date.fromisoformat(reference_date[:10])
-        return (ref - timedelta(days=days)).isoformat()
-    except ValueError:
-        return "0000-00-00"
-
-
 def _merge_uuids(items: Sequence[ClinicalItem]) -> Tuple[str, ...]:
     out: List[str] = []
     for it in items:
@@ -126,6 +114,16 @@ def _span_phrase(dates: Sequence[Optional[str]]) -> Tuple[Optional[str], str]:
     return valid[-1], f"first recorded {valid[0]} through {valid[-1]}"
 
 
+def _disp_with_date(display: str, date_val: Optional[str], extra: str = "") -> str:
+    """Format ``display (qualifiers)`` safely without ever emitting ``'(None)'``."""
+    parts: List[str] = []
+    if date_val:
+        parts.append(date_val)
+    if extra:
+        parts.append(extra)
+    return f"{display} ({', '.join(parts)})" if parts else display
+
+
 def _fold_devices(devices: Sequence[ClinicalItem]) -> List[ClinicalItem]:
     """Fold repeated identical patient devices (e.g. annual CPAP appliance replacements) by (code/display, status)."""
     by_code: Dict[Tuple[str, str], List[ClinicalItem]] = {}
@@ -140,20 +138,23 @@ def _fold_devices(devices: Sequence[ClinicalItem]) -> List[ClinicalItem]:
             folded.append(latest)
             continue
         latest_date, span_str = _span_phrase([x.date for x in ordered])
+        span_part = f", {span_str}" if span_str else ""
+        eff_date = latest_date or latest.date
         folded.append(
             ClinicalItem(
                 resource_type="Device",
                 resource_uuid=latest.resource_uuid,
-                date=latest_date or latest.date,
-                clinical_date=latest_date or latest.clinical_date,
-                date_kind="clinical_event",
+                date=eff_date,
+                clinical_date=None,
+                date_kind="administrative" if eff_date else latest.date_kind,
                 section="device",
                 code=latest.code,
                 display=latest.display,
-                text=f"Device: {latest.display} (status: {latest.status}, {len(ordered)} records, {span_str})",
+                text=f"Device: {latest.display} (status: {latest.status}, {len(ordered)} records{span_part})",
                 mandatory=any(x.mandatory for x in ordered),
                 status=latest.status,
                 source_org=latest.source_org,
+                sensitivity=latest.sensitivity,
                 member_uuids=_merge_uuids(ordered),
             )
         )
@@ -175,17 +176,19 @@ def _fold_social_history(social_items: Sequence[ClinicalItem]) -> List[ClinicalI
             folded.append(latest)
             continue
         latest_date, span_str = _span_phrase([x.date for x in ordered])
+        span_part = f", {span_str}" if span_str else ""
+        eff_date = latest_date or latest.date
         folded.append(
             ClinicalItem(
                 resource_type="Observation",
                 resource_uuid=latest.resource_uuid,
-                date=latest_date or latest.date,
-                clinical_date=latest_date or latest.clinical_date,
-                date_kind="clinical_event",
+                date=eff_date,
+                clinical_date=eff_date,
+                date_kind="clinical_event" if eff_date else latest.date_kind,
                 section="social_history",
                 code=latest.code,
                 display=latest.display,
-                text=f"{latest.text} ({len(ordered)} assessments, {span_str})",
+                text=f"{latest.text} ({len(ordered)} assessments{span_part})",
                 mandatory=latest.mandatory,
                 status=latest.status,
                 sensitivity=latest.sensitivity,
@@ -197,8 +200,7 @@ def _fold_social_history(social_items: Sequence[ClinicalItem]) -> List[ClinicalI
 
 
 def _fold_encounters(encounters: Sequence[ClinicalItem], *, keep_latest_individual: int = 3) -> List[ClinicalItem]:
-    """Keep the `keep_latest_individual` most recent high-acuity encounters unpacked and fold older
-    repeated encounters by (display, class)."""
+    """Keep the `keep_latest_individual` most recent encounters unpacked and fold older repeated encounters."""
     ordered_desc = sorted(encounters, key=lambda x: _date_sort_key(x.date), reverse=True)
     kept = list(ordered_desc[:keep_latest_individual])
     older = ordered_desc[keep_latest_individual:]
@@ -219,23 +221,26 @@ def _fold_encounters(encounters: Sequence[ClinicalItem], *, keep_latest_individu
         latest_date, span_str = _span_phrase([x.date for x in chron])
         orgs = sorted({x.source_org for x in chron if x.source_org})
         org_str = f", facility: {orgs[0]}" if orgs else ""
+        span_prefix = f"{span_str}, " if span_str else ""
+        eff_date = latest_date or latest.date
         folded_older.append(
             ClinicalItem(
                 resource_type="Encounter",
                 resource_uuid=latest.resource_uuid,
-                date=latest_date or latest.date,
-                clinical_date=latest_date or latest.clinical_date,
-                date_kind="clinical_event",
+                date=eff_date,
+                clinical_date=eff_date,
+                date_kind="clinical_event" if eff_date else latest.date_kind,
                 section=latest.section,
                 code=latest.code,
                 display=latest.display,
                 text=(
                     f"Encounter History: {latest.display} — {len(chron)} visits "
-                    f"({span_str}, class: {latest.code}{org_str})"
+                    f"({span_prefix}class: {latest.code}{org_str})"
                 ),
                 mandatory=False,
                 status=latest.status,
                 source_org=latest.source_org,
+                sensitivity=latest.sensitivity,
                 is_routine=latest.is_routine,
                 member_uuids=_merge_uuids(chron),
             )
@@ -262,19 +267,21 @@ def _fold_lab_panels_by_type(
         chron = list(reversed(older))
         latest_older = chron[-1]
         l_date, span_str = _span_phrase([x.date for x in chron])
+        span_part = f" ({span_str})" if span_str else ""
+        eff_date = l_date or latest_older.date
         out.append(
             ClinicalItem(
                 resource_type=latest_older.resource_type,
                 resource_uuid=latest_older.resource_uuid,
-                date=l_date or latest_older.date,
-                clinical_date=l_date or latest_older.clinical_date,
-                date_kind="clinical_event",
+                date=eff_date,
+                clinical_date=eff_date,
+                date_kind="clinical_event" if eff_date else latest_older.date_kind,
                 section=latest_older.section,
                 code=latest_older.code,
                 display=latest_older.display,
                 text=(
                     f"Diagnostic Panel History — {latest_older.display}: "
-                    f"{len(chron)} prior panels ({span_str})"
+                    f"{len(chron)} prior panels{span_part}"
                 ),
                 mandatory=False,
                 status=latest_older.status,
@@ -309,23 +316,26 @@ def _fold_stopped_medications(meds: Sequence[ClinicalItem]) -> List[ClinicalItem
                 if r:
                     reasons.append(r)
         reason_str = f", reason: {', '.join(dict.fromkeys(reasons))}" if reasons else ""
+        span_prefix = f"{span_str}, " if span_str else ""
+        eff_date = latest_date or latest.date
         folded.append(
             ClinicalItem(
                 resource_type=latest.resource_type,
                 resource_uuid=latest.resource_uuid,
-                date=latest_date or latest.date,
-                clinical_date=latest_date or latest.clinical_date,
-                date_kind="clinical_event",
+                date=eff_date,
+                clinical_date=eff_date,
+                date_kind="clinical_event" if eff_date else latest.date_kind,
                 section="med_historical",
                 code=latest.code,
                 display=latest.display,
                 text=(
                     f"Medication History: {latest.display} — {len(ordered)} records "
-                    f"({span_str}, status: {latest.status}, type: {setting}{reason_str})"
+                    f"({span_prefix}status: {latest.status}, type: {setting}{reason_str})"
                 ),
                 mandatory=False,
                 status=latest.status,
                 source_org=latest.source_org,
+                sensitivity=latest.sensitivity,
                 ingredient_key=latest.ingredient_key,
                 member_uuids=_merge_uuids(ordered),
                 metadata={"count": len(ordered), "reasons": list(dict.fromkeys(reasons)), "setting": setting},
@@ -335,15 +345,12 @@ def _fold_stopped_medications(meds: Sequence[ClinicalItem]) -> List[ClinicalItem
 
 
 def _fold_resolved_conditions(conds: Sequence[ClinicalItem]) -> List[ClinicalItem]:
-    """Run-length fold resolved conditions by code/display while preserving sensitivity and conflict tags."""
-    anomalous = [c for c in conds if c.conflict_note]
-    routine = [c for c in conds if not c.conflict_note]
-
+    """Run-length fold resolved conditions by code/display cleanly without leaking sensitivity tags."""
     by_code: Dict[str, List[ClinicalItem]] = {}
-    for c in routine:
+    for c in conds:
         by_code.setdefault(c.code or c.display, []).append(c)
 
-    folded: List[ClinicalItem] = list(anomalous)
+    folded: List[ClinicalItem] = []
     for _code, group in by_code.items():
         ordered = sorted(group, key=lambda x: _date_sort_key(x.date))
         latest = ordered[-1]
@@ -356,24 +363,21 @@ def _fold_resolved_conditions(conds: Sequence[ClinicalItem]) -> List[ClinicalIte
             if x.metadata.get("abatement"):
                 all_dates.append(x.metadata.get("abatement"))
         latest_date, span_str = _span_phrase(all_dates)
-        sens_suffix = (
-            " [sensitivity: SDOH/PRIVACY-SENSITIVE]"
-            if latest.sensitivity == "SDOH/PRIVACY-SENSITIVE"
-            else ""
-        )
+        span_prefix = f"{span_str}, " if span_str else ""
+        eff_date = latest_date or latest.date
         folded.append(
             ClinicalItem(
                 resource_type="Condition",
                 resource_uuid=latest.resource_uuid,
-                date=latest_date or latest.date,
-                clinical_date=latest_date or latest.clinical_date,
-                date_kind="clinical_event",
+                date=eff_date,
+                clinical_date=eff_date,
+                date_kind="clinical_event" if eff_date else latest.date_kind,
                 section="condition_resolved",
                 code=latest.code,
                 display=latest.display,
                 text=(
                     f"Condition History: {latest.display} — {len(ordered)} episodes "
-                    f"({span_str}, status: {latest.status}, SNOMED: {latest.code}){sens_suffix}"
+                    f"({span_prefix}status: {latest.status}, SNOMED: {latest.code})"
                 ),
                 mandatory=False,
                 status=latest.status,
@@ -388,7 +392,7 @@ def _fold_resolved_conditions(conds: Sequence[ClinicalItem]) -> List[ClinicalIte
 
 
 def _fold_immunizations(imms: Sequence[ClinicalItem]) -> List[ClinicalItem]:
-    """Keep all anomalous/duplicate immunizations as individual lines; fold routine multi-dose series."""
+    """Keep anomalous or <=3-dose vaccine series unpacked individually; fold longer (>3-dose) routine series."""
     anomalous = [x for x in imms if x.conflict_note]
     routine = [x for x in imms if not x.conflict_note]
 
@@ -400,29 +404,32 @@ def _fold_immunizations(imms: Sequence[ClinicalItem]) -> List[ClinicalItem]:
     for _grp, group in by_group.items():
         ordered = sorted(group, key=lambda x: _date_sort_key(x.date))
         latest = ordered[-1]
-        if len(ordered) <= 2:
+        if len(ordered) <= 3:
             folded_routine.extend(ordered)
             continue
         latest_date, span_str = _span_phrase([x.date for x in ordered])
         orgs = sorted({x.source_org for x in ordered if x.source_org})
         org_str = f", sources: {'; '.join(orgs[:2])}" if orgs else ""
+        span_prefix = f"{span_str}, " if span_str else ""
+        eff_date = latest_date or latest.date
         folded_routine.append(
             ClinicalItem(
                 resource_type="Immunization",
                 resource_uuid=latest.resource_uuid,
-                date=latest_date or latest.date,
-                clinical_date=latest_date or latest.clinical_date,
-                date_kind="clinical_event",
+                date=eff_date,
+                clinical_date=eff_date,
+                date_kind="clinical_event" if eff_date else latest.date_kind,
                 section="immunization",
                 code=latest.code,
                 display=latest.display,
                 text=(
                     f"Immunization Series: {latest.display} — {len(ordered)} doses "
-                    f"({span_str}, status: completed, CVX: {latest.code}{org_str})"
+                    f"({span_prefix}status: completed, CVX: {latest.code}{org_str})"
                 ),
                 mandatory=False,
                 status=latest.status,
                 source_org=latest.source_org,
+                sensitivity=latest.sensitivity,
                 ingredient_key=latest.ingredient_key,
                 member_uuids=_merge_uuids(ordered),
             )
@@ -445,19 +452,22 @@ def _fold_procedures(procs: Sequence[ClinicalItem], *, section: str) -> List[Cli
             folded.append(latest)
             continue
         latest_date, span_str = _span_phrase([x.date for x in ordered])
+        span_part = f" ({span_str})" if span_str else ""
+        eff_date = latest_date or latest.date
         folded.append(
             ClinicalItem(
                 resource_type="Procedure",
                 resource_uuid=latest.resource_uuid,
-                date=latest_date or latest.date,
-                clinical_date=latest_date or latest.clinical_date,
-                date_kind="clinical_event",
+                date=eff_date,
+                clinical_date=eff_date,
+                date_kind="clinical_event" if eff_date else latest.date_kind,
                 section=section,
                 code=latest.code,
                 display=latest.display,
-                text=f"Procedure History: {latest.display} — {len(ordered)} times ({span_str})",
+                text=f"Procedure History: {latest.display} — {len(ordered)} times{span_part}",
                 mandatory=False,
                 status=latest.status,
+                sensitivity=latest.sensitivity,
                 is_routine=(section == "procedure_routine"),
                 member_uuids=_merge_uuids(ordered),
             )
@@ -475,7 +485,7 @@ def _group_vitals_by_date(vitals: Sequence[ClinicalItem]) -> List[ClinicalItem]:
         by_date.setdefault(v.date or "unknown", []).append(v)
 
     grouped: List[ClinicalItem] = []
-    for d, items_on_date in sorted(by_date.items(), reverse=True):
+    for _d, items_on_date in sorted(by_date.items(), reverse=True):
         if len(items_on_date) == 1:
             grouped.append(items_on_date[0])
             continue
@@ -501,13 +511,14 @@ def _group_vitals_by_date(vitals: Sequence[ClinicalItem]) -> List[ClinicalItem]:
                 resource_uuid=lead.resource_uuid,
                 date=lead.date,
                 clinical_date=lead.clinical_date,
-                date_kind="clinical_event",
+                date_kind="clinical_event" if lead.date else lead.date_kind,
                 section="vital_sign",
                 code="vital-signs-panel",
                 display="Vital Signs Panel",
                 text=f"Vital Signs Panel: {'; '.join(parts)}",
                 mandatory=False,
                 status="final",
+                sensitivity=lead.sensitivity,
                 is_routine=True,
                 member_uuids=_merge_uuids(items_on_date),
             )
@@ -606,8 +617,10 @@ def _build_lab_trajectories(
         )
 
         unit_sp = f" {unit}" if unit else ""
+        interp_tag = f" [interp: {latest.interpretation}]" if getattr(latest, "interpretation", None) else ""
+        latest_label = f"recorded {latest_day}" if latest_day else "date unknown"
         if len(dedup_pts) == 1:
-            text = f"Finding — {concept}: {fmt(latest.value)}{unit_sp} (recorded {latest_day}, n=1)"
+            text = f"Finding — {concept}: {fmt(latest.value)}{unit_sp}{interp_tag} ({latest_label}, n=1)"
         else:
             if latest.value > first.value:
                 direction = "up"
@@ -615,12 +628,20 @@ def _build_lab_trajectories(
                 direction = "down"
             else:
                 direction = "flat"
+            f_on = f" on {first_day}" if first_day else " (date unknown)"
+            l_on = f" on {latest_day}" if latest_day else " (date unknown)"
+            min_on = f" on {min_day}" if min_day else ""
+            max_on = f" on {max_day}" if max_day else ""
+            span_desc = (
+                f"first recorded {first_day} through {latest_day}, "
+                if (first_day and latest_day)
+                else ""
+            )
             text = (
-                f"Finding — {concept}: {fmt(latest.value)}{unit_sp} "
-                f"(initial {fmt(first.value)} on {first_day} -> latest {fmt(latest.value)} on {latest_day}; "
-                f"range {fmt(p_min.value)} on {min_day} to {fmt(p_max.value)} on {max_day}{unit_sp} "
-                f"over n={len(dedup_pts)} measurements, "
-                f"first recorded {first_day} through {latest_day}, trend: {direction})"
+                f"Finding — {concept}: {fmt(latest.value)}{unit_sp}{interp_tag} "
+                f"(initial {fmt(first.value)}{f_on} -> latest {fmt(latest.value)}{l_on}; "
+                f"range {fmt(p_min.value)}{min_on} to {fmt(p_max.value)}{max_on}{unit_sp} "
+                f"over n={len(dedup_pts)} measurements, {span_desc}trend: {direction})"
             )
         member_uuids = tuple(dict.fromkeys(p.resource_uuid for p in pts if p.resource_uuid))
         p_group, p_idx, _, _ = analyte_priority((clean_name, norm_unit))
@@ -628,9 +649,9 @@ def _build_lab_trajectories(
             ClinicalItem(
                 resource_type="Observation",
                 resource_uuid=latest.resource_uuid,
-                date=latest_day,
-                clinical_date=latest_day,
-                date_kind="clinical_event",
+                date=latest_day or None,
+                clinical_date=latest_day or None,
+                date_kind="clinical_event" if latest_day else "unknown",
                 section="lab_trajectory",
                 code=latest.code,
                 display=concept,
@@ -797,17 +818,11 @@ def _extract_note_conflict_clauses(
 
 
 def _excerpt_notes(notes: Sequence[ClinicalItem], max_chars: int = 400) -> List[ClinicalItem]:
-    """Excerpt clinical notes to `max_chars` for condensed Tiers 1..4 while keeping Tier 0 lossless."""
+    """Excerpt clinical notes to `max_chars` for condensed Stages while keeping raw text structural."""
     out: List[ClinicalItem] = []
     for n in notes:
         full_norm = str(n.metadata.get("full_text") or n.text or "")
         title = str(n.metadata.get("title") or n.display or "Clinical Note")
-        conf_suffix = f" [{n.conflict_note}]" if n.conflict_note else ""
-        sens_suffix = (
-            f" [sensitivity: {n.sensitivity}]"
-            if n.sensitivity == "SDOH/PRIVACY-SENSITIVE"
-            else ""
-        )
         if full_norm and len(full_norm) > max_chars:
             has_hold_clause = bool(_HOLD_CLAUSE_RE.search(full_norm))
             if n.conflict_note or has_hold_clause:
@@ -821,11 +836,9 @@ def _excerpt_notes(notes: Sequence[ClinicalItem], max_chars: int = 400) -> List[
                     excerpt = full_norm[:max_chars] + "..."
             else:
                 excerpt = full_norm[:max_chars] + "..."
-            txt = f"Note ({title}): {excerpt}{conf_suffix}{sens_suffix}"
+            txt = f"Note ({title}): {excerpt}"
         else:
             txt = n.text
-            if n.conflict_note and f"[{n.conflict_note}]" not in txt:
-                txt = f"{txt}{conf_suffix}"
         out.append(
             ClinicalItem(
                 resource_type=n.resource_type,
@@ -850,433 +863,6 @@ def _excerpt_notes(notes: Sequence[ClinicalItem], max_chars: int = 400) -> List[
             )
         )
     return out
-
-
-def _compact_item_for_micro_tier(item: ClinicalItem) -> ClinicalItem:
-    """Shorten verbose SNOMED/RxNorm/dosage boilerplate when building Tier 4 (<2k tokens) while
-    preserving all clinical facts, dates, conflict tags, and UUID provenance."""
-    txt = item.text
-    txt = re.sub(r",\s*(?:SNOMED|RxNorm|CVX):\s*[A-Za-z0-9._-]+", "", txt)
-    txt = re.sub(r",\s*type:\s*(?:prescribed|inpatient/administered)", "", txt)
-    txt = re.sub(r",\s*verification:\s*confirmed", "", txt)
-    return ClinicalItem(
-        resource_type=item.resource_type,
-        resource_uuid=item.resource_uuid,
-        date=item.date,
-        clinical_date=item.clinical_date,
-        date_kind=item.date_kind,
-        section=item.section,
-        code=item.code,
-        display=item.display,
-        text=txt,
-        mandatory=item.mandatory,
-        status=item.status,
-        end_date=item.end_date,
-        source_org=item.source_org,
-        sensitivity=item.sensitivity,
-        conflict_note=item.conflict_note,
-        ingredient_key=item.ingredient_key,
-        is_routine=item.is_routine,
-        member_uuids=item.member_uuids,
-        metadata=item.metadata,
-    )
-
-
-def build_tier_items(
-    extracted: ExtractedChart,
-    tier: int,
-    *,
-    mode: str = "full",
-    question: str = "",
-    sharing_posture: str = "patient_self",
-) -> Tuple[List[ClinicalItem], List[Dict[str, Any]], Dict[str, Any]]:
-    """Construct the ordered list of `ClinicalItem`s for `tier` in `{0, 1, 2, 3, 4}`."""
-    if tier not in {0, 1, 2, 3, 4}:
-        raise ValueError(f"Unsupported condensation tier: {tier}")
-
-    redacted: List[Dict[str, Any]] = []
-    redacted_uuids: Set[str] = set()
-    source_items: List[ClinicalItem] = []
-    for it in extracted.items:
-        eff_sens = it.sensitivity or (
-            classify_sensitivity(it.code, f"{it.display} {it.text}")
-            if sharing_posture == "external_share"
-            else None
-        )
-        if sharing_posture == "external_share" and eff_sens == "SDOH/PRIVACY-SENSITIVE":
-            redacted.append(
-                {
-                    "resourceType": it.resource_type,
-                    "resourceUuid": it.resource_uuid,
-                    "date": it.date,
-                    "display": "Redacted privacy-sensitive SDOH record",
-                    "sensitivity": eff_sens,
-                }
-            )
-            if it.resource_uuid:
-                redacted_uuids.add(it.resource_uuid)
-            for m_uuid in it.member_uuids:
-                if m_uuid:
-                    redacted_uuids.add(m_uuid)
-            continue
-        if mode == "reconcile" and it.section == "clinical_note":
-            continue
-        source_items.append(it)
-
-    allowed_numeric_points = [
-        pt
-        for pt in extracted.numeric_points
-        if pt.resource_uuid not in redacted_uuids
-        and not (
-            sharing_posture == "external_share"
-            and classify_sensitivity(pt.code, pt.concept, [pt.category]) == "SDOH/PRIVACY-SENSITIVE"
-        )
-    ]
-
-    patient_items = [x for x in source_items if x.section == "patient"]
-    allergies = [x for x in source_items if x.section == "allergy"]
-    cond_active = [x for x in source_items if x.section == "condition_active"]
-    cond_resolved = [x for x in source_items if x.section == "condition_resolved"]
-    med_active = [x for x in source_items if x.section == "med_active"]
-    med_hist = [x for x in source_items if x.section == "med_historical"]
-    imms = [x for x in source_items if x.section == "immunization"]
-    devices = [x for x in source_items if x.section == "device"]
-    careplans_active = [x for x in source_items if x.section == "careplan_active"]
-    careplans_hist = [x for x in source_items if x.section == "careplan_historical"]
-    procs_major = [x for x in source_items if x.section == "procedure_major"]
-    procs_routine = [x for x in source_items if x.section == "procedure_routine"]
-    enc_acuity = [x for x in source_items if x.section == "encounter_acuity"]
-    enc_routine = [x for x in source_items if x.section == "encounter_routine"]
-    lab_panels = [x for x in source_items if x.section == "lab_panel"]
-    survey_panels = [x for x in source_items if x.section == "survey_panel"]
-    vitals = [x for x in source_items if x.section == "vital_sign"]
-    labs_standalone = sorted(
-        [x for x in source_items if x.section == "lab_observation"],
-        key=lambda x: _date_sort_key(x.date),
-        reverse=True,
-    )
-    social_obs = [x for x in source_items if x.section == "social_history"]
-    survey_obs = sorted(
-        [x for x in source_items if x.section == "survey_observation"],
-        key=lambda x: _date_sort_key(x.date),
-        reverse=True,
-    )
-    other_obs = [x for x in source_items if x.section == "observation"]
-    imaging = sorted(
-        [x for x in source_items if x.section == "imaging"],
-        key=lambda x: _date_sort_key(x.date),
-        reverse=True,
-    )
-    notes = sorted(
-        [x for x in source_items if x.section == "clinical_note"],
-        key=lambda x: _date_sort_key(x.date),
-        reverse=True,
-    )
-    excerpted_notes = _excerpt_notes(notes, max_chars=400)
-
-    tier_names = {
-        0: "Full Normalized Ledger",
-        1: "Panel-Grouped & Renewal-Folded Ledger",
-        2: "IPS Core + 24m Horizon Window",
-        3: "IPS Core + Longitudinal Analyte Trajectories",
-        4: "IPS Micro-Capsule",
-    }
-
-    if tier == 0:
-        core = patient_items + allergies + cond_active + med_active + _fold_devices(devices)
-        rest = (
-            imms
-            + procs_major
-            + enc_acuity
-            + careplans_active
-            + lab_panels
-            + labs_standalone
-            + vitals
-            + social_obs
-            + other_obs
-            + notes
-            + imaging
-            + cond_resolved
-            + med_hist
-            + survey_panels
-            + survey_obs
-            + procs_routine
-            + careplans_hist
-            + enc_routine
-        )
-        rest.sort(key=lambda x: _date_sort_key(x.date), reverse=True)
-        body_items = core + rest
-
-    elif tier == 1:
-        folded_devices = _fold_devices(devices)
-        folded_med_hist = _fold_stopped_medications(med_hist)
-        folded_cond_res = _fold_resolved_conditions(cond_resolved)
-        folded_imms = _fold_immunizations(imms)
-        folded_procs_major = _fold_procedures(procs_major, section="procedure_major")
-        folded_procs_routine = _fold_procedures(procs_routine, section="procedure_routine")
-        folded_enc_acuity = _fold_encounters(enc_acuity, keep_latest_individual=5)
-        folded_enc_routine = _fold_encounters(enc_routine, keep_latest_individual=5)
-        grouped_vitals = _group_vitals_by_date(vitals)[:16]
-        folded_social = _fold_social_history(social_obs)
-        folded_labs = _fold_lab_panels_by_type(lab_panels, keep_latest_per_type=3)
-        folded_surveys = _fold_lab_panels_by_type(survey_panels, keep_latest_per_type=2)
-        trajectories = _build_lab_trajectories(allowed_numeric_points, max_analytes=24)
-
-        core = patient_items + allergies + cond_active + med_active + folded_devices
-        rest = (
-            folded_imms
-            + folded_procs_major
-            + folded_enc_acuity
-            + careplans_active
-            + folded_cond_res
-            + folded_med_hist
-            + trajectories
-            + folded_labs
-            + labs_standalone[:24]
-            + grouped_vitals
-            + folded_social
-            + other_obs
-            + excerpted_notes[:20]
-            + imaging
-            + folded_surveys
-            + survey_obs[:16]
-            + folded_procs_routine
-            + careplans_hist
-            + folded_enc_routine
-        )
-        rest.sort(key=lambda x: _date_sort_key(x.date), reverse=True)
-        body_items = core + rest
-
-    elif tier == 2:
-        cutoff_24m = _cutoff_iso(extracted.reference_date, 730)
-
-        folded_devices = _fold_devices(devices)
-        folded_med_hist = _fold_stopped_medications(med_hist)
-        folded_cond_res = _fold_resolved_conditions(cond_resolved)
-        folded_imms = _fold_immunizations(imms)
-        folded_procs_major = _fold_procedures(procs_major, section="procedure_major")
-        folded_procs_routine = _fold_procedures(procs_routine, section="procedure_routine")
-        folded_enc_acuity = _fold_encounters(enc_acuity, keep_latest_individual=3)
-        folded_enc_routine = _fold_encounters(enc_routine, keep_latest_individual=2)
-        grouped_vitals = _group_vitals_by_date(vitals)[:6]
-        folded_social = _fold_social_history(social_obs)
-        folded_labs = _fold_lab_panels_by_type(lab_panels, keep_latest_per_type=1)
-        folded_surveys = _fold_lab_panels_by_type(survey_panels, keep_latest_per_type=1)
-        trajectories = _build_lab_trajectories(allowed_numeric_points, max_analytes=24)
-
-        recent_notes = sorted(
-            [n for n in excerpted_notes if _date_sort_key(n.date) >= cutoff_24m],
-            key=lambda x: _date_sort_key(x.date),
-            reverse=True,
-        )[:6]
-        if not recent_notes and excerpted_notes:
-            recent_notes = excerpted_notes[:3]
-
-        core = patient_items + allergies + cond_active + med_active + folded_devices
-        rest = (
-            folded_imms
-            + folded_procs_major
-            + folded_enc_acuity
-            + careplans_active
-            + folded_cond_res
-            + folded_med_hist
-            + trajectories
-            + folded_labs
-            + labs_standalone[:10]
-            + grouped_vitals
-            + folded_social
-            + other_obs
-            + folded_surveys
-            + survey_obs[:8]
-            + recent_notes
-            + imaging[:6]
-            + folded_procs_routine[:8]
-            + folded_enc_routine
-        )
-        rest.sort(key=lambda x: _date_sort_key(x.date), reverse=True)
-        body_items = core + rest
-
-    elif tier == 3:
-        folded_devices = _fold_devices(devices)
-        folded_med_hist = _fold_stopped_medications(med_hist)
-        folded_cond_res = _fold_resolved_conditions(cond_resolved)
-        folded_imms = _fold_immunizations(imms)
-        folded_procs_major = _fold_procedures(procs_major, section="procedure_major")
-        folded_enc_acuity = _fold_encounters(enc_acuity, keep_latest_individual=2)
-        folded_social = _fold_social_history(social_obs)
-        trajectories = _build_lab_trajectories(allowed_numeric_points, max_analytes=22)
-
-        med_cond_res = [c for c in folded_cond_res if not c.is_routine]
-        sdoh_cond_res = [c for c in folded_cond_res if c.is_routine]
-        if sdoh_cond_res:
-            l_date, span_str = _span_phrase([c.date for c in sdoh_cond_res])
-            names = ", ".join(c.display for c in sdoh_cond_res[:6])
-            med_cond_res.append(
-                ClinicalItem(
-                    resource_type="Condition",
-                    resource_uuid=sdoh_cond_res[0].resource_uuid,
-                    date=l_date or extracted.reference_date,
-                    clinical_date=l_date or extracted.reference_date,
-                    date_kind="clinical_event",
-                    section="condition_resolved",
-                    code="sdoh-summary",
-                    display="Resolved Social/Administrative Findings",
-                    text=f"Condition History (Social/Admin): {names} ({span_str})",
-                    mandatory=False,
-                    is_routine=True,
-                    member_uuids=_merge_uuids(sdoh_cond_res),
-                )
-            )
-
-        anomalous_notes_t3 = [n for n in excerpted_notes if n.conflict_note]
-        other_notes_t3 = [n for n in excerpted_notes if not n.conflict_note]
-        core = patient_items + allergies + cond_active + med_active + folded_devices + anomalous_notes_t3
-        rest = (
-            folded_imms
-            + folded_procs_major[:10]
-            + folded_enc_acuity
-            + careplans_active
-            + trajectories
-            + med_cond_res
-            + folded_med_hist[:12]
-            + folded_social[:4]
-            + other_notes_t3[:1]
-        )
-        rest.sort(key=lambda x: _date_sort_key(x.date), reverse=True)
-        body_items = core + rest
-
-    else:
-        # Tier 4: IPS Micro-Capsule (<= 1k - 2k token budgets)
-        folded_devices = [_compact_item_for_micro_tier(x) for x in _fold_devices(devices)]
-        folded_imms = _fold_immunizations(imms)
-        anomalous_imms = [_compact_item_for_micro_tier(x) for x in folded_imms if x.conflict_note]
-        routine_imms = [x for x in folded_imms if not x.conflict_note]
-        imm_summary: List[ClinicalItem] = []
-        if routine_imms:
-            l_date, span_str = _span_phrase([x.date for x in routine_imms])
-            v_names = ", ".join(dict.fromkeys(x.display for x in routine_imms[:6]))
-            imm_summary.append(
-                ClinicalItem(
-                    resource_type="Immunization",
-                    resource_uuid=routine_imms[0].resource_uuid,
-                    date=l_date or extracted.reference_date,
-                    clinical_date=l_date or extracted.reference_date,
-                    date_kind="clinical_event",
-                    section="immunization",
-                    code="routine-immunizations",
-                    display="Routine Immunizations",
-                    text=f"Immunization Summary: {len(routine_imms)} routine vaccine series ({v_names}; {span_str})",
-                    mandatory=False,
-                    member_uuids=_merge_uuids(routine_imms),
-                )
-            )
-
-        compact_allergies = [_compact_item_for_micro_tier(x) for x in allergies]
-        compact_cond_active = [
-            _compact_item_for_micro_tier(x)
-            for x in cond_active
-            if x.sensitivity != "SDOH-SOCIAL"
-        ]
-        anomalous_cond_res = [
-            _compact_item_for_micro_tier(x)
-            for x in cond_resolved
-            if x.conflict_note
-        ]
-        sdoh_active = [x for x in cond_active if x.sensitivity == "SDOH-SOCIAL"]
-        if sdoh_active:
-            l_date, _ = _span_phrase([x.date for x in sdoh_active])
-            s_names = ", ".join(f"{x.display} ({x.date})" for x in sdoh_active)
-            compact_cond_active.append(
-                ClinicalItem(
-                    resource_type="Condition",
-                    resource_uuid=sdoh_active[0].resource_uuid,
-                    date=l_date or extracted.reference_date,
-                    clinical_date=l_date or extracted.reference_date,
-                    date_kind="clinical_event",
-                    section="condition_active",
-                    code="active-social-status",
-                    display="Active Social/Admin Findings",
-                    text=f"Condition (status: active, social/admin): {s_names}",
-                    mandatory=True,
-                    member_uuids=_merge_uuids(sdoh_active),
-                )
-            )
-        compact_med_active = [_compact_item_for_micro_tier(x) for x in med_active]
-
-        folded_med_hist = _fold_stopped_medications(med_hist)
-        inpatient_meds = [m for m in med_hist if m.resource_type == "MedicationAdministration"]
-        med_hist_summary: List[ClinicalItem] = []
-        if inpatient_meds:
-            l_date, span_str = _span_phrase([m.date for m in inpatient_meds])
-            m_names = ", ".join(dict.fromkeys(m.display for m in inpatient_meds[:6]))
-            med_hist_summary.append(
-                ClinicalItem(
-                    resource_type="MedicationAdministration",
-                    resource_uuid=inpatient_meds[-1].resource_uuid,
-                    date=l_date or extracted.reference_date,
-                    clinical_date=l_date or extracted.reference_date,
-                    date_kind="clinical_event",
-                    section="med_historical",
-                    code="inpatient-meds",
-                    display="Inpatient Medications",
-                    text=f"Inpatient/Perioperative Medications ({span_str}): {m_names}",
-                    mandatory=False,
-                    member_uuids=_merge_uuids(inpatient_meds),
-                )
-            )
-        if folded_med_hist:
-            l_date, span_str = _span_phrase([m.date for m in folded_med_hist])
-            m_names = ", ".join(dict.fromkeys(m.display for m in folded_med_hist[:8]))
-            med_hist_summary.append(
-                ClinicalItem(
-                    resource_type=folded_med_hist[0].resource_type,
-                    resource_uuid=folded_med_hist[0].resource_uuid,
-                    date=l_date or extracted.reference_date,
-                    clinical_date=l_date or extracted.reference_date,
-                    date_kind="clinical_event",
-                    section="med_historical",
-                    code="stopped-meds",
-                    display="Historical Medications",
-                    text=f"Stopped/Historical Medications ({span_str}): {m_names}",
-                    mandatory=False,
-                    member_uuids=_merge_uuids(folded_med_hist),
-                )
-            )
-
-        trajectories = _build_lab_trajectories(allowed_numeric_points, max_analytes=12)
-        folded_procs_major = _fold_procedures(procs_major, section="procedure_major")
-        folded_enc_acuity = _fold_encounters(enc_acuity, keep_latest_individual=1)
-
-        anomalous_notes_t4 = [_compact_item_for_micro_tier(n) for n in excerpted_notes if n.conflict_note]
-        core = (
-            patient_items
-            + compact_allergies
-            + compact_cond_active
-            + anomalous_cond_res
-            + compact_med_active
-            + anomalous_imms
-            + folded_devices
-            + anomalous_notes_t4
-        )
-        rest = (
-            trajectories
-            + med_hist_summary
-            + imm_summary
-            + folded_procs_major[:5]
-            + folded_enc_acuity[:3]
-        )
-        rest.sort(key=lambda x: _date_sort_key(x.date), reverse=True)
-        body_items = core + rest
-
-    manifest_item, manifest_dict = _build_completeness_manifest(
-        extracted, tier, tier_names[tier], body_items, len(redacted)
-    )
-    if body_items and body_items[0].section == "patient":
-        final_items = [body_items[0], manifest_item] + body_items[1:]
-    else:
-        final_items = [manifest_item] + body_items
-
-    return final_items, redacted, manifest_dict
 
 
 def items_to_querystore_records(items: Sequence[ClinicalItem]) -> List[Dict[str, Any]]:
@@ -1306,766 +892,6 @@ def items_to_querystore_records(items: Sequence[ClinicalItem]) -> List[Dict[str,
             }
         )
     return records
-
-
-def _pack_items_to_token_budget(
-    extracted: ExtractedChart,
-    items: Sequence[ClinicalItem],
-    redacted: List[Dict[str, Any]],
-    *,
-    tier: int,
-    tier_label: str,
-    target_tokens: int,
-    question: str,
-    token_counter: Callable[[str], int],
-) -> Tuple[List[ClinicalItem], Dict[str, Any], str, List[Dict[str, Any]], int]:
-    """Pack optional items below mandatory IPS safety core so rendered chart tokens <= target_tokens."""
-    q_terms = {
-        tok.lower()
-        for tok in re.findall(r"[A-Za-z0-9]+", question or "")
-        if len(tok) >= 3
-    }
-
-    mandatory_items = [it for it in items if it.mandatory and it.section != "manifest"]
-    optional_items = [it for it in items if not it.mandatory and it.section != "manifest"]
-
-    # Rank optional items by: (1) query keyword overlap, (2) section clinical priority, (3) recency
-    # LabTrajectory is ranked #1 among optional items so key numeric series (eGFR, HbA1c, BP, Weight)
-    # are always present even in tight 1,024-token capsules.
-    section_rank = {
-        "lab_trajectory": 1,
-        "med_historical": 2,
-        "procedure_major": 3,
-        "encounter_acuity": 4,
-        "immunization": 5,
-        "lab_panel": 6,
-        "lab_observation": 7,
-        "condition_resolved": 8,
-        "vital_sign": 9,
-        "careplan_active": 10,
-        "social_history": 11,
-        "clinical_note": 12,
-        "survey_panel": 13,
-        "imaging": 14,
-        "procedure_routine": 15,
-        "encounter_routine": 16,
-    }
-
-    ranked_optional = sorted(
-        optional_items,
-        key=lambda it: (
-            -sum(1 for t in q_terms if t in f"{it.display} {it.text}".lower()),
-            section_rank.get(it.section, 20),
-            0 if int(it.metadata.get("n_points", 0)) >= 2 else 1,
-            int(it.metadata.get("analyte_rank", 999)),
-            -_int_date(it.date),
-        ),
-    )
-
-    def render_candidate(
-        cand_body: Sequence[ClinicalItem],
-    ) -> Tuple[List[ClinicalItem], Dict[str, Any], str, List[Dict[str, Any]], int]:
-        manifest_item, manifest_dict = _build_completeness_manifest(
-            extracted, tier, tier_label, cand_body, len(redacted)
-        )
-        if cand_body and cand_body[0].section == "patient":
-            ordered = [cand_body[0], manifest_item] + list(cand_body[1:])
-        else:
-            ordered = [manifest_item] + list(cand_body)
-        recs = items_to_querystore_records(ordered)
-        c_text, c_maps = render_chart(recs)
-        toks = token_counter(c_text)
-        return ordered, manifest_dict, c_text, c_maps, toks
-
-    # Reserve at least ~280 tokens for top optional trajectories/history when target_tokens <= 1200
-    mandatory_ceiling = int(target_tokens * 0.68) if target_tokens <= 1200 else target_tokens
-    _, _, _, _, mand_tokens = render_candidate(mandatory_items)
-    if mand_tokens > mandatory_ceiling:
-        patient_only = [it for it in mandatory_items if it.section == "patient"]
-        allergy_only = [it for it in mandatory_items if it.section == "allergy"]
-        device_only = [it for it in mandatory_items if it.section == "device"]
-        conflict_conds = [
-            it
-            for it in mandatory_items
-            if it.section in {"condition_active", "condition_resolved"}
-            and (it.conflict_note or it.sensitivity == "SDOH/PRIVACY-SENSITIVE")
-        ]
-        conflict_imms = [
-            it
-            for it in mandatory_items
-            if it.section == "immunization" and it.conflict_note
-        ]
-        conflict_notes = [
-            it
-            for it in mandatory_items
-            if it.section in {"clinical_note", "note"}
-        ]
-        other_mandatory = [
-            it
-            for it in mandatory_items
-            if it.section
-            not in {
-                "patient",
-                "allergy",
-                "device",
-                "condition_active",
-                "condition_resolved",
-                "clinical_note",
-                "note",
-                "med_active",
-            }
-            and it not in conflict_imms
-        ]
-        other_conds = [
-            it
-            for it in mandatory_items
-            if it.section == "condition_active" and it not in conflict_conds
-        ]
-        other_meds = [
-            it
-            for it in mandatory_items
-            if it.section == "med_active"
-        ]
-        compact_conflict_notes: List[ClinicalItem] = []
-        for cn in conflict_notes:
-            raw_nt = str(cn.metadata.get("full_text") or cn.text or "")
-            clause_str = _extract_note_conflict_clauses(raw_nt, max_chars=120)
-            c_tag = f" [{cn.conflict_note}]" if cn.conflict_note else ""
-            compact_conflict_notes.append(
-                ClinicalItem(
-                    resource_type=cn.resource_type,
-                    resource_uuid=cn.resource_uuid,
-                    date=cn.date,
-                    clinical_date=cn.clinical_date,
-                    date_kind=cn.date_kind,
-                    section=cn.section,
-                    code=cn.code,
-                    display=cn.display,
-                    text=f"Note ({cn.display or 'Clinical Note'}): {clause_str}{c_tag}",
-                    mandatory=True,
-                    status=cn.status,
-                    conflict_note=cn.conflict_note,
-                    member_uuids=cn.member_uuids,
-                    metadata=cn.metadata,
-                )
-            )
-        compressed_mandatory: List[ClinicalItem] = list(
-            patient_only + allergy_only + compact_conflict_notes + other_mandatory
-        )
-        # Group conflict conditions that share the exact same conflict_note (e.g. CKD stages 1, 2, 3)
-        by_conflict_key: Dict[str, List[ClinicalItem]] = {}
-        for cc in conflict_conds:
-            key = cc.conflict_note or f"sens:{cc.resource_uuid}"
-            by_conflict_key.setdefault(key, []).append(cc)
-        for _ckey, cgroup in by_conflict_key.items():
-            lead = cgroup[-1]
-            l_date, _ = _span_phrase([x.date for x in cgroup])
-            has_mixed_status = any((x.status or "active") != "active" for x in cgroup)
-            if has_mixed_status:
-                names = "; ".join(
-                    f"{x.display} ({x.date}, status: {x.status or 'active'})" for x in cgroup
-                )
-                cond_prefix = "Condition:"
-            else:
-                names = "; ".join(f"{x.display} ({x.date})" for x in cgroup)
-                cond_prefix = "Condition (status: active):"
-            sens_tag = (
-                " [sensitivity: SDOH/PRIVACY-SENSITIVE]"
-                if any(x.sensitivity == "SDOH/PRIVACY-SENSITIVE" for x in cgroup)
-                else ""
-            )
-            note_tag = f" [{lead.conflict_note}]" if lead.conflict_note else ""
-            compressed_mandatory.append(
-                ClinicalItem(
-                    resource_type="Condition",
-                    resource_uuid=lead.resource_uuid,
-                    date=l_date or lead.date,
-                    clinical_date=l_date or lead.clinical_date,
-                    date_kind="clinical_event",
-                    section="condition_active",
-                    code=lead.code,
-                    display=lead.display,
-                    text=f"{cond_prefix} {names}{note_tag}{sens_tag}",
-                    mandatory=True,
-                    status=lead.status,
-                    sensitivity=lead.sensitivity,
-                    conflict_note=lead.conflict_note,
-                    member_uuids=_merge_uuids(cgroup),
-                )
-            )
-        for ci in conflict_imms:
-            compressed_mandatory.append(
-                ClinicalItem(
-                    resource_type="Immunization",
-                    resource_uuid=ci.resource_uuid,
-                    date=ci.date,
-                    clinical_date=ci.clinical_date,
-                    date_kind="clinical_event",
-                    section="immunization",
-                    code=ci.code,
-                    display=ci.display,
-                    text=f"Immunization: {ci.display} [{ci.conflict_note}]",
-                    mandatory=True,
-                    conflict_note=ci.conflict_note,
-                    member_uuids=ci.member_uuids,
-                )
-            )
-        if other_conds:
-            l_date, _ = _span_phrase([c.date for c in other_conds])
-            c_names = "; ".join(f"{c.display} ({c.date})" for c in other_conds)
-            compressed_mandatory.append(
-                ClinicalItem(
-                    resource_type="Condition",
-                    resource_uuid=other_conds[0].resource_uuid,
-                    date=l_date or extracted.reference_date,
-                    clinical_date=l_date or extracted.reference_date,
-                    date_kind="clinical_event",
-                    section="condition_active",
-                    code="active-conditions-folded",
-                    display="Active Conditions",
-                    text=f"Condition (status: active): {c_names}",
-                    mandatory=True,
-                    member_uuids=_merge_uuids(other_conds),
-                )
-            )
-        if other_meds:
-            l_date, span_str = _span_phrase([m.date for m in other_meds])
-            m_parts: List[str] = []
-            for m in other_meds:
-                dm = re.search(r"dosage:\s*([^,\)\]]+)", m.text)
-                dosage_str = dm.group(1).strip() if dm else ""
-                quals: List[str] = []
-                if m.date:
-                    quals.append(m.date)
-                if m.status and m.status != "active":
-                    quals.append(f"status: {m.status}")
-                if dosage_str:
-                    quals.append(f"dosage: {dosage_str}")
-                q_str = f" ({', '.join(quals)})" if quals else ""
-                c_str = f" [{m.conflict_note}]" if m.conflict_note else ""
-                m_parts.append(f"{m.display}{q_str}{c_str}")
-            compressed_mandatory.append(
-                ClinicalItem(
-                    resource_type=other_meds[0].resource_type,
-                    resource_uuid=other_meds[0].resource_uuid,
-                    date=l_date or extracted.reference_date,
-                    clinical_date=l_date or extracted.reference_date,
-                    date_kind="clinical_event",
-                    section="med_active",
-                    code="active-meds-folded",
-                    display="Active Medications",
-                    text=f"Medication (status: active): {'; '.join(m_parts)}",
-                    mandatory=True,
-                    member_uuids=_merge_uuids(other_meds),
-                )
-            )
-        if device_only:
-            l_date, _ = _span_phrase([d.date for d in device_only])
-            d_names = "; ".join(d.display for d in device_only)
-            compressed_mandatory.append(
-                ClinicalItem(
-                    resource_type="Device",
-                    resource_uuid=device_only[0].resource_uuid,
-                    date=l_date or extracted.reference_date,
-                    clinical_date=l_date or extracted.reference_date,
-                    date_kind="clinical_event",
-                    section="device",
-                    code="active-devices-folded",
-                    display="Active Devices",
-                    text=f"Device (status: active): {d_names}",
-                    mandatory=True,
-                    member_uuids=_merge_uuids(device_only),
-                )
-            )
-        _, _, _, _, mand_tokens_after = render_candidate(compressed_mandatory)
-        if mand_tokens_after > mandatory_ceiling:
-            tier_label = "IPS Ultra-Compact Micro-Capsule"
-            raw_all_conds = conflict_conds + other_conds
-            all_imms = [it for it in compressed_mandatory if it.section == "immunization"]
-            non_cond_imm_med = [
-                it
-                for it in compressed_mandatory
-                if it.section not in {"condition_active", "immunization", "med_active", "clinical_note", "note"}
-            ]
-            ultra: List[ClinicalItem] = list(non_cond_imm_med)
-            if conflict_notes:
-                l_date, _ = _span_phrase([cn.date for cn in conflict_notes])
-                per_note_chars = max(24, min(90, 220 // max(1, len(conflict_notes))))
-                n_parts: List[str] = []
-                for cn in conflict_notes:
-                    raw_nt = str(cn.metadata.get("full_text") or cn.text or "")
-                    c_clause = _extract_note_conflict_clauses(raw_nt, max_chars=per_note_chars)
-                    n_parts.append(f"{cn.date or 'note'}: {c_clause}")
-                lead_cn = conflict_notes[0]
-                c_tag = f" [{lead_cn.conflict_note}]" if lead_cn.conflict_note else ""
-                ultra.append(
-                    ClinicalItem(
-                        resource_type=lead_cn.resource_type,
-                        resource_uuid=lead_cn.resource_uuid,
-                        date=l_date or lead_cn.date,
-                        clinical_date=l_date or lead_cn.clinical_date,
-                        date_kind="clinical_event",
-                        section="clinical_note",
-                        code="conflict-notes-ultra",
-                        display="Clinical Note Alerts",
-                        text=f"Clinical Note Alerts: {'; '.join(n_parts)}{c_tag}",
-                        mandatory=True,
-                        conflict_note=lead_cn.conflict_note,
-                        member_uuids=_merge_uuids(conflict_notes),
-                    )
-                )
-            if raw_all_conds:
-                l_date, _ = _span_phrase([c.date for c in raw_all_conds])
-                has_non_active_cond = any((c.status or "active") != "active" for c in raw_all_conds)
-                c_parts = []
-                for c in raw_all_conds:
-                    tag = f" [{c.conflict_note}]" if c.conflict_note else ""
-                    sens = " [SDOH/PRIVACY-SENSITIVE]" if c.sensitivity == "SDOH/PRIVACY-SENSITIVE" else ""
-                    st_str = (
-                        f", status: {c.status or 'active'}"
-                        if has_non_active_cond
-                        else ""
-                    )
-                    c_parts.append(f"{c.display} ({c.date}{st_str}){tag}{sens}")
-                ultra_cond_prefix = "Condition:" if has_non_active_cond else "Condition (status: active):"
-                ultra.append(
-                    ClinicalItem(
-                        resource_type="Condition",
-                        resource_uuid=raw_all_conds[0].resource_uuid,
-                        date=l_date or extracted.reference_date,
-                        clinical_date=l_date or extracted.reference_date,
-                        date_kind="clinical_event",
-                        section="condition_active",
-                        code="active-conditions-ultra",
-                        display="Active Conditions",
-                        text=f"{ultra_cond_prefix} {'; '.join(c_parts)}",
-                        mandatory=True,
-                        member_uuids=_merge_uuids(raw_all_conds),
-                    )
-                )
-            if other_meds:
-                l_date, _ = _span_phrase([m.date for m in other_meds])
-                by_med_qual: Dict[Tuple[str, str, str], List[ClinicalItem]] = {}
-                for m in other_meds:
-                    dm = re.search(r"dosage:\s*([^,\)\]]+)", m.text)
-                    dosage_str = dm.group(1).strip() if dm else ""
-                    key_q = (m.status or "active", dosage_str, m.conflict_note or "")
-                    by_med_qual.setdefault(key_q, []).append(m)
-
-                def _build_ultra_med_text(
-                    include_dosage: bool,
-                    max_med_names: Optional[int] = None,
-                    compact_conflicts: bool = False,
-                ) -> str:
-                    group_strs: List[str] = []
-                    for (st, dos, conf), mgroup in by_med_qual.items():
-                        _, g_span = _span_phrase([x.date for x in mgroup])
-                        short_names = [
-                            re.sub(
-                                r"\s+Oral\s+(?:Tablet|Capsule|Solution)s?\b",
-                                "",
-                                x.display,
-                                flags=re.IGNORECASE,
-                            ).strip()
-                            for x in mgroup
-                        ]
-                        if max_med_names is not None and len(short_names) > max_med_names:
-                            omitted_n = len(short_names) - max_med_names
-                            names_joined = f"{', '.join(short_names[:max_med_names])} (+{omitted_n} more)"
-                        else:
-                            names_joined = ", ".join(short_names)
-                        quals: List[str] = []
-                        if g_span and not compact_conflicts:
-                            quals.append(g_span)
-                        if st and st != "active":
-                            quals.append(f"status: {st}")
-                        if include_dosage and dos:
-                            quals.append(f"dosage: {dos}")
-                        q_str = f" ({', '.join(quals)})" if quals else ""
-                        if conf and compact_conflicts:
-                            short_conf = "; ".join(
-                                p.split(":", 1)[0].strip() for p in conf.split(";") if p.strip()
-                            )
-                            c_str = f" [{short_conf}]"
-                        else:
-                            c_str = f" [{conf}]" if conf else ""
-                        group_strs.append(f"{names_joined}{q_str}{c_str}")
-                    return f"Medication (status: active): {'; '.join(group_strs)}"
-
-                med_ultra_text = _build_ultra_med_text(include_dosage=True)
-                med_ultra_item = ClinicalItem(
-                    resource_type=other_meds[0].resource_type,
-                    resource_uuid=other_meds[0].resource_uuid,
-                    date=l_date or extracted.reference_date,
-                    clinical_date=l_date or extracted.reference_date,
-                    date_kind="clinical_event",
-                    section="med_active",
-                    code="active-meds-ultra",
-                    display="Active Medications",
-                    text=med_ultra_text,
-                    mandatory=True,
-                    member_uuids=_merge_uuids(other_meds),
-                )
-                ultra.append(med_ultra_item)
-            if all_imms:
-                l_date, _ = _span_phrase([i.date for i in all_imms])
-                include_imm_notes = target_tokens >= 1024
-                i_parts = [
-                    f"{i.display} ({i.date}) [{i.conflict_note}]"
-                    if (include_imm_notes and i.conflict_note)
-                    else f"{i.display} ({i.date})"
-                    for i in all_imms
-                ]
-                ultra.append(
-                    ClinicalItem(
-                        resource_type="Immunization",
-                        resource_uuid=all_imms[0].resource_uuid,
-                        date=l_date or extracted.reference_date,
-                        clinical_date=l_date or extracted.reference_date,
-                        date_kind="clinical_event",
-                        section="immunization",
-                        code="anomalous-imms-ultra",
-                        display="Immunization Alerts",
-                        text=f"Immunization Alerts: {'; '.join(i_parts)}",
-                        mandatory=True,
-                        member_uuids=_merge_uuids(all_imms),
-                    )
-                )
-            if other_meds:
-                _, _, _, _, ultra_toks = render_candidate(ultra)
-                if ultra_toks > target_tokens:
-                    for idx_u, u_it in enumerate(ultra):
-                        if u_it.code == "active-meds-ultra":
-                            ultra[idx_u] = ClinicalItem(
-                                resource_type=u_it.resource_type,
-                                resource_uuid=u_it.resource_uuid,
-                                date=u_it.date,
-                                clinical_date=u_it.clinical_date,
-                                date_kind=u_it.date_kind,
-                                section=u_it.section,
-                                code=u_it.code,
-                                display=u_it.display,
-                                text=_build_ultra_med_text(include_dosage=False, compact_conflicts=True),
-                                mandatory=True,
-                                member_uuids=u_it.member_uuids,
-                            )
-                            break
-            mandatory_items = ultra
-        else:
-            mandatory_items = compressed_mandatory
-
-    accepted_optional: List[ClinicalItem] = []
-    if len(ranked_optional) > 60 or target_tokens > 4096:
-        _, _, _, _, running_toks = render_candidate(mandatory_items)
-        for opt in ranked_optional:
-            est_opt = max(6, token_counter(opt.text) + 5)
-            if running_toks + est_opt <= target_tokens:
-                accepted_optional.append(opt)
-                running_toks += est_opt
-        ordered, manifest_dict, c_text, c_maps, final_toks = render_candidate(
-            mandatory_items + sorted(accepted_optional, key=lambda x: _date_sort_key(x.date), reverse=True)
-        )
-        while final_toks > target_tokens and accepted_optional:
-            # Drop several items at once if far over budget, otherwise 1 by 1
-            drop_n = max(1, (final_toks - target_tokens) // 35)
-            del accepted_optional[-drop_n:]
-            ordered, manifest_dict, c_text, c_maps, final_toks = render_candidate(
-                mandatory_items + sorted(accepted_optional, key=lambda x: _date_sort_key(x.date), reverse=True)
-            )
-    else:
-        for opt in ranked_optional:
-            trial_body = mandatory_items + accepted_optional + [opt]
-            _, _, _, _, trial_toks = render_candidate(trial_body)
-            if trial_toks <= target_tokens:
-                accepted_optional.append(opt)
-        accepted_optional.sort(key=lambda x: _date_sort_key(x.date), reverse=True)
-        ordered, manifest_dict, c_text, c_maps, final_toks = render_candidate(
-            mandatory_items + accepted_optional
-        )
-    if final_toks > target_tokens:
-        raise ValueError(
-            f"target_tokens ({target_tokens}) is too small to fit mandatory clinical safety core ({final_toks} tokens required)"
-        )
-    return ordered, manifest_dict, c_text, c_maps, final_toks
-
-
-def _strip_prebaked_tags(item: ClinicalItem) -> ClinicalItem:
-    """Remove pre-baked `[conflict_note: ...]` / `[ingredient_group: ...]` / `[sensitivity: ...]`
-    annotations from `ClinicalItem.text` and reset `conflict_note=None` for `lossless_structural` mode.
-    """
-    cleaned_text = re.sub(
-        r"\s*\[(?:conflict_note:|ingredient_group:|acip_schedule_note:|duplicate_immunization_note:|note_medication_contradiction:|sensitivity:)[^\]]*\]",
-        "",
-        item.text or "",
-    )
-    is_core_mandatory = item.section in {
-        "patient",
-        "allergy",
-        "condition_active",
-        "med_active",
-    } or (item.section == "device" and item.status == "active")
-    return ClinicalItem(
-        resource_type=item.resource_type,
-        resource_uuid=item.resource_uuid,
-        date=item.date,
-        clinical_date=item.clinical_date,
-        date_kind=item.date_kind,
-        section=item.section,
-        code=item.code,
-        display=item.display,
-        text=cleaned_text,
-        mandatory=is_core_mandatory,
-        status=item.status,
-        end_date=item.end_date,
-        source_org=item.source_org,
-        sensitivity=None,
-        conflict_note=None,
-        ingredient_key=item.ingredient_key,
-        is_routine=item.is_routine,
-        member_uuids=item.member_uuids if item.section == "clinical_note" else (),
-        metadata=item.metadata,
-    )
-
-
-def _condense_lossless_structural(
-    extracted: ExtractedChart,
-    *,
-    target_tokens: int,
-    question: str,
-    sharing_posture: str,
-    token_counter: Callable[[str], int],
-) -> CondensedChartResult:
-    """Non-destructive structural condensation (`W12`):
-    - Strips FHIR JSON boilerplate without mutating clinical content or pre-annotating `[conflict_note]` tags.
-    - Preserves active conditions, active medications, allergies, and active patient devices verbatim
-      (1 line per FHIR resource; no folding by ingredient or clinical display).
-    - Orders optional records (lab trajectories, recent clinical notes, immunizations, resolved conditions,
-      historical medications, procedures, encounters) chronologically and packs them up to `target_tokens`
-      while recording exact overflow counts per section in `[Completeness Manifest]`.
-    """
-    from .normalizers import classify_sensitivity
-
-    redacted: List[Dict[str, Any]] = []
-    redacted_uuids: Set[str] = set()
-    clean_items: List[ClinicalItem] = []
-    for raw_it in extracted.items:
-        eff_sens = raw_it.sensitivity or (
-            classify_sensitivity(raw_it.code, f"{raw_it.display} {raw_it.text}")
-            if sharing_posture == "external_share"
-            else None
-        )
-        if sharing_posture == "external_share" and eff_sens == "SDOH/PRIVACY-SENSITIVE":
-            redacted.append(
-                {
-                    "resourceType": raw_it.resource_type,
-                    "resourceUuid": raw_it.resource_uuid,
-                    "date": raw_it.date,
-                    "display": "Redacted privacy-sensitive SDOH record",
-                    "sensitivity": eff_sens,
-                }
-            )
-            if raw_it.resource_uuid:
-                redacted_uuids.add(raw_it.resource_uuid)
-            for m_uuid in raw_it.member_uuids:
-                if m_uuid:
-                    redacted_uuids.add(m_uuid)
-            continue
-        clean_items.append(_strip_prebaked_tags(raw_it))
-
-    allowed_numeric_points = [
-        pt
-        for pt in extracted.numeric_points
-        if pt.resource_uuid not in redacted_uuids
-        and not (
-            sharing_posture == "external_share"
-            and classify_sensitivity(pt.code, pt.concept, [pt.category]) == "SDOH/PRIVACY-SENSITIVE"
-        )
-    ]
-    trajectories = _build_lab_trajectories(allowed_numeric_points, max_analytes=24)
-
-    mandatory_items = [it for it in clean_items if it.mandatory]
-    optional_raw = [it for it in clean_items if not it.mandatory] + trajectories
-
-    q_terms = {
-        tok.lower()
-        for tok in re.findall(r"[A-Za-z0-9]+", question or "")
-        if len(tok) >= 3
-    }
-    section_rank = {
-        "lab_trajectory": 1,
-        "immunization": 2,
-        "condition_resolved": 3,
-        "encounter_acuity": 4,
-        "procedure_major": 5,
-        "clinical_note": 6,
-        "med_historical": 7,
-        "vital_sign": 8,
-        "careplan_active": 9,
-        "lab_panel": 10,
-        "lab_observation": 11,
-        "social_history": 12,
-        "imaging": 13,
-        "survey_panel": 14,
-        "procedure_routine": 15,
-        "encounter_routine": 16,
-    }
-    if target_tokens >= 192000:
-        scale = 16.0
-    elif target_tokens >= 96000:
-        scale = 8.0
-    elif target_tokens >= 48000:
-        scale = 4.0
-    elif target_tokens >= 24000:
-        scale = 2.5
-    elif target_tokens >= 12000:
-        scale = 1.6
-    elif target_tokens >= 6000:
-        scale = 1.0
-    elif target_tokens >= 3000:
-        scale = 0.45
-    else:
-        scale = 0.20
-    primary_window_caps = {
-        "lab_trajectory": max(6, int(24 * scale)),
-        "immunization": max(3, int(24 * scale)),
-        "condition_resolved": max(3, int(25 * scale)),
-        "encounter_acuity": max(2, int(10 * scale)),
-        "procedure_major": max(3, int(18 * scale)),
-        "clinical_note": max(2, int(8 * scale)),
-        "med_historical": max(4, int(35 * scale)),
-        "vital_sign": max(4, int(12 * scale)),
-        "lab_panel": max(2, int(10 * scale)),
-    }
-    by_sec_ordered: Dict[str, List[ClinicalItem]] = {}
-    for it in optional_raw:
-        by_sec_ordered.setdefault(it.section, []).append(it)
-    within_sec_rank: Dict[int, int] = {}
-    for sec_name, sec_items in by_sec_ordered.items():
-        if sec_name == "med_historical":
-            sec_items.sort(
-                key=lambda x: (
-                    1 if x.metadata.get("setting") == "inpatient/administered" else 0,
-                    _date_sort_key(x.date),
-                ),
-                reverse=True,
-            )
-        else:
-            sec_items.sort(key=lambda x: _date_sort_key(x.date), reverse=True)
-        for idx_in_sec, x in enumerate(sec_items):
-            within_sec_rank[id(x)] = idx_in_sec
-
-    ranked_optional = sorted(
-        optional_raw,
-        key=lambda it: (
-            -sum(1 for t in q_terms if t in f"{it.display} {it.text}".lower()),
-            0 if within_sec_rank.get(id(it), 999) < primary_window_caps.get(it.section, 4) else 1,
-            section_rank.get(it.section, 20),
-            within_sec_rank.get(id(it), 999),
-            -_int_date(it.date),
-        ),
-    )
-
-    def render_structural(
-        cand_body: Sequence[ClinicalItem],
-        _legacy_omitted_by_sec: Dict[str, int],
-    ) -> Tuple[List[ClinicalItem], Dict[str, Any], str, List[Dict[str, Any]], int]:
-        _, probe_manifest = _build_completeness_manifest(
-            extracted, 0, "Lossless Structural Ledger", cand_body, len(redacted)
-        )
-        omitted_by_sec = dict(probe_manifest.get("omitted_by_section") or {})
-        tier_num = 0 if not omitted_by_sec else (1 if target_tokens >= 8192 else (2 if target_tokens >= 4096 else 3))
-        tier_label = (
-            "Lossless Structural Ledger"
-            if not omitted_by_sec
-            else f"Lossless Structural Window ({target_tokens}t budget)"
-        )
-        manifest_item, manifest_dict = _build_completeness_manifest(
-            extracted, tier_num, tier_label, cand_body, len(redacted)
-        )
-        if omitted_by_sec:
-            omitted_str = ", ".join(f"{k}={v}" for k, v in sorted(omitted_by_sec.items()))
-            manifest_item = ClinicalItem(
-                resource_type=manifest_item.resource_type,
-                resource_uuid=manifest_item.resource_uuid,
-                date=manifest_item.date,
-                clinical_date=manifest_item.clinical_date,
-                date_kind=manifest_item.date_kind,
-                section="manifest",
-                code=manifest_item.code,
-                display=manifest_item.display,
-                text=f"{manifest_item.text} | budget_overflow_omitted: {omitted_str}",
-                mandatory=True,
-                status="current",
-            )
-            manifest_dict["omitted_section_counts"] = dict(omitted_by_sec)
-        else:
-            manifest_dict["omitted_section_counts"] = {}
-        manifest_dict["condense_mode"] = "lossless_structural"
-
-        if cand_body and cand_body[0].section == "patient":
-            ordered = [cand_body[0], manifest_item] + list(cand_body[1:])
-        else:
-            ordered = [manifest_item] + list(cand_body)
-        recs = items_to_querystore_records(ordered)
-        c_text, c_maps = render_chart(recs)
-        toks = token_counter(c_text)
-        return ordered, manifest_dict, c_text, c_maps, toks
-
-    # Reserve at least 30% of budget for top trajectories/notes when mandatory items are large
-    mand_ceiling = int(target_tokens * 0.70) if target_tokens <= 4096 else target_tokens
-    kept_mandatory: List[ClinicalItem] = []
-    omitted_counts: Dict[str, int] = {}
-    running_est = 95  # manifest + header reserve
-    for m_it in mandatory_items:
-        est_it = max(8, token_counter(m_it.text) + 6)
-        if running_est + est_it <= mand_ceiling or m_it.section in {"patient", "allergy"}:
-            kept_mandatory.append(m_it)
-            running_est += est_it
-        else:
-            omitted_counts[m_it.section] = omitted_counts.get(m_it.section, 0) + 1
-
-    accepted_optional: List[ClinicalItem] = []
-    soft_ceiling = max(128, target_tokens - 90)
-    for opt in ranked_optional:
-        est_opt = max(8, token_counter(opt.text) + 6)
-        if running_est + est_opt <= soft_ceiling:
-            accepted_optional.append(opt)
-            running_est += est_opt
-        else:
-            omitted_counts[opt.section] = omitted_counts.get(opt.section, 0) + 1
-
-    final_items, manifest_dict, chart_text, mappings, actual_toks = render_structural(
-        kept_mandatory + sorted(accepted_optional, key=lambda x: _date_sort_key(x.date), reverse=True),
-        omitted_counts,
-    )
-    while actual_toks > target_tokens and accepted_optional:
-        dropped = accepted_optional.pop()
-        omitted_counts[dropped.section] = omitted_counts.get(dropped.section, 0) + 1
-        final_items, manifest_dict, chart_text, mappings, actual_toks = render_structural(
-            kept_mandatory + sorted(accepted_optional, key=lambda x: _date_sort_key(x.date), reverse=True),
-            omitted_counts,
-        )
-    records = items_to_querystore_records(final_items)
-    return CondensedChartResult(
-        tier=manifest_dict["tier"],
-        tier_name=manifest_dict["tier_name"],
-        target_tokens=target_tokens,
-        actual_tokens=actual_toks,
-        chart_text=chart_text,
-        records=records,
-        mappings=mappings,
-        completeness_manifest=manifest_dict,
-        redacted_for_privacy=redacted,
-        compression_stats={
-            "condense_mode": "lossless_structural",
-            "bundle_entries": extracted.total_bundle_entries,
-            "extracted_clinical_items": len(extracted.items),
-            "rendered_records": len(records),
-            "target_tokens": target_tokens,
-            "actual_tokens": actual_toks,
-            "budget_utilization": round(actual_toks / target_tokens, 3),
-        },
-    )
 
 
 def _filter_source_items_for_posture(
@@ -2170,7 +996,13 @@ def _build_stage_a_parts(
     folded_imms = _fold_immunizations(imms)
     folded_procs_major = _fold_procedures(procs_major, section="procedure_major")
     folded_procs_routine = _fold_procedures(procs_routine, section="procedure_routine")
-    folded_enc_acuity = _fold_encounters(enc_acuity, keep_latest_individual=5)
+    # Preserve every inpatient/ICU/ED/urgent encounter verbatim in Stage A so acute
+    # admissions are never collapsed into cumulative count lines.
+    folded_enc_acuity = sorted(
+        enc_acuity,
+        key=lambda x: _date_sort_key(x.date),
+        reverse=True,
+    )
     folded_enc_routine = _fold_encounters(enc_routine, keep_latest_individual=5)
     grouped_vitals = _group_vitals_by_date(vitals)
     folded_social = _fold_social_history(social_obs)
@@ -2270,7 +1102,6 @@ def _build_compressed_and_ultra_mandatory(
     for cn in conflict_notes:
         raw_nt = str(cn.metadata.get("full_text") or cn.text or "")
         clause_str = _extract_note_conflict_clauses(raw_nt, max_chars=260, include_vitals=True)
-        c_tag = f" [{cn.conflict_note}]" if cn.conflict_note else ""
         compact_conflict_notes.append(
             ClinicalItem(
                 resource_type=cn.resource_type,
@@ -2281,9 +1112,10 @@ def _build_compressed_and_ultra_mandatory(
                 section=cn.section,
                 code=cn.code,
                 display=cn.display,
-                text=f"Note ({cn.display or 'Clinical Note'}): {clause_str}{c_tag}",
+                text=f"Note ({cn.display or 'Clinical Note'}): {clause_str}",
                 mandatory=True,
                 status=cn.status,
+                sensitivity=cn.sensitivity,
                 conflict_note=cn.conflict_note,
                 member_uuids=cn.member_uuids,
                 metadata=cn.metadata,
@@ -2302,28 +1134,25 @@ def _build_compressed_and_ultra_mandatory(
         l_date, _ = _span_phrase([x.date for x in cgroup])
         has_mixed_status = any((x.status or "active") != "active" for x in cgroup)
         if has_mixed_status:
-            names = "; ".join(f"{x.display} ({x.date}, status: {x.status or 'active'})" for x in cgroup)
+            names = "; ".join(
+                _disp_with_date(x.display, x.date, f"status: {x.status or 'active'}")
+                for x in cgroup
+            )
             cond_prefix = "Condition:"
         else:
-            names = "; ".join(f"{x.display} ({x.date})" for x in cgroup)
+            names = "; ".join(_disp_with_date(x.display, x.date) for x in cgroup)
             cond_prefix = "Condition (status: active):"
-        sens_tag = (
-            " [sensitivity: SDOH/PRIVACY-SENSITIVE]"
-            if any(x.sensitivity == "SDOH/PRIVACY-SENSITIVE" for x in cgroup)
-            else ""
-        )
-        note_tag = f" [{lead.conflict_note}]" if lead.conflict_note else ""
         compressed_mandatory.append(
             ClinicalItem(
                 resource_type="Condition",
                 resource_uuid=lead.resource_uuid,
                 date=l_date or lead.date,
                 clinical_date=l_date or lead.clinical_date,
-                date_kind="clinical_event",
+                date_kind="clinical_event" if (l_date or lead.date) else lead.date_kind,
                 section="condition_active",
                 code=lead.code,
                 display=lead.display,
-                text=f"{cond_prefix} {names}{note_tag}{sens_tag}",
+                text=f"{cond_prefix} {names}",
                 mandatory=True,
                 status=lead.status,
                 sensitivity=lead.sensitivity,
@@ -2338,11 +1167,11 @@ def _build_compressed_and_ultra_mandatory(
                 resource_uuid=ci.resource_uuid,
                 date=ci.date,
                 clinical_date=ci.clinical_date,
-                date_kind="clinical_event",
+                date_kind="clinical_event" if ci.date else ci.date_kind,
                 section="immunization",
                 code=ci.code,
                 display=ci.display,
-                text=f"Immunization: {ci.display} [{ci.conflict_note}]",
+                text=f"Immunization: {_disp_with_date(ci.display, ci.date)}",
                 mandatory=True,
                 conflict_note=ci.conflict_note,
                 member_uuids=ci.member_uuids,
@@ -2350,14 +1179,14 @@ def _build_compressed_and_ultra_mandatory(
         )
     if other_conds:
         l_date, _ = _span_phrase([c.date for c in other_conds])
-        c_names = "; ".join(f"{c.display} ({c.date})" for c in other_conds)
+        c_names = "; ".join(_disp_with_date(c.display, c.date) for c in other_conds)
         compressed_mandatory.append(
             ClinicalItem(
                 resource_type="Condition",
                 resource_uuid=other_conds[0].resource_uuid,
-                date=l_date or extracted.reference_date,
-                clinical_date=l_date or extracted.reference_date,
-                date_kind="clinical_event",
+                date=l_date,
+                clinical_date=l_date,
+                date_kind="clinical_event" if l_date else "unknown",
                 section="condition_active",
                 code="active-conditions-folded",
                 display="Active Conditions",
@@ -2380,15 +1209,14 @@ def _build_compressed_and_ultra_mandatory(
             if dosage_str:
                 quals.append(f"dosage: {dosage_str}")
             q_str = f" ({', '.join(quals)})" if quals else ""
-            c_str = f" [{m.conflict_note}]" if m.conflict_note else ""
-            m_parts.append(f"{m.display}{q_str}{c_str}")
+            m_parts.append(f"{m.display}{q_str}")
         compressed_mandatory.append(
             ClinicalItem(
                 resource_type=other_meds[0].resource_type,
                 resource_uuid=other_meds[0].resource_uuid,
-                date=l_date or extracted.reference_date,
-                clinical_date=l_date or extracted.reference_date,
-                date_kind="clinical_event",
+                date=l_date,
+                clinical_date=l_date,
+                date_kind="clinical_event" if l_date else "unknown",
                 section="med_active",
                 code="active-meds-folded",
                 display="Active Medications",
@@ -2404,9 +1232,9 @@ def _build_compressed_and_ultra_mandatory(
             ClinicalItem(
                 resource_type="Device",
                 resource_uuid=device_only[0].resource_uuid,
-                date=l_date or extracted.reference_date,
-                clinical_date=l_date or extracted.reference_date,
-                date_kind="clinical_event",
+                date=l_date,
+                clinical_date=None,
+                date_kind="administrative" if l_date else device_only[0].date_kind,
                 section="device",
                 code="active-devices-folded",
                 display="Active Devices",
@@ -2433,18 +1261,17 @@ def _build_compressed_and_ultra_mandatory(
                 for cn in conflict_notes
             ]
             lead_cn = conflict_notes[0]
-            c_tag = f" [{lead_cn.conflict_note}]" if lead_cn.conflict_note else ""
             ultra.append(
                 ClinicalItem(
                     resource_type=lead_cn.resource_type,
                     resource_uuid=lead_cn.resource_uuid,
                     date=l_date or lead_cn.date,
                     clinical_date=l_date or lead_cn.clinical_date,
-                    date_kind="clinical_event",
+                    date_kind="clinical_event" if (l_date or lead_cn.date) else lead_cn.date_kind,
                     section="clinical_note",
                     code="conflict-notes-ultra",
-                    display="Clinical Note Alerts",
-                    text=f"Clinical Note Alerts: {'; '.join(n_parts)}{c_tag}",
+                    display="Clinical Notes",
+                    text=f"Clinical Notes: {'; '.join(n_parts)}",
                     mandatory=True,
                     conflict_note=lead_cn.conflict_note,
                     member_uuids=_merge_uuids(conflict_notes),
@@ -2454,25 +1281,21 @@ def _build_compressed_and_ultra_mandatory(
             l_date, _ = _span_phrase([c.date for c in raw_all_conds])
             has_non_active_cond = any((c.status or "active") != "active" for c in raw_all_conds)
             c_parts = []
-            seen_cond_conflicts: Set[str] = set()
             for c in raw_all_conds:
-                if c.conflict_note and (not compact_details or c.conflict_note not in seen_cond_conflicts):
-                    tag = f" [{c.conflict_note}]"
-                    seen_cond_conflicts.add(c.conflict_note)
+                extra_st = f"status: {c.status or 'active'}" if has_non_active_cond else ""
+                if compact_details:
+                    c_text_part = f"{c.display} ({extra_st})" if extra_st else f"{c.display}"
                 else:
-                    tag = ""
-                sens = " [SDOH/PRIVACY-SENSITIVE]" if c.sensitivity == "SDOH/PRIVACY-SENSITIVE" else ""
-                st_str = f", status: {c.status or 'active'}" if has_non_active_cond else ""
-                c_text_part = f"{c.display}" if compact_details else f"{c.display} ({c.date}{st_str})"
-                c_parts.append(f"{c_text_part}{tag}{sens}")
+                    c_text_part = _disp_with_date(c.display, c.date, extra_st)
+                c_parts.append(c_text_part)
             ultra_cond_prefix = "Condition:" if has_non_active_cond else "Condition (status: active):"
             ultra.append(
                 ClinicalItem(
                     resource_type="Condition",
                     resource_uuid=raw_all_conds[0].resource_uuid,
-                    date=l_date or extracted.reference_date,
-                    clinical_date=l_date or extracted.reference_date,
-                    date_kind="clinical_event",
+                    date=l_date,
+                    clinical_date=l_date,
+                    date_kind="clinical_event" if l_date else "unknown",
                     section="condition_active",
                     code="active-conditions-ultra",
                     display="Active Conditions",
@@ -2483,13 +1306,13 @@ def _build_compressed_and_ultra_mandatory(
             )
         if other_meds:
             l_date, _ = _span_phrase([m.date for m in other_meds])
-            by_med_qual: Dict[Tuple[str, str, str], List[ClinicalItem]] = {}
+            by_med_qual: Dict[Tuple[str, str], List[ClinicalItem]] = {}
             for m in other_meds:
                 dm = re.search(r"dosage:\s*([^,\)\]]+)", m.text)
                 dosage_str = dm.group(1).strip() if dm else ""
-                by_med_qual.setdefault((m.status or "active", dosage_str, m.conflict_note or ""), []).append(m)
+                by_med_qual.setdefault((m.status or "active", dosage_str), []).append(m)
             group_strs: List[str] = []
-            for (st, dos, conf), mgroup in by_med_qual.items():
+            for (st, dos), mgroup in by_med_qual.items():
                 _, g_span = _span_phrase([x.date for x in mgroup])
                 short_names = [
                     re.sub(r"\s+Oral\s+(?:Tablet|Capsule|Solution)s?\b", "", x.display, flags=re.IGNORECASE).strip()
@@ -2503,19 +1326,14 @@ def _build_compressed_and_ultra_mandatory(
                 if not compact_details and dos:
                     quals.append(f"dosage: {dos}")
                 q_str = f" ({', '.join(quals)})" if quals else ""
-                if conf and compact_details:
-                    short_conf = "; ".join(p.split(":", 1)[0].strip() for p in conf.split(";") if p.strip())
-                    c_str = f" [{short_conf}]"
-                else:
-                    c_str = f" [{conf}]" if conf else ""
-                group_strs.append(f"{', '.join(short_names)}{q_str}{c_str}")
+                group_strs.append(f"{', '.join(short_names)}{q_str}")
             ultra.append(
                 ClinicalItem(
                     resource_type=other_meds[0].resource_type,
                     resource_uuid=other_meds[0].resource_uuid,
-                    date=l_date or extracted.reference_date,
-                    clinical_date=l_date or extracted.reference_date,
-                    date_kind="clinical_event",
+                    date=l_date,
+                    clinical_date=l_date,
+                    date_kind="clinical_event" if l_date else "unknown",
                     section="med_active",
                     code="active-meds-ultra",
                     display="Active Medications",
@@ -2526,23 +1344,18 @@ def _build_compressed_and_ultra_mandatory(
             )
         if all_imms:
             l_date, _ = _span_phrase([i.date for i in all_imms])
-            i_parts = [
-                f"{i.display} ({i.date}) [{i.conflict_note}]"
-                if (target_tokens >= 1024 and i.conflict_note and not compact_details)
-                else f"{i.display} ({i.date})"
-                for i in all_imms
-            ]
+            i_parts = [_disp_with_date(i.display, i.date) for i in all_imms]
             ultra.append(
                 ClinicalItem(
                     resource_type="Immunization",
                     resource_uuid=all_imms[0].resource_uuid,
-                    date=l_date or extracted.reference_date,
-                    clinical_date=l_date or extracted.reference_date,
-                    date_kind="clinical_event",
+                    date=l_date,
+                    clinical_date=l_date,
+                    date_kind="clinical_event" if l_date else "unknown",
                     section="immunization",
                     code="anomalous-imms-ultra",
-                    display="Immunization Alerts",
-                    text=f"Immunization Alerts: {'; '.join(i_parts)}",
+                    display="Immunizations",
+                    text=f"Immunizations: {'; '.join(i_parts)}",
                     mandatory=True,
                     member_uuids=_merge_uuids(all_imms),
                 )
@@ -2927,45 +1740,23 @@ def condense_bundle_to_budget(
 ) -> CondensedChartResult:
     """Condense a FHIR R4 Bundle (or `ExtractedChart`) into `target_tokens`.
 
-    Supports two `condense_mode` strategies:
-    - `"tiered"` / `"hierarchical"` (default): 2-Stage Monotonic Condensation Pipeline (Stage A:
-      lossless normalization + redundant-repeat RLE with zero slice caps or note chops; Stage B:
-      strict prefix priority packing + progressive full-note expansion).
-    - `"lossless_structural"` (`W12`/`W15`): Non-destructive structural condensation that strips only FHIR
-      JSON syntax overhead and SHA-256 byte-identical Base64 duplicates while keeping active conditions,
-      active medications, allergies, and recent clinical records verbatim without pre-baked
-      `[conflict_note]` annotations.
+    Supports `condense_mode in {"tiered", "hierarchical"}` (2-Stage Monotonic
+    Structural Condensation Pipeline: Stage A lossless clinical normalization and
+    redundant-repeat RLE with unpacked inpatient acuity encounters; Stage B
+    strict prefix priority packing with progressive full-note expansion).
     """
     if not isinstance(target_tokens, int) or isinstance(target_tokens, bool) or target_tokens <= 0:
         raise ValueError("target_tokens must be a positive integer")
     if mode not in {"full", "reconcile"}:
         raise ValueError(f"Unsupported condensation mode: {mode!r}")
+    if condense_mode not in {"tiered", "hierarchical"}:
+        raise ValueError(
+            f"Unsupported condense_mode: {condense_mode!r}; expected 'tiered' or 'hierarchical'"
+        )
     if sharing_posture not in {"patient_self", "external_share"}:
         raise ValueError(f"Unsupported sharing_posture: {sharing_posture!r}")
 
     counter = token_counter or estimate_tokens_local
-    if condense_mode == "lossless_structural":
-        filter_equip = False if filter_room_equipment_devices is None else filter_room_equipment_devices
-        extracted = (
-            bundle
-            if isinstance(bundle, ExtractedChart)
-            else extract_bundle(
-                bundle,
-                include_conflict_annotations=False,
-                enable_privacy_classification=(sharing_posture == "external_share"),
-                preserve_intraday_timestamps=True,
-                preserve_all_note_sections=True,
-                filter_room_equipment_devices=filter_equip,
-            )
-        )
-        return _condense_lossless_structural(
-            extracted,
-            target_tokens=target_tokens,
-            question=question,
-            sharing_posture=sharing_posture,
-            token_counter=counter,
-        )
-
     filter_equip_tiered = True if filter_room_equipment_devices is None else filter_room_equipment_devices
     extracted = (
         bundle

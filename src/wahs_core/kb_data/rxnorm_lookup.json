@@ -61,7 +61,17 @@
     "aleve": "naproxen",
     "advil": "ibuprofen",
     "motrin": "ibuprofen",
-    "tylenol": "acetaminophen"
+    "tylenol": "acetaminophen",
+    "humalog": "insulin lispro",
+    "novolog": "insulin aspart",
+    "nitrolingual": "nitroglycerin",
+    "nitromist": "nitroglycerin",
+    "kefzol": "cefazolin",
+    "veetids": "penicillin v potassium",
+    "prevident": "sodium fluoride",
+    "forane": "isoflurane",
+    "hep-lock": "heparin",
+    "anaprox": "naproxen"
   },
   "therapeutic_class_rules": {
     "statin_lipid_lowering": {
@@ -449,5 +459,42 @@
       "brand_names": ["Protonix"],
       "plain_purpose": "Proton pump inhibitor (PPI) that reduces stomach acid to heal peptic ulcers and protect against gastrointestinal bleeding."
     }
-  }
+  },
+  "allergy_cross_reactivity_rules": [
+    {
+      "rule_id": "wahs-kb-allergy-penicillin-betalactam",
+      "allergen_tokens": ["penicillin", "amoxicillin", "ampicillin", "beta-lactam"],
+      "med_tokens": ["penicillin", "amoxicillin", "ampicillin", "augmentin", "clavulanate", "piperacillin", "tazobactam", "nafcillin", "oxacillin"],
+      "rationale": "Direct beta-lactam / penicillin class match — contraindicated in documented penicillin allergy unless formally desensitized",
+      "kb_source": "AAAAI / FDA Drug Allergy Practice Parameter"
+    },
+    {
+      "rule_id": "wahs-kb-allergy-cephalosporin-cross",
+      "allergen_tokens": ["penicillin", "amoxicillin", "ampicillin"],
+      "med_tokens": ["cefazolin", "cephalexin", "ceftriaxone", "cefuroxime", "cefepime", "cefdinir", "cephalosporin"],
+      "rationale": "Potential beta-lactam side-chain cross-reactivity alert with documented penicillin allergy (verify tolerability / low R1-side-chain cross-reactivity with cefazolin)",
+      "kb_source": "AAAAI / WAHS Perioperative Beta-Lactam Safety"
+    },
+    {
+      "rule_id": "wahs-kb-allergy-nsaid-aspirin",
+      "allergen_tokens": ["aspirin", "salicylate", "nsaid", "ibuprofen", "naproxen"],
+      "med_tokens": ["aspirin", "ibuprofen", "naproxen", "meloxicam", "ketorolac", "diclofenac", "celecoxib", "indomethacin", "salicylate"],
+      "rationale": "NSAID / salicylate cross-reactivity risk (aspirin-exacerbated respiratory disease, urticaria, or anaphylaxis)",
+      "kb_source": "FDA NSAID Hypersensitivity Safety Rule"
+    },
+    {
+      "rule_id": "wahs-kb-allergy-sulfonamide-abx",
+      "allergen_tokens": ["sulfa", "sulfonamide", "sulfamethoxazole", "bactrim"],
+      "med_tokens": ["sulfamethoxazole", "trimethoprim", "bactrim", "septra", "sulfasalazine", "sulfadiazine"],
+      "rationale": "Sulfonamide antibiotic allergy match",
+      "kb_source": "FDA Sulfonamide Hypersensitivity Rule"
+    },
+    {
+      "rule_id": "wahs-kb-allergy-ace-angioedema",
+      "allergen_tokens": ["lisinopril", "enalapril", "ramipril", "ace inhibitor"],
+      "med_tokens": ["lisinopril", "enalapril", "ramipril", "benazepril", "captopril", "quinapril"],
+      "rationale": "ACE inhibitor class match (contraindicated in history of ACE-inhibitor angioedema or hypersensitivity)",
+      "kb_source": "AHA/ACC Hypertension & Heart Failure Guideline"
+    }
+  ]
 }
