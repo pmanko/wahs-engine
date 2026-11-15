@@ -942,7 +942,9 @@ def _filter_source_items_for_posture(
     allowed_numeric_points = [
         pt
         for pt in extracted.numeric_points
-        if pt.resource_uuid not in redacted_uuids
+        if str(getattr(pt, "status", "") or "").strip().lower()
+        not in {"entered-in-error", "cancelled", "noshow"}
+        and pt.resource_uuid not in redacted_uuids
         and not (
             sharing_posture == "external_share"
             and classify_sensitivity(pt.code, pt.concept, [pt.category]) == "SDOH/PRIVACY-SENSITIVE"

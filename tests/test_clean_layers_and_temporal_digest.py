@@ -1071,3 +1071,176 @@ def test_offset_aware_timestamps_across_utc_midnight_keep_consistent_series_boun
     assert "latest 1.8 mg/dL on 2026-01-02" in digest.digest_text
     assert "window 2026-01-01..2026-01-02" in digest.digest_text
     assert "increasing +0.6" in digest.digest_text
+
+
+def test_invalidated_observations_excluded_from_numeric_trends() -> None:
+    """Entered-in-error and cancelled observations must never drive numeric trends or ceiling dates."""
+    from wahs_core.extractors import ExtractedChart, NumericPoint
+
+    bundle = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "p-inv-1", "birthDate": "1972-02-02"}},
+            {
+                "resource": {
+                    "resourceType": "Observation",
+                    "id": "obs-cr-valid-1",
+                    "status": "final",
+                    "category": [{"coding": [{"code": "laboratory"}]}],
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "2160-0", "display": "Creatinine"}], "text": "Creatinine"},
+                    "effectiveDateTime": "2026-01-05",
+                    "valueQuantity": {"value": 1.1, "unit": "mg/dL"},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Observation",
+                    "id": "obs-cr-valid-2",
+                    "status": "final",
+                    "category": [{"coding": [{"code": "laboratory"}]}],
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "2160-0", "display": "Creatinine"}], "text": "Creatinine"},
+                    "effectiveDateTime": "2026-01-15",
+                    "valueQuantity": {"value": 1.2, "unit": "mg/dL"},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Observation",
+                    "id": "obs-cr-err",
+                    "status": "entered-in-error",
+                    "category": [{"coding": [{"code": "laboratory"}]}],
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "2160-0", "display": "Creatinine"}], "text": "Creatinine"},
+                    "effectiveDateTime": "2026-03-01",
+                    "valueQuantity": {"value": 9.9, "unit": "mg/dL"},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Observation",
+                    "id": "obs-bp-cancelled",
+                    "status": "cancelled",
+                    "category": [{"coding": [{"code": "vital-signs"}]}],
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "85354-9", "display": "Blood pressure"}], "text": "Blood pressure"},
+                    "effectiveDateTime": "2026-03-02",
+                    "component": [
+                        {
+                            "code": {"coding": [{"system": "http://loinc.org", "code": "8480-6", "display": "Systolic BP"}]},
+                            "valueQuantity": {"value": 240, "unit": "mmHg"},
+                        }
+                    ],
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "DiagnosticReport",
+                    "id": "dr-err-1",
+                    "status": "entered-in-error",
+                    "code": {"text": "BMP Panel"},
+                    "effectiveDateTime": "2026-03-03",
+                    "conclusion": "Serum potassium 8.8 mmol/L",
+                }
+            },
+        ],
+    }
+
+    ext = extract_bundle(bundle)
+    assert [pt.value for pt in ext.numeric_points] == [1.1, 1.2]
+    assert ext.reference_date == "2026-01-15"
+
+    condensed = condense_bundle_to_budget(ext, target_tokens=8192)
+    digest = build_temporal_digest(ext, condensed=condensed)
+    assert "9.9" not in digest.digest_text
+    assert "240" not in digest.digest_text
+    assert "2026-03-01" not in digest.digest_text
+    assert "latest 1.2 mg/dL on 2026-01-15" in digest.digest_text
+
+    # Direct ExtractedChart with manual NumericPoint(status=...) is also filtered by build_temporal_digest
+    manual_chart = ExtractedChart(
+        patient_id="p-inv-manual",
+        patient_name="Manual Patient",
+        birth_date="1972-02-02",
+        reference_date="2026-01-15",
+        items=[],
+        numeric_points=[
+            NumericPoint(
+                resource_uuid="obs-valid-1",
+                date="2026-01-05",
+                code="2160-0",
+                concept="Creatinine",
+                value=1.0,
+                unit="mg/dL",
+                category="lab",
+                status="final",
+            ),
+            NumericPoint(
+                resource_uuid="obs-valid-2",
+                date="2026-01-15",
+                code="2160-0",
+                concept="Creatinine",
+                value=1.1,
+                unit="mg/dL",
+                category="lab",
+                status="final",
+            ),
+            NumericPoint(
+                resource_uuid="obs-manual-err",
+                date="2026-02-20",
+                code="2160-0",
+                concept="Creatinine",
+                value=9.5,
+                unit="mg/dL",
+                category="lab",
+                status="entered-in-error",
+            ),
+            NumericPoint(
+                resource_uuid="obs-manual-cancel",
+                date="2026-02-25",
+                code="2160-0",
+                concept="Creatinine",
+                value=8.4,
+                unit="mg/dL",
+                category="lab",
+                status="cancelled",
+            ),
+        ],
+        excluded_resource_counts={},
+        deduplicated_note_count=0,
+        total_bundle_entries=0,
+    )
+    manual_condensed = condense_bundle_to_budget(manual_chart, target_tokens=8192)
+    manual_digest = build_temporal_digest(manual_chart, manual_condensed)
+    assert "9.5" not in manual_digest.digest_text
+    assert "8.4" not in manual_digest.digest_text
+    assert "latest 1.1 mg/dL on 2026-01-15" in manual_digest.digest_text
+
+
+def test_fulfilled_appointment_populates_last_completed_clinical_encounter() -> None:
+    """A fulfilled Appointment represents a completed visit and sets the completed-encounter anchor."""
+    bundle = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "p-appt-ful-1", "birthDate": "1975-06-01"}},
+            {
+                "resource": {
+                    "resourceType": "Appointment",
+                    "id": "appt-ful-1",
+                    "status": "fulfilled",
+                    "description": "Nephrology Follow-up",
+                    "start": "2026-03-10T10:00:00Z",
+                    "end": "2026-03-10T10:30:00Z",
+                }
+            },
+        ],
+    }
+
+    ext = extract_bundle(bundle)
+    condensed = condense_bundle_to_budget(ext, target_tokens=8192)
+    digest = build_temporal_digest(ext, condensed=condensed)
+
+    assert digest.reference_date == "2026-03-10"
+    assert digest.summary["last_clinical_encounter_date"] == "2026-03-10"
+    assert "- Last Completed Clinical Encounter:" in digest.digest_text
+    assert "2026-03-10" in digest.digest_text
+    assert "- Upcoming Scheduled Encounters" not in digest.digest_text

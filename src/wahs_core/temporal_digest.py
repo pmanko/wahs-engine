@@ -31,7 +31,7 @@ _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 _UPCOMING_ENCOUNTER_STATUSES: Set[str] = {"planned", "booked", "scheduled", "proposed", "pending", "waitlist"}
 _FUTURE_APPT_STATUSES: Set[str] = {"planned", "booked", "scheduled", "proposed", "pending", "waitlist"}
 _EXCLUDED_EVENT_STATUSES: Set[str] = {"cancelled", "entered-in-error", "noshow"}
-_COMPLETED_ENCOUNTER_STATUSES: Set[str] = {"finished", "completed", ""}
+_COMPLETED_ENCOUNTER_STATUSES: Set[str] = {"finished", "completed", "fulfilled", ""}
 _STOPPED_MED_STATUSES: Set[str] = {
     "stopped",
     "cancelled",
@@ -247,6 +247,9 @@ def _collect_numeric_series(
     seen_point_keys: Set[Tuple[str, str, str, float]] = set()
 
     for pt in points:
+        pt_status = str(getattr(pt, "status", "") or "").strip().lower()
+        if pt_status in _EXCLUDED_EVENT_STATUSES:
+            continue
         if pt.resource_uuid and pt.resource_uuid in redacted_uuids:
             continue
         if is_external and classify_sensitivity(pt.code, pt.concept, [pt.category]) == "SDOH/PRIVACY-SENSITIVE":
@@ -410,8 +413,14 @@ def build_temporal_digest(
                 uuid_to_cit.setdefault(k, v)
 
     redacted_uuids: Set[str] = set()
+    invalidated_uuids: Set[str] = set()
     kept_items: List[ClinicalItem] = []
     for it in extracted.items:
+        st_it = (it.status or "").strip().lower()
+        if st_it in _EXCLUDED_EVENT_STATUSES:
+            if it.resource_uuid:
+                invalidated_uuids.add(it.resource_uuid)
+            invalidated_uuids.update(u for u in it.member_uuids if u)
         if is_external and _is_sensitive_item(it):
             if it.resource_uuid:
                 redacted_uuids.add(it.resource_uuid)
@@ -455,7 +464,10 @@ def build_temporal_digest(
 
         if c_dt is not None:
             completed_clinical_dates.append((c_dt, it))
-            is_encounter = it.section in {"encounter_acuity", "encounter_routine"} or it.resource_type == "Encounter"
+            is_encounter = it.section in {"encounter_acuity", "encounter_routine"} or it.resource_type in {
+                "Encounter",
+                "Appointment",
+            }
             if is_encounter and st in _COMPLETED_ENCOUNTER_STATUSES:
                 encounters_completed.append((c_dt, it))
         elif any_dt is not None and it.section not in _ADMIN_SECTIONS and it.date_kind != "administrative":
@@ -533,7 +545,7 @@ def build_temporal_digest(
     # 2. Longitudinal Numeric Series (with no-trend-from-one-point guard & stem dedup)
     ranked_series, total_series_count, multi_point_count = _collect_numeric_series(
         extracted.numeric_points,
-        redacted_uuids=redacted_uuids,
+        redacted_uuids=(redacted_uuids | invalidated_uuids),
         is_external=is_external,
         uuid_to_cit=uuid_to_cit,
         q_terms=q_terms,

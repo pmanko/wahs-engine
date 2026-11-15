@@ -1017,6 +1017,12 @@ class ClinicalEntityGraph:
         # Group numeric_points by code/concept into trajectory Observation nodes
         series_by_key: Dict[str, List[NumericPoint]] = {}
         for pt in extracted.numeric_points:
+            if str(getattr(pt, "status", "") or "").strip().lower() in {
+                "entered-in-error",
+                "cancelled",
+                "noshow",
+            }:
+                continue
             if pt.resource_uuid and pt.resource_uuid in redacted_uuids:
                 continue
             if is_external and classify_sensitivity(pt.code, pt.concept, [pt.category]) == "SDOH/PRIVACY-SENSITIVE":

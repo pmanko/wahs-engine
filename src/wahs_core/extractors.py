@@ -97,6 +97,7 @@ class NumericPoint:
     reference_range: Optional[str] = None
     is_abnormal: bool = False
     timestamp: str = ""
+    status: str = ""
 
 
 @dataclass
@@ -1296,6 +1297,8 @@ def extract_bundle(
         )
 
     # 7. Extract DiagnosticReport Lab & Survey Panels (and track claimed child Observations)
+    _INVALIDATED_OBS_STATUSES = {"entered-in-error", "cancelled"}
+
     def _extract_obs_components(
         obs_res: Mapping[str, Any],
         obs_uuid: str,
@@ -1303,11 +1306,14 @@ def extract_bundle(
         obs_cat: str,
         obs_cats: Sequence[str],
         obs_ts: str = "",
+        obs_status: str = "",
+        include_numeric_points: bool = True,
     ) -> Tuple[List[NumericPoint], List[str], Optional[str], List[Dict[str, Any]], bool]:
         pts: List[NumericPoint] = []
         comp_sens: List[str] = []
         comp_src: Optional[str] = None
         comp_entries: List[Dict[str, Any]] = []
+        structured_comp_count = 0
         parent_sec_codes = _extract_meta_security_codes(obs_res)
         raw_components = [c for c in (obs_res.get("component") or []) if isinstance(c, Mapping)]
         for comp in raw_components:
@@ -1327,39 +1333,45 @@ def extract_bundle(
                     comp, None if c_cmp else c_num
                 )
                 if not c_cmp and c_num is not None:
-                    pts.append(
-                        NumericPoint(
-                            resource_uuid=obs_uuid,
-                            date=obs_date,
-                            code=c_code or c_disp,
-                            concept=c_disp or c_code,
-                            value=c_num,
-                            unit=c_unit,
-                            category=obs_cat,
-                            interpretation=c_interp,
-                            reference_range=c_rr,
-                            is_abnormal=c_abn,
-                            timestamp=obs_ts or _sort_timestamp_key(obs_date),
+                    structured_comp_count += 1
+                    if include_numeric_points:
+                        pts.append(
+                            NumericPoint(
+                                resource_uuid=obs_uuid,
+                                date=obs_date,
+                                code=c_code or c_disp,
+                                concept=c_disp or c_code,
+                                value=c_num,
+                                unit=c_unit,
+                                category=obs_cat,
+                                interpretation=c_interp,
+                                reference_range=c_rr,
+                                is_abnormal=c_abn,
+                                timestamp=obs_ts or _sort_timestamp_key(obs_date),
+                                status=obs_status,
+                            )
                         )
-                    )
                 elif c_cmp:
-                    comp_entry = {
-                        "resource_uuid": obs_uuid,
-                        "date": obs_date,
-                        "code": c_code or c_disp,
-                        "concept": c_disp or c_code or "Component",
-                        "display": c_disp or c_code or "Component",
-                        "category": obs_cat,
-                        "comparator": c_cmp,
-                        "value": c_val_str,
-                        "numeric": None,
-                        "threshold": c_num,
-                        "unit": c_unit,
-                        "interpretation": c_interp,
-                        "reference_range": c_rr,
-                        "is_abnormal": c_abn,
-                        "sensitivity": "",
-                    }
+                    structured_comp_count += 1
+                    if include_numeric_points:
+                        comp_entry = {
+                            "resource_uuid": obs_uuid,
+                            "date": obs_date,
+                            "code": c_code or c_disp,
+                            "concept": c_disp or c_code or "Component",
+                            "display": c_disp or c_code or "Component",
+                            "category": obs_cat,
+                            "comparator": c_cmp,
+                            "value": c_val_str,
+                            "numeric": None,
+                            "threshold": c_num,
+                            "unit": c_unit,
+                            "interpretation": c_interp,
+                            "reference_range": c_rr,
+                            "is_abnormal": c_abn,
+                            "status": obs_status,
+                            "sensitivity": "",
+                        }
             else:
                 _, vc_disp = _coding_pair(comp.get("valueCodeableConcept"))
                 c_val_str = vc_disp
@@ -1376,7 +1388,7 @@ def extract_bundle(
             if comp_entry is not None:
                 comp_entries.append(comp_entry)
         all_comp_structured = bool(raw_components) and (
-            len(pts) + len(comp_entries) == len(raw_components)
+            structured_comp_count == len(raw_components)
         )
         return pts, comp_sens, comp_src, comp_entries, all_comp_structured
 
@@ -1388,6 +1400,8 @@ def extract_bundle(
         if not result_refs:
             continue
         rid = str(res.get("id") or "")
+        dr_status = str(res.get("status") or "final").strip().lower()
+        dr_invalid = dr_status in _INVALIDATED_OBS_STATUSES
         code, disp = _coding_pair(res.get("code"))
         p_date_raw = res.get("effectiveDateTime") or res.get("issued")
         p_date = _iso_date(p_date_raw)
@@ -1419,6 +1433,8 @@ def extract_bundle(
                 if r_disp:
                     child_parts.append(r_disp)
                 continue
+            child_status = str(child_obs.get("status") or "final").strip().lower()
+            child_invalid = dr_invalid or (child_status in _INVALIDATED_OBS_STATUSES)
             o_code, o_disp = _coding_pair(child_obs.get("code"))
             val_str, num_val, unit = _format_obs_value(child_obs)
             o_interp, o_range, o_abn = _extract_obs_interpretation_and_range(child_obs, num_val)
@@ -1438,7 +1454,7 @@ def extract_bundle(
             if o_sens_src:
                 child_sens_sources.append(o_sens_src)
             short_label = o_disp or o_code or "item"
-            if o_abn:
+            if o_abn and not child_invalid:
                 panel_abn = True
                 if o_interp:
                     panel_interps.append(o_interp)
@@ -1453,7 +1469,14 @@ def extract_bundle(
                     child_comp_entries,
                     child_comp_structured,
                 ) = _extract_obs_components(
-                    child_obs, oid, o_date or "", o_primary_cat, o_cats, obs_ts=o_sort_ts
+                    child_obs,
+                    oid,
+                    o_date or "",
+                    o_primary_cat,
+                    o_cats,
+                    obs_ts=o_sort_ts,
+                    obs_status=child_status,
+                    include_numeric_points=not child_invalid,
                 )
                 if child_comp_structured:
                     structured_child_count += 1
@@ -1474,21 +1497,23 @@ def extract_bundle(
                         panel_interps.append(pt.interpretation)
             elif num_val is not None:
                 structured_child_count += 1
-                numeric_points.append(
-                    NumericPoint(
-                        resource_uuid=oid,
-                        date=o_date or "",
-                        code=o_code or short_label,
-                        concept=short_label,
-                        value=num_val,
-                        unit=unit,
-                        category=o_primary_cat,
-                        interpretation=o_interp,
-                        reference_range=o_range,
-                        is_abnormal=o_abn,
-                        timestamp=o_sort_ts,
+                if not child_invalid:
+                    numeric_points.append(
+                        NumericPoint(
+                            resource_uuid=oid,
+                            date=o_date or "",
+                            code=o_code or short_label,
+                            concept=short_label,
+                            value=num_val,
+                            unit=unit,
+                            category=o_primary_cat,
+                            interpretation=o_interp,
+                            reference_range=o_range,
+                            is_abnormal=o_abn,
+                            timestamp=o_sort_ts,
+                            status=child_status,
+                        )
                     )
-                )
             else:
                 vq_child = child_obs.get("valueQuantity")
                 o_cmp = (
@@ -1502,25 +1527,27 @@ def extract_bundle(
                         o_thresh: Optional[float] = float(vq_child["value"])
                     except (TypeError, ValueError):
                         o_thresh = None
-                    panel_comp_entries.append(
-                        {
-                            "resource_uuid": oid,
-                            "date": o_date or "",
-                            "code": o_code or short_label,
-                            "concept": short_label,
-                            "display": short_label,
-                            "category": o_primary_cat,
-                            "comparator": o_cmp,
-                            "value": val_str,
-                            "numeric": None,
-                            "threshold": o_thresh,
-                            "unit": unit,
-                            "interpretation": o_interp,
-                            "reference_range": o_range,
-                            "is_abnormal": o_abn,
-                            "sensitivity": o_sens or "",
-                        }
-                    )
+                    if not child_invalid:
+                        panel_comp_entries.append(
+                            {
+                                "resource_uuid": oid,
+                                "date": o_date or "",
+                                "code": o_code or short_label,
+                                "concept": short_label,
+                                "display": short_label,
+                                "category": o_primary_cat,
+                                "comparator": o_cmp,
+                                "value": val_str,
+                                "numeric": None,
+                                "threshold": o_thresh,
+                                "unit": unit,
+                                "interpretation": o_interp,
+                                "reference_range": o_range,
+                                "is_abnormal": o_abn,
+                                "status": child_status,
+                                "sensitivity": o_sens or "",
+                            }
+                        )
             if val_str:
                 annot_bits: List[str] = []
                 child_interp_disp = o_interp or ", ".join(
@@ -1579,14 +1606,14 @@ def extract_bundle(
                 resource_type="DiagnosticReport",
                 resource_uuid=rid,
                 date=p_date,
-                clinical_date=p_date,
-                date_kind="clinical_event" if p_date else "unknown",
+                clinical_date=None if dr_invalid else p_date,
+                date_kind="clinical_event" if (p_date and not dr_invalid) else "unknown",
                 section="survey_panel" if is_survey else "lab_panel",
                 code=code or disp,
                 display=disp or code or "Diagnostic Report",
                 text=f"{panel_prefix} — {disp or code}: {joined_children}",
                 mandatory=False,
-                status=str(res.get("status") or "final").lower(),
+                status=dr_status,
                 source_org=resolve_source_org(res),
                 sensitivity=panel_sens,
                 is_routine=is_survey,
@@ -1602,6 +1629,8 @@ def extract_bundle(
         rid = str(res.get("id") or "")
         if rid in claimed_obs_ids:
             continue
+        obs_status = str(res.get("status") or "final").strip().lower()
+        obs_invalid = obs_status in _INVALIDATED_OBS_STATUSES
         code, disp = _coding_pair(res.get("code"))
         raw_obs_dt = res.get("effectiveDateTime") or res.get("issued")
         o_date = _iso_date(raw_obs_dt)
@@ -1624,7 +1653,14 @@ def extract_bundle(
                 comp_entries,
                 all_comp_structured,
             ) = _extract_obs_components(
-                res, rid, o_ts or o_date or "", primary_cat, cats, obs_ts=o_sort_ts
+                res,
+                rid,
+                o_ts or o_date or "",
+                primary_cat,
+                cats,
+                obs_ts=o_sort_ts,
+                obs_status=obs_status,
+                include_numeric_points=not obs_invalid,
             )
             numeric_points.extend(comp_pts)
             if any(pt.is_abnormal for pt in comp_pts) or any(
@@ -1657,7 +1693,7 @@ def extract_bundle(
             elif not sens and comp_sens:
                 sens = comp_sens[0]
                 sens_src = comp_src or sens_src
-        elif num_val is not None:
+        elif num_val is not None and not obs_invalid:
             numeric_points.append(
                 NumericPoint(
                     resource_uuid=rid,
@@ -1671,6 +1707,7 @@ def extract_bundle(
                     reference_range=obs_range,
                     is_abnormal=obs_abn,
                     timestamp=o_sort_ts,
+                    status=obs_status,
                 )
             )
 
@@ -1727,14 +1764,14 @@ def extract_bundle(
                 resource_type="Observation",
                 resource_uuid=rid,
                 date=o_date,
-                clinical_date=o_date,
-                date_kind="clinical_event" if o_date else "unknown",
+                clinical_date=None if obs_invalid else o_date,
+                date_kind="clinical_event" if (o_date and not obs_invalid) else "unknown",
                 section=sec,
                 code=code or disp,
                 display=disp or code or "Observation",
                 text=f"{cls_label} — {disp or code}{body_val}{ts_suffix}",
                 mandatory=False,
-                status=str(res.get("status") or "final").lower(),
+                status=obs_status,
                 source_org=resolve_source_org(res),
                 sensitivity=sens,
                 is_routine=(sec in {"survey_observation", "vital_sign"}),
