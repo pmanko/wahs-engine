@@ -17,6 +17,7 @@ Strict Layer Boundaries:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from functools import lru_cache
 import re
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
@@ -121,31 +122,123 @@ _NEGATED_HOLD_RE = re.compile(
 )
 
 
+_CLAUSE_SEP_RE = re.compile(
+    r"\b(?:but|however|though|although|whereas)\b"
+    r"|[,;]"
+    r"|\band\s+(?=[a-z][a-z0-9-]{3,}\s+(?:was|were|is|remained|remains|continued|resumed|restarted|held|stopped|discontinued)\b)"
+)
+_CONTINUATION_DIRECTIVE_RE = re.compile(
+    r"^\s*(?:and\s+)?(?:then\s+|later\s+|subsequently\s+)?(?:was\s+|were\s+)?"
+    r"(?:continue|continuing|resume|resumed|restart|restarted|stopped|stop|discontinue|discontinued|held|holding|hold)\b"
+)
+
+
+def _last_affirmative_cue_offset(
+    clause_low: str,
+    probes: Set[str],
+    cues: Sequence[str],
+    neg_re: re.Pattern[str],
+    other_med_probes: Optional[Set[str]] = None,
+) -> Optional[int]:
+    """Return the latest character offset of an affirmative cue for *probes*, or None."""
+    if not clause_low:
+        return None
+    sub_spans: List[Tuple[int, str]] = []
+    last_end = 0
+    for sep in _CLAUSE_SEP_RE.finditer(clause_low):
+        part = clause_low[last_end : sep.start()]
+        if part.strip():
+            sub_spans.append((last_end, part))
+        last_end = sep.end()
+    tail = clause_low[last_end:]
+    if tail.strip():
+        sub_spans.append((last_end, tail))
+    if not sub_spans:
+        sub_spans = [(0, clause_low)]
+
+    other_probes = other_med_probes or set()
+    subject_matched = False
+    best_offset: Optional[int] = None
+    for base_off, sub in sub_spans:
+        cleaned = neg_re.sub(lambda m: " " * len(m.group(0)), sub)
+        toks = set(re.findall(r"[a-z][a-z0-9-]{3,}", cleaned))
+        if probes & toks:
+            applies = True
+            subject_matched = True
+        elif other_probes & toks:
+            applies = False
+            subject_matched = False
+        elif subject_matched and _CONTINUATION_DIRECTIVE_RE.match(cleaned):
+            applies = True
+        else:
+            applies = False
+        if applies:
+            cue_offs = [cleaned.rfind(cue) for cue in cues if cue in cleaned]
+            if cue_offs:
+                cand = base_off + max(cue_offs)
+                if best_offset is None or cand > best_offset:
+                    best_offset = cand
+    return best_offset
+
+
 def _clause_has_affirmative_directive(
     clause_low: str,
     probes: Set[str],
     cues: Sequence[str],
     neg_re: re.Pattern[str],
+    other_med_probes: Optional[Set[str]] = None,
 ) -> bool:
     """Return True if *clause_low* affirms *cues* for *probes* without negation."""
-    if not clause_low:
-        return False
-    sub_clauses = (
-        [
-            sc.strip()
-            for sc in re.split(r"\b(?:but|however|though|although|whereas)\b|[,;]", clause_low)
-            if sc.strip()
-        ]
-        if neg_re.search(clause_low)
-        else [clause_low]
-    )
-    for sub in sub_clauses:
-        cleaned = neg_re.sub(" ", sub)
-        if any(cue in cleaned for cue in cues):
-            toks = set(re.findall(r"[a-z][a-z0-9-]{3,}", cleaned))
-            if probes & toks:
-                return True
-    return False
+    return _last_affirmative_cue_offset(clause_low, probes, cues, neg_re, other_med_probes=other_med_probes) is not None
+
+
+def _scan_note_med_directives(
+    note_body: str,
+    raw_note: str,
+    probes: Set[str],
+    hold_cues: Sequence[str],
+    resume_cues: Sequence[str],
+    other_med_probes: Optional[Set[str]] = None,
+) -> Tuple[Optional[Tuple[int, int]], str, Optional[Tuple[int, int]], str]:
+    """Scan *note_body* for the latest affirmative hold and resume directives for *probes*."""
+    last_hold_pos: Optional[Tuple[int, int]] = None
+    last_hold_sent = ""
+    last_res_pos: Optional[Tuple[int, int]] = None
+    last_res_sent = ""
+    text_to_scan = raw_note or note_body
+    if not text_to_scan:
+        return last_hold_pos, last_hold_sent, last_res_pos, last_res_sent
+
+    for sent_idx, sent in enumerate(re.split(r"(?<=[.!?;])\s+|\n+", text_to_scan)):
+        s_low = sent.lower()
+        if any(rc in s_low for rc in resume_cues):
+            res_off = _last_affirmative_cue_offset(
+                s_low,
+                probes,
+                resume_cues,
+                _NEGATED_RESUME_RE,
+                other_med_probes=other_med_probes,
+            )
+            if res_off is not None:
+                last_res_pos = (sent_idx, res_off)
+                last_res_sent = sent.strip()
+        if raw_note and any(hc in s_low for hc in hold_cues):
+            directive_clause = re.split(
+                r"\b(?:due to|secondary to|because of|despite)\b",
+                s_low,
+                maxsplit=1,
+            )[0]
+            hold_off = _last_affirmative_cue_offset(
+                directive_clause,
+                probes,
+                hold_cues,
+                _NEGATED_HOLD_RE,
+                other_med_probes=other_med_probes,
+            )
+            if hold_off is not None:
+                last_hold_pos = (sent_idx, hold_off)
+                last_hold_sent = sent.strip()
+    return last_hold_pos, last_hold_sent, last_res_pos, last_res_sent
 
 _SECTION_OVERFLOW_PRIORITY: Dict[str, int] = {
     "allergy": 0,
@@ -838,6 +931,11 @@ class ClinicalEntityGraph:
                         "therapeutic_class": str(item.metadata.get("therapeutic_class") or ""),
                         "verification_status": str(item.metadata.get("verification_status") or "").lower(),
                         **(
+                            {"raw_timestamp": str(item.metadata.get("raw_timestamp") or "")}
+                            if item.metadata.get("raw_timestamp")
+                            else {}
+                        ),
+                        **(
                             {
                                 "is_abnormal": bool(item.metadata.get("is_abnormal")),
                                 "interpretation": str(item.metadata.get("interpretation") or ""),
@@ -1433,63 +1531,87 @@ class ClinicalEntityGraph:
                     )
                     seen_rationale_counts[rationale] = seen_rationale_counts.get(rationale, 0) + 1
 
+        def _note_is_older(candidate_ts: str, ref_ts: str) -> bool:
+            if len(candidate_ts or "") > 10 and len(ref_ts or "") > 10:
+                try:
+                    c_dt = datetime.fromisoformat(candidate_ts.replace("Z", "+00:00"))
+                    r_dt = datetime.fromisoformat(ref_ts.replace("Z", "+00:00"))
+                    if (c_dt.tzinfo is None) == (r_dt.tzinfo is None):
+                        return c_dt < r_dt
+                except ValueError:
+                    pass
+            c_date = (candidate_ts or "")[:10]
+            r_date = (ref_ts or "")[:10]
+            if not c_date or not r_date:
+                return False
+            return c_date < r_date
+
+        def _note_sort_key(ts: str) -> str:
+            raw = ts or ""
+            if len(raw) > 10:
+                try:
+                    dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                    if dt.tzinfo is not None:
+                        return dt.astimezone(timezone.utc).isoformat(timespec="microseconds")
+                except ValueError:
+                    pass
+            return raw
+
+        def _note_ts(node: ClinicalNode) -> str:
+            return str(node.metadata.get("raw_timestamp") or node.date_str or "")
+
         # 5. ClinicalNote -> Medication hold/discontinue/reconcile & resume reconciliation edges
-        notes_sorted = sorted(notes, key=lambda n: n.date_str or "", reverse=True)
+        notes_sorted = sorted(notes, key=lambda n: _note_sort_key(_note_ts(n)), reverse=True)
+        all_chart_med_probes = {p for m in meds for p in _med_name_probes(m)}
         for m in scoped_meds:
             probes = _med_name_probes(m)
             if not probes:
                 continue
+            other_probes = all_chart_med_probes - probes
             m_date = (m.date_str or "")[:10]
-            latest_resume_date = ""
-            matched_m = False
+            latest_resume_ts = ""
             for n in notes_sorted:
                 raw_note = n.raw_line or ""
                 note_body = raw_note or n.value_summary or ""
-                n_low = note_body.lower()
-                n_date = (n.date_str or "")[:10]
+                n_ts = _note_ts(n)
+                n_date = n_ts[:10]
                 if m_date and n_date and n_date < m_date:
                     continue
-                if n_low and any(rc in n_low for rc in resume_cues):
-                    for r_sent in re.split(r"(?<=[.!?;])\s+|\n+", note_body):
-                        rs_low = r_sent.lower()
-                        if _clause_has_affirmative_directive(rs_low, probes, resume_cues, _NEGATED_RESUME_RE):
-                            if n_date > latest_resume_date:
-                                latest_resume_date = n_date
-                            break
-                if latest_resume_date and n_date and n_date < latest_resume_date:
+                if latest_resume_ts and _note_is_older(n_ts, latest_resume_ts):
                     continue
-                if not n_low or not any(cue in n_low for cue in hold_cues):
+                n_low = note_body.lower()
+                if not n_low:
                     continue
                 n_toks = set(re.findall(r"[a-z][a-z0-9-]{3,}", n_low))
                 if not (probes & n_toks):
                     continue
-                for sent in re.split(r"(?<=[.!?;])\s+|\n+", raw_note):
-                    s_low = sent.lower()
-                    if not any(cue in s_low for cue in hold_cues):
-                        continue
-                    directive_clause = re.split(
-                        r"\b(?:due to|secondary to|because of|despite)\b",
-                        s_low,
-                        maxsplit=1,
-                    )[0]
-                    if _clause_has_affirmative_directive(directive_clause, probes, hold_cues, _NEGATED_HOLD_RE):
-                        snippet = sent.strip()
-                        if len(snippet) > 160:
-                            snippet = snippet[:157].rstrip() + "..."
-                        self.add_edge(
-                            ClinicalEdge(
-                                source_id=m.node_id,
-                                target_id=n.node_id,
-                                edge_type="CONTRADICTED_OR_MODIFIED_BY_NOTE",
-                                rationale=f"Clinical note statement ({n.date_str or 'undated'}): {snippet}",
-                                kb_source="Longitudinal Note-to-Medication Reconciliation",
-                                source_citation=m.citation_idx,
-                                target_citation=n.citation_idx,
-                            )
+                hold_pos, hold_sent, res_pos, _ = _scan_note_med_directives(
+                    note_body,
+                    raw_note,
+                    probes,
+                    hold_cues,
+                    resume_cues,
+                    other_med_probes=other_probes,
+                )
+                if res_pos is not None and (hold_pos is None or res_pos > hold_pos):
+                    if not latest_resume_ts or _note_is_older(latest_resume_ts, n_ts):
+                        latest_resume_ts = n_ts
+                    continue
+                if hold_pos is not None and hold_sent:
+                    snippet = hold_sent
+                    if len(snippet) > 160:
+                        snippet = snippet[:157].rstrip() + "..."
+                    self.add_edge(
+                        ClinicalEdge(
+                            source_id=m.node_id,
+                            target_id=n.node_id,
+                            edge_type="CONTRADICTED_OR_MODIFIED_BY_NOTE",
+                            rationale=f"Clinical note statement ({n.date_str or 'undated'}): {snippet}",
+                            kb_source="Longitudinal Note-to-Medication Reconciliation",
+                            source_citation=m.citation_idx,
+                            target_citation=n.citation_idx,
                         )
-                        matched_m = True
-                        break
-                if matched_m:
+                    )
                     break
 
         active_med_probes = {p for m in scoped_meds for p in _med_name_probes(m)}
@@ -1505,42 +1627,53 @@ class ClinicalEntityGraph:
             probes = _med_name_probes(m)
             if not probes or (probes & active_med_probes):
                 continue
+            other_probes = all_chart_med_probes - probes
             m_date = (m.date_str or "")[:10]
+            latest_hold_ts = ""
             for n in notes_sorted:
-                n_date = (n.date_str or "")[:10]
+                raw_note = n.raw_line or ""
+                if not raw_note:
+                    continue
+                n_ts = _note_ts(n)
+                n_date = n_ts[:10]
                 if m_date and n_date and n_date < m_date:
                     continue
-                raw_note = n.raw_line or ""
-                n_low = (raw_note or n.value_summary or "").lower()
-                if not n_low or not any(cue in n_low for cue in resume_cues):
+                if latest_hold_ts and _note_is_older(n_ts, latest_hold_ts):
                     continue
+                n_low = raw_note.lower()
                 n_toks = set(re.findall(r"[a-z][a-z0-9-]{3,}", n_low))
                 if not (probes & n_toks):
                     continue
-                matched_note = False
-                for sent in re.split(r"(?<=[.!?;])\s+|\n+", raw_note):
-                    s_low = sent.lower()
-                    if _clause_has_affirmative_directive(s_low, probes, resume_cues, _NEGATED_RESUME_RE):
-                        snippet = sent.strip()
-                        if len(snippet) > 160:
-                            snippet = snippet[:157].rstrip() + "..."
-                        self.add_edge(
-                            ClinicalEdge(
-                                source_id=m.node_id,
-                                target_id=n.node_id,
-                                edge_type="CONTRADICTED_OR_MODIFIED_BY_NOTE",
-                                rationale=(
-                                    f"Stopped/historical order but newer note ({n.date_str or 'undated'}) "
-                                    f"instructs continue/resume: {snippet}"
-                                ),
-                                kb_source="Longitudinal Note-to-Medication Reconciliation",
-                                source_citation=m.citation_idx,
-                                target_citation=n.citation_idx,
-                            )
+                hold_pos, _, res_pos, res_sent = _scan_note_med_directives(
+                    raw_note,
+                    raw_note,
+                    probes,
+                    hold_cues,
+                    resume_cues,
+                    other_med_probes=other_probes,
+                )
+                if hold_pos is not None and (res_pos is None or hold_pos > res_pos):
+                    if not latest_hold_ts or _note_is_older(latest_hold_ts, n_ts):
+                        latest_hold_ts = n_ts
+                    continue
+                if res_pos is not None and res_sent:
+                    snippet = res_sent
+                    if len(snippet) > 160:
+                        snippet = snippet[:157].rstrip() + "..."
+                    self.add_edge(
+                        ClinicalEdge(
+                            source_id=m.node_id,
+                            target_id=n.node_id,
+                            edge_type="CONTRADICTED_OR_MODIFIED_BY_NOTE",
+                            rationale=(
+                                f"Stopped/historical order but newer note ({n.date_str or 'undated'}) "
+                                f"instructs continue/resume: {snippet}"
+                            ),
+                            kb_source="Longitudinal Note-to-Medication Reconciliation",
+                            source_citation=m.citation_idx,
+                            target_citation=n.citation_idx,
                         )
-                        matched_note = True
-                        break
-                if matched_note:
+                    )
                     break
 
     def format_subgraph_lines(self, question: str = "", *, max_lines: Optional[int] = None) -> List[str]:

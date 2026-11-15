@@ -1051,3 +1051,167 @@ def test_comparator_valued_observation_component_and_diagnostic_report_child_pre
         e.edge_type == "CONTRAINDICATED_OR_DOSE_ADJUST_IN"
         for e in g_dr_multi.edges
     )
+
+
+def test_same_note_directive_order_reconciles_hold_vs_resume() -> None:
+    """PRRT_kwDOVrPAic63k5oM: later affirmative resume in same note must supersede earlier hold."""
+    import base64
+    from wahs_core import ClinicalEntityGraph, extract_bundle
+
+    def _note(nid: str, ndate: str, text: str) -> Dict[str, Any]:
+        return {
+            "resource": {
+                "resourceType": "DocumentReference",
+                "id": nid,
+                "status": "current",
+                "date": ndate,
+                "type": {"text": "Discharge Summary"},
+                "content": [
+                    {
+                        "attachment": {
+                            "contentType": "text/plain",
+                            "data": base64.b64encode(text.encode("utf-8")).decode("ascii"),
+                        }
+                    }
+                ],
+            }
+        }
+
+    # 1. Hold then resume in same note (plus older hold note) -> no hold contradiction on active med
+    same_note_resumed = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "p-same-note-1", "birthDate": "1964-01-01"}},
+            {
+                "resource": {
+                    "resourceType": "MedicationRequest",
+                    "id": "med-met-1",
+                    "status": "active",
+                    "authoredOn": "2026-01-01",
+                    "medicationCodeableConcept": {"text": "Metformin 500 MG Oral Tablet"},
+                }
+            },
+            _note("doc-old-hold", "2026-06-01", "Hold metformin pre-op."),
+            _note(
+                "doc-dc",
+                "2026-06-05",
+                "Metformin was held for surgery. Metformin was resumed at discharge.",
+            ),
+        ],
+    }
+    g_res = ClinicalEntityGraph.from_extracted_chart(extract_bundle(same_note_resumed))
+    assert not any(e.edge_type == "CONTRADICTED_OR_MODIFIED_BY_NOTE" for e in g_res.edges)
+
+    # 2. Same-sentence hold then resume -> no hold contradiction
+    same_sent_resumed = json.loads(json.dumps(same_note_resumed))
+    same_sent_resumed["entry"][3] = _note(
+        "doc-dc-same-sent",
+        "2026-06-05",
+        "Metformin was held for surgery, then metformin was resumed at discharge.",
+    )
+    g_same_sent = ClinicalEntityGraph.from_extracted_chart(extract_bundle(same_sent_resumed))
+    assert not any(e.edge_type == "CONTRADICTED_OR_MODIFIED_BY_NOTE" for e in g_same_sent.edges)
+
+    # 3. Resume then later hold in same note -> final hold contradiction MUST still fire
+    same_note_held_after = json.loads(json.dumps(same_note_resumed))
+    same_note_held_after["entry"][2] = _note(
+        "doc-dc-held-last",
+        "2026-06-05",
+        "Metformin was resumed at admission. Metformin was held at discharge due to AKI.",
+    )
+    same_note_held_after["entry"].pop(3)
+    g_held_last = ClinicalEntityGraph.from_extracted_chart(extract_bundle(same_note_held_after))
+    assert any(e.edge_type == "CONTRADICTED_OR_MODIFIED_BY_NOTE" for e in g_held_last.edges)
+
+    # 4. Stopped medication with resume followed by later hold in same note -> no resume contradiction
+    stopped_held_last = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "p-same-note-4", "birthDate": "1964-01-01"}},
+            {
+                "resource": {
+                    "resourceType": "MedicationRequest",
+                    "id": "med-met-stop",
+                    "status": "stopped",
+                    "authoredOn": "2026-01-01",
+                    "medicationCodeableConcept": {"text": "Metformin 500 MG Oral Tablet"},
+                }
+            },
+            _note(
+                "doc-stop-held-last",
+                "2026-06-05",
+                "Metformin was resumed in clinic. Metformin was held at follow-up for rising creatinine.",
+            ),
+        ],
+    }
+    g_stop_held = ClinicalEntityGraph.from_extracted_chart(extract_bundle(stopped_held_last))
+    assert not any(e.edge_type == "CONTRADICTED_OR_MODIFIED_BY_NOTE" for e in g_stop_held.edges)
+
+    # 5. Compound two-drug sentence: other drug's resume must NOT suppress Metformin's hold
+    compound_two_drugs = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "p-same-note-5", "birthDate": "1964-01-01"}},
+            {
+                "resource": {
+                    "resourceType": "MedicationRequest",
+                    "id": "med-met-5",
+                    "status": "active",
+                    "authoredOn": "2026-01-01",
+                    "medicationCodeableConcept": {"text": "Metformin 500 MG Oral Tablet"},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "MedicationRequest",
+                    "id": "med-lis-5",
+                    "status": "active",
+                    "authoredOn": "2026-01-01",
+                    "medicationCodeableConcept": {"text": "Lisinopril 10 MG Oral Tablet"},
+                }
+            },
+            _note(
+                "doc-compound-2drugs",
+                "2026-06-05",
+                "Metformin was held for surgery, and lisinopril was resumed at discharge.",
+            ),
+        ],
+    }
+    g_comp = ClinicalEntityGraph.from_extracted_chart(extract_bundle(compound_two_drugs))
+    met_hold_edges = [
+        e for e in g_comp.edges
+        if e.edge_type == "CONTRADICTED_OR_MODIFIED_BY_NOTE"
+        and "metformin" in g_comp.nodes[e.source_id].label.lower()
+    ]
+    lis_edges = [
+        e for e in g_comp.edges
+        if e.edge_type == "CONTRADICTED_OR_MODIFIED_BY_NOTE"
+        and "lisinopril" in g_comp.nodes[e.source_id].label.lower()
+    ]
+    assert len(met_hold_edges) == 1
+    assert lis_edges == []
+
+    # 6. Same-day cross-offset notes: 09:00-05:00 (14:00Z) resume supersedes 11:00Z hold
+    cross_offset_notes = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "p-same-note-6", "birthDate": "1964-01-01"}},
+            {
+                "resource": {
+                    "resourceType": "MedicationRequest",
+                    "id": "med-met-6",
+                    "status": "active",
+                    "authoredOn": "2026-01-01",
+                    "medicationCodeableConcept": {"text": "Metformin 500 MG Oral Tablet"},
+                }
+            },
+            _note("doc-hold-utc", "2026-06-05T11:00:00Z", "Hold metformin during inpatient procedure."),
+            _note("doc-resume-est", "2026-06-05T09:00:00-05:00", "Metformin was resumed at discharge."),
+        ],
+    }
+    g_tz = ClinicalEntityGraph.from_extracted_chart(extract_bundle(cross_offset_notes))
+    assert not any(e.edge_type == "CONTRADICTED_OR_MODIFIED_BY_NOTE" for e in g_tz.edges)

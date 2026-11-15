@@ -16,7 +16,7 @@ import base64
 import hashlib
 import re
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from .kb_lookup import (
@@ -1118,7 +1118,8 @@ def extract_bundle(
         rtype = str(res.get("resourceType") or "")
         rid = str(res.get("id") or "")
         if rtype == "DocumentReference":
-            n_date = _iso_date(res.get("date") or (res.get("context") or {}).get("period", {}).get("start"))
+            n_raw_ts = str(res.get("date") or (res.get("context") or {}).get("period", {}).get("start") or "").strip()
+            n_date = _iso_date(n_raw_ts)
             _, n_type = _coding_pair(res.get("type"))
             sec_codes = _extract_meta_security_codes(res)
             for content_item in res.get("content") or []:
@@ -1130,6 +1131,8 @@ def extract_bundle(
                         notes_by_hash[digest]["member_uuids"].append(rid)
                         if n_date:
                             notes_by_hash[digest]["dates"].append(n_date)
+                        if n_raw_ts:
+                            notes_by_hash[digest]["timestamps"].append(n_raw_ts)
                         notes_by_hash[digest]["meta_security"].extend(sec_codes)
                         dedup_note_count += 1
                     else:
@@ -1142,6 +1145,7 @@ def extract_bundle(
                             "primary_uuid": rid,
                             "date": n_date,
                             "dates": [n_date] if n_date else [],
+                            "timestamps": [n_raw_ts] if n_raw_ts else [],
                             "title": n_type or "Clinical Note",
                             "decoded": decoded,
                             "source_org": resolve_source_org(res),
@@ -1149,7 +1153,8 @@ def extract_bundle(
                             "meta_security": list(sec_codes),
                         }
         elif rtype == "DiagnosticReport" and (res.get("presentedForm") or []):
-            n_date = _iso_date(res.get("effectiveDateTime") or res.get("issued"))
+            n_raw_ts = str(res.get("effectiveDateTime") or res.get("issued") or "").strip()
+            n_date = _iso_date(n_raw_ts)
             _, n_type = _coding_pair(res.get("code"))
             sec_codes = _extract_meta_security_codes(res)
             for pf in res.get("presentedForm") or []:
@@ -1160,6 +1165,8 @@ def extract_bundle(
                         notes_by_hash[digest]["member_uuids"].append(rid)
                         if n_date:
                             notes_by_hash[digest]["dates"].append(n_date)
+                        if n_raw_ts:
+                            notes_by_hash[digest]["timestamps"].append(n_raw_ts)
                         notes_by_hash[digest]["meta_security"].extend(sec_codes)
                         dedup_note_count += 1
                     else:
@@ -1172,12 +1179,23 @@ def extract_bundle(
                             "primary_uuid": rid,
                             "date": n_date,
                             "dates": [n_date] if n_date else [],
+                            "timestamps": [n_raw_ts] if n_raw_ts else [],
                             "title": n_type or "Clinical Note",
                             "decoded": decoded,
                             "source_org": resolve_source_org(res),
                             "member_uuids": [rid],
                             "meta_security": list(sec_codes),
                         }
+
+    def _raw_ts_sort_key(raw_ts: str) -> str:
+        if len(raw_ts) > 10:
+            try:
+                dt = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+                if dt.tzinfo is not None:
+                    return dt.astimezone(timezone.utc).isoformat(timespec="microseconds")
+            except ValueError:
+                pass
+        return raw_ts
 
     for note_info in notes_by_hash.values():
         snippet = _extract_unique_note_narrative(
@@ -1188,7 +1206,9 @@ def extract_bundle(
             continue
         members = tuple(dict.fromkeys(note_info["member_uuids"]))
         distinct_dates = sorted({d for d in (note_info.get("dates") or []) if d})
+        distinct_ts = sorted({t for t in (note_info.get("timestamps") or []) if t}, key=_raw_ts_sort_key)
         primary_date = distinct_dates[-1] if distinct_dates else note_info["date"]
+        latest_raw_ts = distinct_ts[-1] if distinct_ts else ""
         extra_dates_str = (
             f" (recorded across dates: {', '.join(distinct_dates)})"
             if len(distinct_dates) > 1
@@ -1208,6 +1228,7 @@ def extract_bundle(
             "title": note_info["title"],
             "duplicate_wrapper_count": len(members),
             **({"dates": distinct_dates} if distinct_dates else {}),
+            **({"raw_timestamp": latest_raw_ts} if latest_raw_ts else {}),
             **({"sensitivity_source": note_sens_src} if note_sens_src else {}),
         }
         items.append(
