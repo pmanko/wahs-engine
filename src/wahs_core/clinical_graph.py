@@ -786,8 +786,10 @@ class ClinicalEntityGraph:
             if (
                 cat == "Observation"
                 and item.section in {"lab_observation", "vital_sign"}
-                and item.resource_uuid
-                and item.resource_uuid in numeric_point_uuids
+                and (
+                    (item.resource_uuid and item.resource_uuid in numeric_point_uuids)
+                    or bool(item.metadata.get("all_components_structured"))
+                )
             ):
                 continue
             item_setting = str(item.metadata.get("setting") or "")
@@ -840,6 +842,13 @@ class ClinicalEntityGraph:
                                 "is_abnormal": bool(item.metadata.get("is_abnormal")),
                                 "interpretation": str(item.metadata.get("interpretation") or ""),
                                 "reference_range": str(item.metadata.get("reference_range") or ""),
+                                "comparator": str(item.metadata.get("comparator") or ""),
+                                "all_children_structured": bool(
+                                    item.metadata.get("all_children_structured")
+                                ),
+                                "comparator_observations": list(
+                                    item.metadata.get("comparator_observations") or []
+                                ),
                                 "latest_value": item.metadata.get("numeric"),
                                 "numeric": item.metadata.get("numeric"),
                                 "unit": str(item.metadata.get("unit") or ""),
@@ -894,6 +903,80 @@ class ClinicalEntityGraph:
                 )
             )
 
+        # Preserve comparator-valued component and DiagnosticReport child observations as nodes
+        comp_obs_by_key: Dict[str, List[Tuple[ClinicalItem, Mapping[str, Any]]]] = {}
+        for item in kept_items:
+            if not isinstance(item.metadata, Mapping):
+                continue
+            for ce in item.metadata.get("comparator_observations") or ():
+                if not isinstance(ce, Mapping):
+                    continue
+                ce_uuid = str(ce.get("resource_uuid") or item.resource_uuid or "")
+                if ce_uuid and ce_uuid in redacted_uuids:
+                    continue
+                ce_code = str(ce.get("code") or "")
+                ce_concept = str(ce.get("concept") or ce.get("display") or ce_code)
+                ce_cat = str(ce.get("category") or "laboratory")
+                ce_sens = str(ce.get("sensitivity") or "")
+                if is_external and (
+                    ce_sens == "SDOH/PRIVACY-SENSITIVE"
+                    or classify_sensitivity(ce_code, ce_concept, [ce_cat]) == "SDOH/PRIVACY-SENSITIVE"
+                ):
+                    continue
+                ckey = f"{ce_code}:{ce_concept}".strip(":")
+                if ckey:
+                    comp_obs_by_key.setdefault(ckey, []).append((item, ce))
+
+        for code_key, entries in comp_obs_by_key.items():
+            entries_sorted = sorted(
+                entries,
+                key=lambda pair: (
+                    str(pair[1].get("date") or pair[0].date or ""),
+                    1 if pair[1].get("is_abnormal") else 0,
+                ),
+            )
+            parent_item, latest_ce = entries_sorted[-1]
+            c_uuid = str(latest_ce.get("resource_uuid") or parent_item.resource_uuid or "")
+            c_date = str(latest_ce.get("date") or parent_item.date or "")
+            c_val = str(latest_ce.get("value") or "")
+            c_unit = str(latest_ce.get("unit") or "")
+            c_cmp = str(latest_ce.get("comparator") or "")
+            c_interp = str(latest_ce.get("interpretation") or "")
+            c_rr = str(latest_ce.get("reference_range") or "")
+            c_abn = bool(latest_ce.get("is_abnormal"))
+            c_concept = str(latest_ce.get("concept") or latest_ce.get("display") or code_key)
+            c_code = str(latest_ce.get("code") or "")
+            abn_tag = f" [{c_interp}]" if c_interp and c_abn else ""
+            date_tag = f" on {c_date[:10]}" if c_date else " (date unknown)"
+            val_summary = f"latest {c_val}{abn_tag}{date_tag}".strip()
+            obs_id = f"obs:{_slugify(code_key)}"
+            comp_node = ClinicalNode(
+                node_id=obs_id,
+                category="Observation",
+                label=c_concept or code_key,
+                code=c_code,
+                citation_idx=cit_map.get(c_uuid) or cit_map.get(parent_item.resource_uuid),
+                resource_uuid=c_uuid,
+                date_str=c_date,
+                status="final",
+                value_summary=val_summary,
+                metadata={
+                    "comparator": c_cmp,
+                    "latest_value": None,
+                    "threshold": latest_ce.get("threshold"),
+                    "numeric": None,
+                    "value": c_val,
+                    "unit": c_unit,
+                    "reference_range": c_rr,
+                    "is_abnormal": c_abn,
+                    "interpretation": c_interp,
+                    "from_comparator_component": True,
+                },
+            )
+            existing = graph.nodes.get(obs_id)
+            if existing is None or (c_date or "") >= (existing.date_str or ""):
+                graph.nodes[obs_id] = comp_node
+
         graph._infer_clinical_edges(kept_items, extracted.birth_date)
         return graph
 
@@ -909,8 +992,25 @@ class ClinicalEntityGraph:
         }
 
         # 1. Layer-0 normalizer reconciliation edges (Conditions, Meds, Immunizations)
-        cond_dicts = [
-            {
+        def _item_is_refuted_or_error(it: ClinicalItem) -> bool:
+            st = (it.status or "").strip().lower()
+            if st == "entered-in-error":
+                return True
+            meta = it.metadata if isinstance(it.metadata, Mapping) else {}
+            v_st = str(meta.get("verification_status") or "").strip().lower()
+            if v_st in {"refuted", "entered-in-error"}:
+                return True
+            raw_low = f"{it.display} {it.text}".lower()
+            return "verification: refuted" in raw_low or "verification: entered-in-error" in raw_low
+
+        active_c_dicts: List[Dict[str, Any]] = []
+        resolved_c_dicts: List[Dict[str, Any]] = []
+        for it in kept_items:
+            if it.section not in {"condition_active", "condition_resolved"} or not it.resource_uuid:
+                continue
+            if _item_is_refuted_or_error(it):
+                continue
+            c_dict = {
                 "resourceUuid": it.resource_uuid,
                 "code": it.code,
                 "display": it.display,
@@ -919,11 +1019,13 @@ class ClinicalEntityGraph:
                 "abatement": (it.metadata.get("abatement") or it.end_date or "") if isinstance(it.metadata, Mapping) else (it.end_date or ""),
                 "source_org": it.source_org or "",
             }
-            for it in kept_items
-            if it.section in {"condition_active", "condition_resolved"} and it.resource_uuid
-        ]
-        active_c_dicts = [c for c in cond_dicts if c["status"] in {"active", "recurrence", "relapse"}]
-        resolved_c_dicts = [c for c in cond_dicts if c not in active_c_dicts]
+            if (
+                it.section == "condition_active"
+                and str(c_dict["status"]).strip().lower() in {"active", "recurrence", "relapse"}
+            ):
+                active_c_dicts.append(c_dict)
+            else:
+                resolved_c_dicts.append(c_dict)
         cond_conflicts = detect_condition_conflicts(active_c_dicts, resolved_c_dicts)
         for rid, note_txt in cond_conflicts.items():
             src_node = node_by_uuid.get(rid)
@@ -1101,6 +1203,10 @@ class ClinicalEntityGraph:
         def _is_clinically_significant_obs(tgt: ClinicalNode, t_low: str) -> bool:
             if tgt.category != "Observation":
                 return True
+            if tgt.metadata.get("section") == "lab_panel" and bool(
+                tgt.metadata.get("all_children_structured")
+            ):
+                return False
             is_abn = bool(tgt.metadata.get("is_abnormal"))
             interp = str(tgt.metadata.get("interpretation") or "").strip().lower()
             is_high = interp in {"h", "hh", "high", "above high normal", "critical high", ">"}

@@ -822,10 +822,9 @@ def extract_bundle(
     resolved_cond_dicts = [
         c
         for c in raw_conditions
-        if not (
-            c["status"] in {"active", "recurrence", "relapse"}
-            and c["verification"] not in _non_actionable_cond_verif
-        )
+        if c["verification"] not in _non_actionable_cond_verif
+        and c["status"] != "entered-in-error"
+        and c["status"] not in {"active", "recurrence", "relapse"}
     ]
     condition_conflicts = (
         detect_condition_conflicts(active_cond_dicts, resolved_cond_dicts)
@@ -1238,45 +1237,62 @@ def extract_bundle(
         obs_date: str,
         obs_cat: str,
         obs_cats: Sequence[str],
-    ) -> Tuple[List[NumericPoint], List[str], Optional[str]]:
+    ) -> Tuple[List[NumericPoint], List[str], Optional[str], List[Dict[str, Any]], bool]:
         pts: List[NumericPoint] = []
         comp_sens: List[str] = []
         comp_src: Optional[str] = None
+        comp_entries: List[Dict[str, Any]] = []
         parent_sec_codes = _extract_meta_security_codes(obs_res)
-        for comp in obs_res.get("component") or []:
-            if not isinstance(comp, Mapping):
-                continue
+        raw_components = [c for c in (obs_res.get("component") or []) if isinstance(c, Mapping)]
+        for comp in raw_components:
             c_code, c_disp = _coding_pair(comp.get("code"))
             vq = comp.get("valueQuantity")
             c_val_str = ""
-            c_num_for_rr: Optional[float] = None
+            comp_entry: Optional[Dict[str, Any]] = None
             if isinstance(vq, Mapping) and vq.get("value") is not None:
                 c_cmp = str(vq.get("comparator") or "").strip()
                 c_unit = str(vq.get("unit") or vq.get("code") or "").strip()
                 c_val_str = f"{c_cmp}{_format_num(vq.get('value'))} {c_unit}".strip()
-                if not c_cmp:
-                    try:
-                        c_num = float(vq["value"])
-                        c_num_for_rr = c_num
-                        c_interp, c_rr, c_abn = _extract_obs_interpretation_and_range(
-                            comp, c_num
+                try:
+                    c_num: Optional[float] = float(vq["value"])
+                except (TypeError, ValueError):
+                    c_num = None
+                c_interp, c_rr, c_abn = _extract_obs_interpretation_and_range(
+                    comp, None if c_cmp else c_num
+                )
+                if not c_cmp and c_num is not None:
+                    pts.append(
+                        NumericPoint(
+                            resource_uuid=obs_uuid,
+                            date=obs_date,
+                            code=c_code or c_disp,
+                            concept=c_disp or c_code,
+                            value=c_num,
+                            unit=c_unit,
+                            category=obs_cat,
+                            interpretation=c_interp,
+                            reference_range=c_rr,
+                            is_abnormal=c_abn,
                         )
-                        pts.append(
-                            NumericPoint(
-                                resource_uuid=obs_uuid,
-                                date=obs_date,
-                                code=c_code or c_disp,
-                                concept=c_disp or c_code,
-                                value=c_num,
-                                unit=c_unit,
-                                category=obs_cat,
-                                interpretation=c_interp,
-                                reference_range=c_rr,
-                                is_abnormal=c_abn,
-                            )
-                        )
-                    except (TypeError, ValueError):
-                        pass
+                    )
+                elif c_cmp:
+                    comp_entry = {
+                        "resource_uuid": obs_uuid,
+                        "date": obs_date,
+                        "code": c_code or c_disp,
+                        "concept": c_disp or c_code or "Component",
+                        "display": c_disp or c_code or "Component",
+                        "category": obs_cat,
+                        "comparator": c_cmp,
+                        "value": c_val_str,
+                        "numeric": None,
+                        "threshold": c_num,
+                        "unit": c_unit,
+                        "interpretation": c_interp,
+                        "reference_range": c_rr,
+                        "is_abnormal": c_abn,
+                        "sensitivity": "",
+                    }
             else:
                 _, vc_disp = _coding_pair(comp.get("valueCodeableConcept"))
                 c_val_str = vc_disp
@@ -1288,7 +1304,14 @@ def extract_bundle(
                     comp_sens.append(cs)
                     if cs == "SDOH/PRIVACY-SENSITIVE" or not comp_src:
                         comp_src = csrc
-        return pts, comp_sens, comp_src
+                    if comp_entry is not None:
+                        comp_entry["sensitivity"] = cs
+            if comp_entry is not None:
+                comp_entries.append(comp_entry)
+        all_comp_structured = bool(raw_components) and (
+            len(pts) + len(comp_entries) == len(raw_components)
+        )
+        return pts, comp_sens, comp_src, comp_entries, all_comp_structured
 
     claimed_obs_ids: Set[str] = set()
     for res in resources:
@@ -1306,6 +1329,12 @@ def extract_bundle(
         child_parts: List[str] = []
         child_sensitivities: List[str] = []
         child_sens_sources: List[str] = []
+        panel_abn = False
+        panel_interps: List[str] = []
+        panel_ranges: List[str] = []
+        panel_comp_entries: List[Dict[str, Any]] = []
+        total_child_refs = 0
+        structured_child_count = 0
 
         for ref_obj in result_refs:
             if not isinstance(ref_obj, Mapping):
@@ -1315,6 +1344,7 @@ def extract_bundle(
                 continue
             claimed_obs_ids.add(oid)
             member_uuids.append(oid)
+            total_child_refs += 1
             child_obs = obs_by_id.get(oid)
             if not child_obs:
                 r_disp = str(ref_obj.get("display") or "").strip()
@@ -1339,23 +1369,42 @@ def extract_bundle(
             if o_sens_src:
                 child_sens_sources.append(o_sens_src)
             short_label = o_disp or o_code or "item"
-            if val_str:
-                annot_bits: List[str] = []
+            if o_abn:
+                panel_abn = True
                 if o_interp:
-                    annot_bits.append(o_interp)
-                if o_range:
-                    annot_bits.append(f"ref: {o_range}")
-                annot_str = f" ({'; '.join(annot_bits)})" if annot_bits else ""
-                child_parts.append(f"{short_label}: {val_str}{annot_str}")
+                    panel_interps.append(o_interp)
+            if o_range:
+                panel_ranges.append(o_range)
+            child_comp_entries: List[Dict[str, Any]] = []
             if child_obs.get("component"):
-                comp_pts, comp_sens, comp_src = _extract_obs_components(
+                (
+                    comp_pts,
+                    comp_sens,
+                    comp_src,
+                    child_comp_entries,
+                    child_comp_structured,
+                ) = _extract_obs_components(
                     child_obs, oid, o_date or "", o_primary_cat, o_cats
                 )
+                if child_comp_structured:
+                    structured_child_count += 1
                 numeric_points.extend(comp_pts)
                 child_sensitivities.extend(comp_sens)
                 if comp_src:
                     child_sens_sources.append(comp_src)
+                panel_comp_entries.extend(child_comp_entries)
+                if any(pt.is_abnormal for pt in comp_pts) or any(
+                    bool(ce.get("is_abnormal")) for ce in child_comp_entries
+                ):
+                    panel_abn = True
+                for ce in child_comp_entries:
+                    if ce.get("is_abnormal") and ce.get("interpretation"):
+                        panel_interps.append(str(ce["interpretation"]))
+                for pt in comp_pts:
+                    if pt.is_abnormal and pt.interpretation:
+                        panel_interps.append(pt.interpretation)
             elif num_val is not None:
+                structured_child_count += 1
                 numeric_points.append(
                     NumericPoint(
                         resource_uuid=oid,
@@ -1370,6 +1419,53 @@ def extract_bundle(
                         is_abnormal=o_abn,
                     )
                 )
+            else:
+                vq_child = child_obs.get("valueQuantity")
+                o_cmp = (
+                    str(vq_child.get("comparator") or "").strip()
+                    if isinstance(vq_child, Mapping)
+                    else ""
+                )
+                if o_cmp and vq_child.get("value") is not None:
+                    structured_child_count += 1
+                    try:
+                        o_thresh: Optional[float] = float(vq_child["value"])
+                    except (TypeError, ValueError):
+                        o_thresh = None
+                    panel_comp_entries.append(
+                        {
+                            "resource_uuid": oid,
+                            "date": o_date or "",
+                            "code": o_code or short_label,
+                            "concept": short_label,
+                            "display": short_label,
+                            "category": o_primary_cat,
+                            "comparator": o_cmp,
+                            "value": val_str,
+                            "numeric": None,
+                            "threshold": o_thresh,
+                            "unit": unit,
+                            "interpretation": o_interp,
+                            "reference_range": o_range,
+                            "is_abnormal": o_abn,
+                            "sensitivity": o_sens or "",
+                        }
+                    )
+            if val_str:
+                annot_bits: List[str] = []
+                child_interp_disp = o_interp or ", ".join(
+                    dict.fromkeys(
+                        str(ce.get("interpretation") or "")
+                        for ce in child_comp_entries
+                        if ce.get("is_abnormal") and ce.get("interpretation")
+                    )
+                )
+                if child_interp_disp:
+                    annot_bits.append(child_interp_disp)
+                if o_range:
+                    annot_bits.append(f"ref: {o_range}")
+                annot_str = f" ({'; '.join(annot_bits)})" if annot_bits else ""
+                child_parts.append(f"{short_label}: {val_str}{annot_str}")
 
         dr_sens, dr_sens_src = _classify_res_sensitivity(res, code, disp)
         if enable_privacy_classification:
@@ -1389,7 +1485,21 @@ def extract_bundle(
         joined_children = "; ".join(child_parts) if child_parts else "completed"
         panel_prefix = "Survey Panel" if is_survey else "Diagnostic Panel"
         panel_kb = resolve_lab_code(code, disp) if not is_survey else {}
-        panel_meta: Dict[str, Any] = {}
+        panel_meta: Dict[str, Any] = {
+            "is_abnormal": panel_abn,
+            "all_children_structured": total_child_refs > 0 and structured_child_count == total_child_refs,
+        }
+        if panel_interps:
+            panel_meta["interpretation"] = ", ".join(dict.fromkeys(panel_interps))
+        if len(panel_ranges) == 1:
+            panel_meta["reference_range"] = panel_ranges[0]
+        if panel_comp_entries:
+            panel_meta["comparator_observations"] = panel_comp_entries
+            if len(panel_comp_entries) == 1:
+                only_ce = panel_comp_entries[0]
+                panel_meta["comparator"] = only_ce["comparator"]
+                panel_meta["value"] = only_ce["value"]
+                panel_meta["unit"] = only_ce["unit"]
         if panel_kb:
             panel_meta["kb_resolution"] = panel_kb
         if panel_sens_src:
@@ -1433,13 +1543,43 @@ def extract_bundle(
 
         primary_cat = cats[0] if cats else "observation"
         has_components = bool(res.get("component"))
+        comp_entries: List[Dict[str, Any]] = []
+        all_comp_structured = False
         if has_components:
-            comp_pts, comp_sens, comp_src = _extract_obs_components(
+            (
+                comp_pts,
+                comp_sens,
+                comp_src,
+                comp_entries,
+                all_comp_structured,
+            ) = _extract_obs_components(
                 res, rid, o_ts or o_date or "", primary_cat, cats
             )
             numeric_points.extend(comp_pts)
-            if any(pt.is_abnormal for pt in comp_pts):
+            if any(pt.is_abnormal for pt in comp_pts) or any(
+                bool(ce.get("is_abnormal")) for ce in comp_entries
+            ):
                 obs_abn = True
+            if not obs_interp:
+                abn_interps = [
+                    str(ce.get("interpretation") or "")
+                    for ce in comp_entries
+                    if ce.get("is_abnormal") and ce.get("interpretation")
+                ] + [
+                    str(pt.interpretation or "")
+                    for pt in comp_pts
+                    if pt.is_abnormal and pt.interpretation
+                ]
+                if abn_interps:
+                    obs_interp = ", ".join(dict.fromkeys(abn_interps))
+            if not obs_range:
+                comp_ranges = [
+                    str(ce.get("reference_range") or "")
+                    for ce in comp_entries
+                    if ce.get("reference_range")
+                ]
+                if len(comp_ranges) == 1:
+                    obs_range = comp_ranges[0]
             if "SDOH/PRIVACY-SENSITIVE" in comp_sens:
                 sens = "SDOH/PRIVACY-SENSITIVE"
                 sens_src = comp_src or sens_src
@@ -1487,6 +1627,14 @@ def extract_bundle(
         annot_str_o = f" [{'; '.join(annot_bits_o)}]" if annot_bits_o else ""
         body_val = f": {val_str}{annot_str_o}" if val_str else ""
         obs_kb = resolve_lab_code(code, disp) if sec in {"vital_sign", "lab_observation"} else {}
+        top_vq = res.get("valueQuantity")
+        top_cmp = (
+            str(top_vq.get("comparator") or "").strip()
+            if (not has_components and isinstance(top_vq, Mapping))
+            else ""
+        )
+        if not top_cmp and len(comp_entries) == 1:
+            top_cmp = str(comp_entries[0].get("comparator") or "")
         obs_meta: Dict[str, Any] = {
             "value": val_str,
             "numeric": num_val,
@@ -1494,6 +1642,9 @@ def extract_bundle(
             "category": primary_cat,
             "timestamp": o_ts,
             "is_abnormal": obs_abn,
+            **({"all_components_structured": all_comp_structured} if has_components else {}),
+            **({"comparator": top_cmp} if top_cmp else {}),
+            **({"comparator_observations": comp_entries} if comp_entries else {}),
             **({"interpretation": obs_interp} if obs_interp else {}),
             **({"reference_range": obs_range} if obs_range else {}),
             **({"kb_resolution": obs_kb} if obs_kb else {}),

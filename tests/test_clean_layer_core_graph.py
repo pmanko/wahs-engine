@@ -780,3 +780,274 @@ def test_negated_hold_and_resume_directives_do_not_emit_false_note_conflicts() -
     )
     g_stop_pos = ClinicalEntityGraph.from_extracted_chart(extract_bundle(stopped_pos_resume))
     assert any(e.edge_type == "CONTRADICTED_OR_MODIFIED_BY_NOTE" for e in g_stop_pos.edges)
+
+
+def test_refuted_ckd_condition_with_active_clinical_status_does_not_emit_stage_conflict() -> None:
+    """PRRT_kwDOVrPAic63kws8: refuted/entered-in-error Condition keeping clinicalStatus=active must not trigger CONFLICTS_WITH."""
+    bundle = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "p-ckd-ref", "birthDate": "1960-01-01"}},
+            {
+                "resource": {
+                    "resourceType": "Condition",
+                    "id": "cond-ckd-1",
+                    "clinicalStatus": {"coding": [{"code": "active"}]},
+                    "verificationStatus": {"coding": [{"code": "confirmed"}]},
+                    "code": {
+                        "coding": [{"system": "http://snomed.info/sct", "code": "431855005", "display": "Chronic kidney disease stage 1"}],
+                        "text": "Chronic kidney disease stage 1",
+                    },
+                    "onsetDateTime": "2024-01-01",
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Condition",
+                    "id": "cond-ckd-3-refuted",
+                    "clinicalStatus": {"coding": [{"code": "active"}]},
+                    "verificationStatus": {"coding": [{"code": "refuted"}]},
+                    "code": {
+                        "coding": [{"system": "http://snomed.info/sct", "code": "433144002", "display": "Chronic kidney disease stage 3"}],
+                        "text": "Chronic kidney disease stage 3",
+                    },
+                    "onsetDateTime": "2024-02-01",
+                }
+            },
+        ],
+    }
+    ext = extract_bundle(bundle)
+    g = ClinicalEntityGraph.from_extracted_chart(ext)
+    assert not any(e.edge_type == "CONFLICTS_WITH" for e in g.edges)
+    assert g.conflict_alerts == []
+
+    # Control: two confirmed active CKD stages DO emit CONFLICTS_WITH
+    confirmed_bundle = json.loads(json.dumps(bundle))
+    confirmed_bundle["entry"][2]["resource"]["verificationStatus"] = {"coding": [{"code": "confirmed"}]}
+    g_conf = ClinicalEntityGraph.from_extracted_chart(extract_bundle(confirmed_bundle))
+    assert any(e.edge_type == "CONFLICTS_WITH" for e in g_conf.edges)
+
+
+def test_comparator_valued_observation_component_and_diagnostic_report_child_preserve_safety_edges() -> None:
+    """PRRT_kwDOVrPAic63kws-: Observation components & DiagnosticReport children with comparators retain risk metadata & trigger edges."""
+    comp_bundle = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "p-comp-cmp", "birthDate": "1955-01-01"}},
+            {
+                "resource": {
+                    "resourceType": "MedicationRequest",
+                    "id": "med-met-comp",
+                    "status": "active",
+                    "authoredOn": "2026-01-01",
+                    "medicationCodeableConcept": {"text": "Metformin 1000 MG Oral Tablet"},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Observation",
+                    "id": "obs-renal-panel-comp",
+                    "status": "final",
+                    "category": [{"coding": [{"code": "laboratory"}]}],
+                    "code": {"coding": [{"code": "24362-6", "display": "Renal function panel"}]},
+                    "effectiveDateTime": "2026-06-01",
+                    "component": [
+                        {
+                            "code": {"coding": [{"code": "33914-3", "display": "eGFR"}]},
+                            "valueQuantity": {"value": 30, "comparator": "<", "unit": "mL/min/1.73m2"},
+                            "referenceRange": [{"low": {"value": 60, "unit": "mL/min/1.73m2"}}],
+                        }
+                    ],
+                }
+            },
+        ],
+    }
+    ext_comp = extract_bundle(comp_bundle)
+    assert ext_comp.numeric_points == []
+    obs_item = next(it for it in ext_comp.items if it.resource_uuid == "obs-renal-panel-comp")
+    assert obs_item.metadata.get("is_abnormal") is True
+    assert obs_item.metadata.get("interpretation") == "L"
+    comp_entries = obs_item.metadata.get("comparator_observations") or []
+    assert len(comp_entries) == 1
+    assert comp_entries[0]["comparator"] == "<"
+    assert comp_entries[0]["unit"] == "mL/min/1.73m2"
+    assert comp_entries[0]["interpretation"] == "L"
+    assert comp_entries[0]["is_abnormal"] is True
+
+    g_comp = ClinicalEntityGraph.from_extracted_chart(ext_comp)
+    assert any(
+        e.edge_type == "CONTRAINDICATED_OR_DOSE_ADJUST_IN"
+        for e in g_comp.edges
+    )
+
+    # Also test comparator component without explicit interpretation/referenceRange
+    comp_no_rr = json.loads(json.dumps(comp_bundle))
+    del comp_no_rr["entry"][2]["resource"]["component"][0]["referenceRange"]
+    g_comp_no_rr = ClinicalEntityGraph.from_extracted_chart(extract_bundle(comp_no_rr))
+    assert any(
+        e.edge_type == "CONTRAINDICATED_OR_DOSE_ADJUST_IN"
+        for e in g_comp_no_rr.edges
+    )
+
+    # Control: normal comparator >60 mL/min/1.73m2 must NOT trigger contraindication
+    comp_normal = json.loads(json.dumps(comp_bundle))
+    comp_normal["entry"][2]["resource"]["component"][0]["valueQuantity"] = {
+        "value": 60,
+        "comparator": ">",
+        "unit": "mL/min/1.73m2",
+    }
+    g_normal = ClinicalEntityGraph.from_extracted_chart(extract_bundle(comp_normal))
+    assert not any(
+        e.edge_type == "CONTRAINDICATED_OR_DOSE_ADJUST_IN"
+        for e in g_normal.edges
+    )
+
+    # DiagnosticReport child Observation with comparator <30 mL/min/1.73m2
+    dr_bundle = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "p-dr-cmp", "birthDate": "1955-01-01"}},
+            {
+                "resource": {
+                    "resourceType": "MedicationRequest",
+                    "id": "med-met-dr",
+                    "status": "active",
+                    "authoredOn": "2026-01-01",
+                    "medicationCodeableConcept": {"text": "Metformin 500 MG Oral Tablet"},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Observation",
+                    "id": "obs-egfr-child",
+                    "status": "final",
+                    "category": [{"coding": [{"code": "laboratory"}]}],
+                    "code": {"coding": [{"code": "33914-3", "display": "eGFR"}]},
+                    "effectiveDateTime": "2026-06-01",
+                    "valueQuantity": {"value": 30, "comparator": "<", "unit": "mL/min/1.73m2"},
+                    "interpretation": [{"coding": [{"code": "L"}]}],
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "DiagnosticReport",
+                    "id": "dr-renal-cmp",
+                    "status": "final",
+                    "code": {"coding": [{"code": "24362-6", "display": "Renal function panel"}]},
+                    "effectiveDateTime": "2026-06-01",
+                    "result": [{"reference": "Observation/obs-egfr-child"}],
+                }
+            },
+        ],
+    }
+    ext_dr = extract_bundle(dr_bundle)
+    assert ext_dr.numeric_points == []
+    dr_item = next(it for it in ext_dr.items if it.resource_uuid == "dr-renal-cmp")
+    assert dr_item.metadata.get("is_abnormal") is True
+    assert dr_item.metadata.get("interpretation") == "L"
+    g_dr = ClinicalEntityGraph.from_extracted_chart(ext_dr)
+    assert any(
+        e.edge_type == "CONTRAINDICATED_OR_DOSE_ADJUST_IN"
+        for e in g_dr.edges
+    )
+
+    # Normal upper-bounded Creatinine <1.5 mg/dL component must NOT trigger contraindication
+    cr_normal_comp = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "p-cr-cmp", "birthDate": "1955-01-01"}},
+            {
+                "resource": {
+                    "resourceType": "MedicationRequest",
+                    "id": "med-met-cr",
+                    "status": "active",
+                    "authoredOn": "2026-01-01",
+                    "medicationCodeableConcept": {"text": "Metformin 500 MG Oral Tablet"},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Observation",
+                    "id": "obs-cr-cmp",
+                    "status": "final",
+                    "category": [{"coding": [{"code": "laboratory"}]}],
+                    "code": {"coding": [{"code": "24362-6", "display": "Renal function panel"}]},
+                    "effectiveDateTime": "2026-06-01",
+                    "component": [
+                        {
+                            "code": {"coding": [{"code": "2160-0", "display": "Creatinine"}]},
+                            "valueQuantity": {"value": 1.5, "comparator": "<", "unit": "mg/dL"},
+                        }
+                    ],
+                }
+            },
+        ],
+    }
+    g_cr = ClinicalEntityGraph.from_extracted_chart(extract_bundle(cr_normal_comp))
+    assert not any(
+        e.edge_type == "CONTRAINDICATED_OR_DOSE_ADJUST_IN"
+        for e in g_cr.edges
+    )
+
+    # Multi-child DiagnosticReport: abnormal Glucose [L] must NOT cross-contaminate normal eGFR >60
+    dr_multi_bundle = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "p-dr-multi", "birthDate": "1955-01-01"}},
+            {
+                "resource": {
+                    "resourceType": "MedicationRequest",
+                    "id": "med-met-multi",
+                    "status": "active",
+                    "authoredOn": "2026-01-01",
+                    "medicationCodeableConcept": {"text": "Metformin 500 MG Oral Tablet"},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Observation",
+                    "id": "obs-glu-child",
+                    "status": "final",
+                    "category": [{"coding": [{"code": "laboratory"}]}],
+                    "code": {"coding": [{"code": "2345-7", "display": "Glucose"}]},
+                    "effectiveDateTime": "2026-06-01",
+                    "valueQuantity": {"value": 45, "unit": "mg/dL"},
+                    "interpretation": [{"coding": [{"code": "L"}]}],
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Observation",
+                    "id": "obs-egfr-normal-child",
+                    "status": "final",
+                    "category": [{"coding": [{"code": "laboratory"}]}],
+                    "code": {"coding": [{"code": "33914-3", "display": "eGFR"}]},
+                    "effectiveDateTime": "2026-06-01",
+                    "valueQuantity": {"value": 60, "comparator": ">", "unit": "mL/min/1.73m2"},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "DiagnosticReport",
+                    "id": "dr-multi-panel",
+                    "status": "final",
+                    "code": {"coding": [{"code": "24323-8", "display": "Comprehensive metabolic panel"}]},
+                    "effectiveDateTime": "2026-06-01",
+                    "result": [
+                        {"reference": "Observation/obs-glu-child"},
+                        {"reference": "Observation/obs-egfr-normal-child"},
+                    ],
+                }
+            },
+        ],
+    }
+    g_dr_multi = ClinicalEntityGraph.from_extracted_chart(extract_bundle(dr_multi_bundle))
+    assert not any(
+        e.edge_type == "CONTRAINDICATED_OR_DOSE_ADJUST_IN"
+        for e in g_dr_multi.edges
+    )
