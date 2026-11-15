@@ -748,6 +748,20 @@ def _accumulate_stream_tool_calls(
                 )
 
 
+def _normalize_tool_calls_with_ids(
+    tool_calls: Sequence[Mapping[str, Any]],
+    *,
+    round_idx: int,
+) -> List[Dict[str, Any]]:
+    """Copy tool call dicts and ensure each has a stable, non-empty ``id`` for pairing."""
+    out: List[Dict[str, Any]] = []
+    for idx, tc in enumerate(tool_calls):
+        item = dict(tc) if isinstance(tc, Mapping) else {}
+        item["id"] = str(item.get("id") or f"call_{round_idx + 1}_{idx + 1}")
+        out.append(item)
+    return out
+
+
 def _execute_tool_call_batch(
     ctx: AssembledWahsContext,
     options: WahsRequestOptions,
@@ -756,12 +770,31 @@ def _execute_tool_call_batch(
     round_idx: int,
     tool_calls_log: List[Dict[str, Any]],
 ) -> Tuple[List[Dict[str, Any]], int]:
-    """Execute up to 4 overflow tool calls and return `(tool_messages, recovered_count)`."""
+    """Execute up to 4 overflow tool calls and pair every call ID with a ``tool`` message."""
     tool_msgs: List[Dict[str, Any]] = []
     recovered_total = 0
-    for tc in list(tool_calls)[:4]:
+    for tc_idx, tc in enumerate(tool_calls):
         fn = (tc.get("function") or {}) if isinstance(tc, Mapping) else {}
         fn_name = str(fn.get("name") or "")
+        tc_id = str(
+            (tc.get("id") if isinstance(tc, Mapping) else None)
+            or f"call_{round_idx + 1}_{tc_idx + 1}"
+        )
+        if tc_idx >= 4:
+            tool_msgs.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc_id,
+                    "name": fn_name,
+                    "content": json.dumps(
+                        {
+                            "error": "tool_call_limit_exceeded",
+                            "message": "Maximum 4 tool calls executed per round; prioritize key lookups.",
+                        }
+                    ),
+                }
+            )
+            continue
         try:
             fn_args = json.loads(fn.get("arguments") or "{}")
         except Exception:
@@ -781,7 +814,7 @@ def _execute_tool_call_batch(
         tool_msgs.append(
             {
                 "role": "tool",
-                "tool_call_id": str(tc.get("id") or f"call_{round_idx + 1}"),
+                "tool_call_id": tc_id,
                 "name": fn_name,
                 "content": tool_out,
             }
@@ -922,9 +955,14 @@ class SouthboundOpenAIClient:
                 tool_calls = (msg0.get("tool_calls") or []) if isinstance(msg0, Mapping) else []
                 if not tool_calls or not allow_tools:
                     break
-                followup_msgs.append(dict(msg0))
+                normalized_calls = _normalize_tool_calls_with_ids(
+                    tool_calls, round_idx=round_idx
+                )
+                assistant_msg = dict(msg0)
+                assistant_msg["tool_calls"] = normalized_calls
+                followup_msgs.append(assistant_msg)
                 tool_msgs, rec_delta = _execute_tool_call_batch(
-                    ctx, options, tool_calls, round_idx=round_idx, tool_calls_log=tool_calls_log
+                    ctx, options, normalized_calls, round_idx=round_idx, tool_calls_log=tool_calls_log
                 )
                 overflow_recovered += rec_delta
                 followup_msgs.extend(tool_msgs)
@@ -1234,7 +1272,10 @@ class SouthboundOpenAIClient:
                         buffered_pieces.append(tail)
 
                 if tool_calls_by_idx and round_idx < max_tool_rounds:
-                    assembled_calls = [tool_calls_by_idx[k] for k in sorted(tool_calls_by_idx)]
+                    assembled_calls = _normalize_tool_calls_with_ids(
+                        [tool_calls_by_idx[k] for k in sorted(tool_calls_by_idx)],
+                        round_idx=round_idx,
+                    )
                     followup_msgs.append(
                         {
                             "role": "assistant",

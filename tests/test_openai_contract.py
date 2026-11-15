@@ -220,7 +220,7 @@ async def test_streaming_buffers_pre_tool_round_text_until_terminal_round() -> N
         model_specs={
             "wahs-test": ModelSpec(
                 upstream_model="gemma4:12b",
-                context_window=8192,
+                context_window=32768,
                 chart_budget_ceiling=2048,
                 tokenizer_family="gemma4",
                 provider_flavor="litellm",
@@ -268,3 +268,154 @@ async def test_streaming_buffers_pre_tool_round_text_until_terminal_round() -> N
     assert round_counter["n"] == 2
     assert "PRE_TOOL_DRAFT" not in raw_sse
     assert "FINAL_ANSWER" in raw_sse
+
+
+@pytest.mark.asyncio
+async def test_tool_call_batch_over_four_returns_paired_tool_messages_for_skipped_calls() -> None:
+    from wahs_engine.app import create_app
+    from wahs_engine.config import ModelSpec, WahsEngineSettings
+
+    captured_requests: List[Dict[str, Any]] = []
+
+    def llm_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"object": "list", "data": [{"id": "gemma4:12b"}]})
+        body = json.loads(request.content.decode("utf-8"))
+        captured_requests.append(body)
+        is_round_two = any(m.get("role") == "tool" for m in body.get("messages", []))
+
+        if body.get("stream"):
+            if not is_round_two:
+                tc_deltas = [
+                    {
+                        "index": i,
+                        "id": f"call_stream_{i}",
+                        "type": "function",
+                        "function": {"name": "search_chart_entries", "arguments": json.dumps({"query": f"lab {i}"})},
+                    }
+                    for i in range(6)
+                ]
+                sse_lines = [
+                    f'data: {json.dumps({"id": "s1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"tool_calls": tc_deltas}, "finish_reason": None}]})}',
+                    'data: {"id":"s1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}',
+                    "data: [DONE]",
+                ]
+                return httpx.Response(
+                    200,
+                    headers={"content-type": "text/event-stream"},
+                    content=("\n\n".join(sse_lines) + "\n\n").encode("utf-8"),
+                )
+            sse_lines = [
+                'data: {"id":"s2","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"STREAM_DONE"},"finish_reason":null}]}',
+                'data: {"id":"s2","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+                "data: [DONE]",
+            ]
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=("\n\n".join(sse_lines) + "\n\n").encode("utf-8"),
+            )
+
+        if not is_round_two:
+            calls = [
+                {
+                    "id": f"call_sync_{i}",
+                    "type": "function",
+                    "function": {"name": "search_chart_entries", "arguments": json.dumps({"query": f"lab {i}"})},
+                }
+                for i in range(6)
+            ]
+            return httpx.Response(
+                200,
+                json={
+                    "id": "sync-1",
+                    "object": "chat.completion",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": None, "tool_calls": calls}, "finish_reason": "tool_calls"}],
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": "sync-2",
+                "object": "chat.completion",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "SYNC_DONE"}, "finish_reason": "stop"}],
+            },
+        )
+
+    settings = WahsEngineSettings(
+        allow_local_bundle_mode=True,
+        llm_base_url="http://mock-llm/v1",
+        default_model="wahs-test",
+        model_specs={
+            "wahs-test": ModelSpec(
+                upstream_model="gemma4:12b",
+                context_window=32768,
+                chart_budget_ceiling=2048,
+                tokenizer_family="gemma4",
+                provider_flavor="litellm",
+                disable_thinking=True,
+            )
+        },
+    )
+    entries = [{"resource": {"resourceType": "Patient", "id": "p-tc6", "birthDate": "1960-01-01"}}]
+    for idx in range(45):
+        entries.append(
+            {
+                "resource": {
+                    "resourceType": "Observation",
+                    "id": f"obs-tc6-{idx}",
+                    "status": "final",
+                    "category": [{"coding": [{"code": "laboratory"}]}],
+                    "code": {"coding": [{"system": "http://loinc.org", "code": f"888-{idx}", "display": f"Filler Panel Result Number {idx} with Extended Text"}]},
+                    "effectiveDateTime": "2026-01-01",
+                    "valueQuantity": {"value": float(idx), "unit": "mg/dL"},
+                }
+            }
+        )
+    bundle = {"resourceType": "Bundle", "type": "collection", "entry": entries}
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(llm_handler)) as llm_client:
+        app = create_app(settings, llm_http_client=llm_client)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://wahs-engine"
+        ) as api:
+            # Streaming 6 parallel tool calls
+            r_stream = await api.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "wahs-test",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "Check labs"}],
+                    "wahs": {"fhir_bundle": bundle, "target_budget_tokens": 512, "enable_overflow_tools": True},
+                },
+            )
+            assert r_stream.status_code == 200
+            assert "STREAM_DONE" in r_stream.text
+            stream_round2_msgs = captured_requests[1]["messages"]
+            stream_asst = [m for m in stream_round2_msgs if m.get("role") == "assistant" and m.get("tool_calls")][-1]
+            stream_tools = [m for m in stream_round2_msgs if m.get("role") == "tool"]
+            assert [tc["id"] for tc in stream_asst["tool_calls"]] == [f"call_stream_{i}" for i in range(6)]
+            assert [m["tool_call_id"] for m in stream_tools] == [f"call_stream_{i}" for i in range(6)]
+            assert "tool_call_limit_exceeded" in stream_tools[4]["content"]
+            assert "tool_call_limit_exceeded" in stream_tools[5]["content"]
+
+            # Non-streaming 6 parallel tool calls
+            r_sync = await api.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "wahs-test",
+                    "stream": False,
+                    "messages": [{"role": "user", "content": "Check labs"}],
+                    "wahs": {"fhir_bundle": bundle, "target_budget_tokens": 512, "enable_overflow_tools": True},
+                },
+            )
+            assert r_sync.status_code == 200
+            assert r_sync.json()["choices"][0]["message"]["content"] == "SYNC_DONE"
+            assert len(r_sync.json()["x_wahs"]["tool_calls"]) == 4
+            sync_round2_msgs = captured_requests[3]["messages"]
+            sync_asst = [m for m in sync_round2_msgs if m.get("role") == "assistant" and m.get("tool_calls")][-1]
+            sync_tools = [m for m in sync_round2_msgs if m.get("role") == "tool"]
+            assert [tc["id"] for tc in sync_asst["tool_calls"]] == [f"call_sync_{i}" for i in range(6)]
+            assert [m["tool_call_id"] for m in sync_tools] == [f"call_sync_{i}" for i in range(6)]
+            assert "tool_call_limit_exceeded" in sync_tools[4]["content"]
+            assert "tool_call_limit_exceeded" in sync_tools[5]["content"]
