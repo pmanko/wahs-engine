@@ -1352,7 +1352,9 @@ class ClinicalEntityGraph:
             if e.edge_type == "CONFLICTS_WITH" and e.source_id != e.target_id
         }
 
-        def _is_clinically_significant_obs(tgt: ClinicalNode, t_low: str) -> bool:
+        def _is_clinically_significant_obs(
+            tgt: ClinicalNode, t_low: str, rule: Mapping[str, Any]
+        ) -> bool:
             if tgt.category != "Observation":
                 return True
             if tgt.metadata.get("section") == "lab_panel" and bool(
@@ -1398,8 +1400,10 @@ class ClinicalEntityGraph:
                 return None
 
             if _contains_clinical_term(t_low, "egfr") or _contains_clinical_term(t_low, "glomerular filtration"):
+                raw_egfr_lt = rule.get("egfr_lt")
+                egfr_lt = float(raw_egfr_lt) if raw_egfr_lt is not None else 60.0
                 if not unit_compact or "ml/min" in unit_compact:
-                    res = _eval_low(60.0, lambda x: x)
+                    res = _eval_low(egfr_lt, lambda x: x)
                     if res is not None:
                         return res
                 return is_abn and is_low
@@ -1419,15 +1423,40 @@ class ClinicalEntityGraph:
                         return res
                 return is_abn and is_high
             if _contains_clinical_term(t_low, "potassium"):
+                raw_dirs = rule.get("potassium_directions")
+                k_dirs = (
+                    {str(d).strip().lower() for d in raw_dirs}
+                    if raw_dirs
+                    else {"high", "low"}
+                )
+                allow_high = "high" in k_dirs
+                allow_low = "low" in k_dirs
                 if unit_compact in {"", "meq/l", "mmol/l", "meq/liter", "mmol/liter"}:
                     if has_num:
-                        return float(val) >= 5.0 or float(val) <= 3.4
+                        k_val = float(val)
+                        return (allow_high and k_val >= 5.0) or (
+                            allow_low and k_val <= 3.4
+                        )
                     if cmp_num is not None:
-                        if cmp_op in {">", ">="} and cmp_num >= 5.0:
+                        if allow_high and cmp_op in {">", ">="} and cmp_num >= 5.0:
                             return True
-                        if cmp_op in {"<", "<="} and cmp_num <= 3.4:
+                        if allow_low and cmp_op in {"<", "<="} and cmp_num <= 3.4:
                             return True
-                return is_abn and (is_high or is_low or not interp)
+                        high_ruled_out = (not allow_high) or (
+                            (cmp_op == "<" and cmp_num <= 5.0)
+                            or (cmp_op == "<=" and cmp_num < 5.0)
+                        )
+                        low_ruled_out = (not allow_low) or (
+                            (cmp_op == ">" and cmp_num >= 3.4)
+                            or (cmp_op == ">=" and cmp_num > 3.4)
+                        )
+                        if high_ruled_out and low_ruled_out:
+                            return False
+                return is_abn and (
+                    (allow_high and is_high)
+                    or (allow_low and is_low)
+                    or (not interp and allow_high and allow_low)
+                )
             if _contains_clinical_term(t_low, "inr"):
                 if unit_compact in {"", "{inr}", "inr", "ratio", "1", "none"}:
                     res = _eval_high(3.5, lambda x: x)
@@ -1511,7 +1540,7 @@ class ClinicalEntityGraph:
                         for rk in risk_kws
                     ):
                         continue
-                    if not _is_clinically_significant_obs(tgt, t_low):
+                    if not _is_clinically_significant_obs(tgt, t_low, rule):
                         continue
                     matched_tgts.append(tgt)
                 matched_tgts.sort(

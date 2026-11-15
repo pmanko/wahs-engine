@@ -1383,3 +1383,76 @@ def test_graph_preserves_linked_medication_order_uuids_against_duplicate_conflic
     }
     g_unlinked = ClinicalEntityGraph.from_extracted_chart(extract_bundle(unlinked_bundle))
     assert any(e.edge_type == "CONFLICTS_WITH" for e in g_unlinked.edges)
+
+
+def test_rule_specific_egfr_threshold_and_potassium_direction() -> None:
+    """PRRT_kwDOVrPAic63lRE3 & PRRT_kwDOVrPAic63lRE6: metformin eGFR <45 threshold and rule-scoped potassium direction."""
+    from wahs_core import ClinicalEntityGraph, extract_bundle
+
+    def _single_lab_bundle(
+        med_text: str, loinc: str, display: str, val: float, unit: str, interp: str
+    ) -> Dict[str, Any]:
+        return {
+            "resourceType": "Bundle",
+            "type": "collection",
+            "entry": [
+                {"resource": {"resourceType": "Patient", "id": "p-rule-spec", "birthDate": "1960-01-01"}},
+                {
+                    "resource": {
+                        "resourceType": "MedicationRequest",
+                        "id": "med-1",
+                        "status": "active",
+                        "authoredOn": "2026-09-01",
+                        "medicationCodeableConcept": {"text": med_text},
+                    }
+                },
+                {
+                    "resource": {
+                        "resourceType": "Observation",
+                        "id": "obs-1",
+                        "status": "final",
+                        "category": [{"coding": [{"code": "laboratory"}]}],
+                        "code": {"coding": [{"system": "http://loinc.org", "code": loinc, "display": display}], "text": display},
+                        "interpretation": [{"coding": [{"code": interp}]}],
+                        "effectiveDateTime": "2026-10-01",
+                        "valueQuantity": {"value": val, "unit": unit},
+                    }
+                },
+            ],
+        }
+
+    # Metformin + eGFR 59 mL/min/1.73m2 (L) -> must NOT trigger (dose-adjust only at 30-44, contraindicated < 30)
+    g_met_59 = ClinicalEntityGraph.from_extracted_chart(
+        extract_bundle(_single_lab_bundle("Metformin 500 MG", "33914-3", "eGFR", 59.0, "mL/min/1.73m2", "L"))
+    )
+    assert not any(e.edge_type == "CONTRAINDICATED_OR_DOSE_ADJUST_IN" for e in g_met_59.edges)
+
+    # Metformin + eGFR 44 mL/min/1.73m2 (L) -> DOES trigger (30-44 dose adjustment range)
+    g_met_44 = ClinicalEntityGraph.from_extracted_chart(
+        extract_bundle(_single_lab_bundle("Metformin 500 MG", "33914-3", "eGFR", 44.0, "mL/min/1.73m2", "L"))
+    )
+    assert any(e.edge_type == "CONTRAINDICATED_OR_DOSE_ADJUST_IN" for e in g_met_44.edges)
+
+    # Lisinopril (RAAS hyperkalemia rule) + hypokalemia K+ 3.0 mmol/L (L) -> must NOT warn for hyperkalemia
+    g_lis_low_k = ClinicalEntityGraph.from_extracted_chart(
+        extract_bundle(_single_lab_bundle("Lisinopril 10 MG", "2823-3", "Potassium", 3.0, "mmol/L", "L"))
+    )
+    assert not any(e.edge_type == "CONTRAINDICATED_OR_DOSE_ADJUST_IN" for e in g_lis_low_k.edges)
+
+    # Lisinopril + hyperkalemia K+ 5.5 mmol/L (H) -> DOES warn
+    g_lis_hi_k = ClinicalEntityGraph.from_extracted_chart(
+        extract_bundle(_single_lab_bundle("Lisinopril 10 MG", "2823-3", "Potassium", 5.5, "mmol/L", "H"))
+    )
+    assert any(e.edge_type == "CONTRAINDICATED_OR_DOSE_ADJUST_IN" for e in g_lis_hi_k.edges)
+
+    # Furosemide (potassium-wasting diuretic) + hypokalemia K+ 3.0 mmol/L (L) -> DOES warn
+    g_fur_low_k = ClinicalEntityGraph.from_extracted_chart(
+        extract_bundle(_single_lab_bundle("Furosemide 20 MG", "2823-3", "Potassium", 3.0, "mmol/L", "L"))
+    )
+    assert any(e.edge_type == "CONTRAINDICATED_OR_DOSE_ADJUST_IN" for e in g_fur_low_k.edges)
+
+    # Furosemide + hyperkalemia K+ 5.5 mmol/L (H) -> must NOT falsely fire loop-diuretic hypokalemia risk
+    g_fur_hi_k = ClinicalEntityGraph.from_extracted_chart(
+        extract_bundle(_single_lab_bundle("Furosemide 20 MG", "2823-3", "Potassium", 5.5, "mmol/L", "H"))
+    )
+    assert not any(e.edge_type == "CONTRAINDICATED_OR_DOSE_ADJUST_IN" for e in g_fur_hi_k.edges)

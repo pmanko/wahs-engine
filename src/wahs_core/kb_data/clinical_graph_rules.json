@@ -280,6 +280,7 @@
         "aki"
       ],
       "rationale": "Metformin renal safety: contraindicated when eGFR < 30 mL/min/1.73m2; avoid initiation and reduce dose when eGFR 30-44 due to lactic acidosis risk",
+      "egfr_lt": 45.0,
       "kb_source": "FDA Metformin Boxed Warning & KDIGO Diabetes in CKD"
     },
     {
@@ -309,6 +310,9 @@
         "glomerular filtration"
       ],
       "rationale": "RAAS / MRA cardiorenal safety: monitor potassium (hyperkalemia risk) and renal function (eGFR/creatinine) in advanced CKD or volume depletion",
+      "potassium_directions": [
+        "high"
+      ],
       "kb_source": "AHA/ACC/HFSA & KDIGO Cardiorenal Monitoring Rule"
     },
     {
@@ -426,6 +430,9 @@
         "acute kidney"
       ],
       "rationale": "Diuretic electrolyte & renal safety: monitor potassium, sodium, volume status, and creatinine",
+      "potassium_directions": [
+        "low"
+      ],
       "kb_source": "ACC/AHA Heart Failure Diuretic Monitoring Rule"
     },
     {
