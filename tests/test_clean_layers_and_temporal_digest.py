@@ -1244,3 +1244,268 @@ def test_fulfilled_appointment_populates_last_completed_clinical_encounter() -> 
     assert "- Last Completed Clinical Encounter:" in digest.digest_text
     assert "2026-03-10" in digest.digest_text
     assert "- Upcoming Scheduled Encounters" not in digest.digest_text
+
+
+def test_appointment_sensitive_reason_redacted_on_external_share() -> None:
+    """PRRT_kwDOVrPAic63kqTY: Appointment/Encounter reasonCode and facility sensitivity must trigger external_share redaction."""
+    bundle = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "p-appt-sens", "birthDate": "1982-08-15"}},
+            {
+                "resource": {
+                    "resourceType": "Encounter",
+                    "id": "enc-base-pcp",
+                    "status": "finished",
+                    "type": [{"text": "Primary Care Visit"}],
+                    "period": {"start": "2026-01-10"},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Appointment",
+                    "id": "appt-sens-1",
+                    "status": "booked",
+                    "description": "Follow-up",
+                    "start": "2026-04-12T09:00:00Z",
+                    "reasonCode": [{"text": "HIV disease"}],
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Encounter",
+                    "id": "enc-sens-2",
+                    "status": "planned",
+                    "type": [{"text": "Clinic Consult"}],
+                    "period": {"start": "2026-05-01"},
+                    "reasonCode": [{"text": "Alcohol dependence counseling"}],
+                }
+            },
+        ],
+    }
+
+    ext = extract_bundle(bundle)
+    appt_item = next(it for it in ext.items if it.resource_uuid == "appt-sens-1")
+    enc_sens_item = next(it for it in ext.items if it.resource_uuid == "enc-sens-2")
+    assert appt_item.sensitivity == "SDOH/PRIVACY-SENSITIVE"
+    assert enc_sens_item.sensitivity == "SDOH/PRIVACY-SENSITIVE"
+
+    condensed_ext = condense_bundle_to_budget(ext, target_tokens=8192, sharing_posture="external_share")
+    assert "HIV disease" not in condensed_ext.chart_text
+    assert "appt-sens-1" not in condensed_ext.chart_text
+    assert "Alcohol dependence" not in condensed_ext.chart_text
+
+    digest_ext = build_temporal_digest(ext, condensed=condensed_ext, sharing_posture="external_share")
+    assert "HIV disease" not in digest_ext.digest_text
+    assert "2026-04-12" not in digest_ext.digest_text
+    assert "2026-05-01" not in digest_ext.digest_text
+
+
+def test_mixed_timezone_provenance_series_rejects_trend() -> None:
+    """PRRT_kwDOVrPAic63kqTb: Mixing offset-aware and naive/date-only timestamps must mark series trend_supported=False."""
+    bundle = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "p-mix-tz", "birthDate": "1971-01-01"}},
+            {
+                "resource": {
+                    "resourceType": "Observation",
+                    "id": "obs-naive-1",
+                    "status": "final",
+                    "category": [{"coding": [{"code": "laboratory"}]}],
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "2160-0", "display": "Creatinine"}], "text": "Creatinine"},
+                    "effectiveDateTime": "2026-01-01T23:30:00",
+                    "valueQuantity": {"value": 2.0, "unit": "mg/dL"},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Observation",
+                    "id": "obs-aware-2",
+                    "status": "final",
+                    "category": [{"coding": [{"code": "laboratory"}]}],
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "2160-0", "display": "Creatinine"}], "text": "Creatinine"},
+                    "effectiveDateTime": "2026-01-02T00:00:00+14:00",
+                    "valueQuantity": {"value": 1.0, "unit": "mg/dL"},
+                }
+            },
+        ],
+    }
+
+    ext = extract_bundle(bundle)
+    condensed = condense_bundle_to_budget(ext, target_tokens=8192)
+    digest = build_temporal_digest(ext, condensed=condensed, question="How is creatinine changing?")
+    assert digest.summary["multi_point_series_count"] == 0
+    assert "decreasing" not in digest.digest_text.lower()
+    assert "latest 1" not in digest.digest_text.lower()
+    assert "trend not supported" in digest.digest_text.lower()
+    assert "range 1..2" in digest.digest_text
+
+
+@pytest.mark.asyncio
+async def test_note_rag_and_digest_respect_tight_context_window_without_422() -> None:
+    """PRRT_kwDOVrPAic63kqTe: note_rag + digest + KB must reserve RAG headroom and never exceed model context_window."""
+    from wahs_engine.tokenizers_registry import count_chat_messages_tokens
+
+    long_note = (
+        "Hospital Discharge Note: Patient evaluated for acute kidney injury and creatinine elevation. "
+        + ("Renal function potassium creatinine hydration medication reconciliation plan documented in detail. " * 35)
+    )
+    bundle = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "p-rag-tight", "birthDate": "1964-05-05"}},
+            {
+                "resource": {
+                    "resourceType": "Condition",
+                    "id": "cond-ckd-tight",
+                    "clinicalStatus": {"coding": [{"code": "active"}]},
+                    "code": {"text": "Chronic kidney disease stage 3"},
+                    "onsetDateTime": "2024-01-01",
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "MedicationRequest",
+                    "id": "med-met-tight",
+                    "status": "active",
+                    "authoredOn": "2026-01-10",
+                    "medicationCodeableConcept": {"text": "Metformin 500 MG Oral Tablet"},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Observation",
+                    "id": "obs-cr-tight-1",
+                    "status": "final",
+                    "category": [{"coding": [{"code": "laboratory"}]}],
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "2160-0", "display": "Creatinine"}], "text": "Creatinine"},
+                    "effectiveDateTime": "2026-01-01",
+                    "valueQuantity": {"value": 1.1, "unit": "mg/dL"},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Observation",
+                    "id": "obs-cr-tight-2",
+                    "status": "final",
+                    "category": [{"coding": [{"code": "laboratory"}]}],
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "2160-0", "display": "Creatinine"}], "text": "Creatinine"},
+                    "effectiveDateTime": "2026-02-01",
+                    "valueQuantity": {"value": 1.9, "unit": "mg/dL"},
+                    "interpretation": [{"coding": [{"code": "H"}]}],
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "DocumentReference",
+                    "id": "doc-rag-tight",
+                    "status": "current",
+                    "date": "2026-02-02",
+                    "type": {"text": "Discharge Summary"},
+                    "content": [{"attachment": {"contentType": "text/plain", "data": _b64(long_note)}}],
+                }
+            },
+        ],
+    }
+
+    captured: List[Dict[str, Any]] = []
+
+    async def llm_handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
+            200,
+            json={
+                "id": "cmpl-tight-1",
+                "object": "chat.completion",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "Summary complete."}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 500, "completion_tokens": 10, "total_tokens": 510},
+            },
+        )
+
+    long_question = (
+        "What does the discharge note say about creatinine and metformin? "
+        + ("Please review all recent discharge findings carefully for creatinine, potassium, and metformin dosing. " * 140)
+    )
+
+    # First measure exact base chart_only prompt tokens so we set a genuinely tight context_window
+    wide_settings = WahsEngineSettings(
+        fhir_auth_base_url="http://fhir-auth:8080/fhir",
+        llm_base_url="http://llm-backend:4000/v1",
+        allow_local_bundle_mode=True,
+        default_model="wahs-tight",
+        model_specs={
+            "wahs-tight": ModelSpec(
+                upstream_model="ollama/gemma4:12b",
+                context_window=32768,
+                chart_budget_ceiling=512,
+                default_max_output_tokens=512,
+                tokenizer_family="gemma4",
+                provider_flavor="litellm",
+                disable_thinking=True,
+            )
+        },
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(llm_handler)) as llm_client:
+        app_wide = create_app(wide_settings, llm_http_client=llm_client)
+        with TestClient(app_wide) as client_wide:
+            resp_base = client_wide.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "wahs-tight",
+                    "stream": False,
+                    "max_tokens": 512,
+                    "messages": [{"role": "user", "content": long_question}],
+                    "wahs": {
+                        "fhir_bundle": bundle,
+                        "retrieval_strategy": "chart_only",
+                        "target_budget_tokens": 512,
+                    },
+                },
+            )
+            assert resp_base.status_code == 200
+            base_tokens = count_chat_messages_tokens(captured[-1]["messages"], tokenizer_family="gemma4")
+
+    # Tight window leaves only +260 tokens of prompt room beyond base prompt + max_tokens=512,
+    # which is smaller than RAG + full KB + full Temporal Digest combined.
+    tight_window = base_tokens + 512 + 260
+    tight_settings = WahsEngineSettings(
+        fhir_auth_base_url="http://fhir-auth:8080/fhir",
+        llm_base_url="http://llm-backend:4000/v1",
+        allow_local_bundle_mode=True,
+        default_model="wahs-tight",
+        model_specs={
+            "wahs-tight": ModelSpec(
+                upstream_model="ollama/gemma4:12b",
+                context_window=tight_window,
+                chart_budget_ceiling=512,
+                default_max_output_tokens=512,
+                tokenizer_family="gemma4",
+                provider_flavor="litellm",
+                disable_thinking=True,
+            )
+        },
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(llm_handler)) as llm_client:
+        app_tight = create_app(tight_settings, llm_http_client=llm_client)
+        with TestClient(app_tight) as client_tight:
+            resp_rag = client_tight.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "wahs-tight",
+                    "stream": False,
+                    "max_tokens": 512,
+                    "messages": [{"role": "user", "content": long_question}],
+                    "wahs": {
+                        "fhir_bundle": bundle,
+                        "retrieval_strategy": "note_rag",
+                        "target_budget_tokens": 512,
+                    },
+                },
+            )
+            assert resp_rag.status_code == 200
+            sent_tokens = count_chat_messages_tokens(captured[-1]["messages"], tokenizer_family="gemma4")
+            assert sent_tokens + 512 <= tight_window

@@ -184,6 +184,13 @@ def _resolve_series_bounds(
     day_of = lambda p: _iso10(p.date) or ""
     all_utc = all((p.timestamp or "").startswith("Z:") for p in raw_pts)
     all_naive = all((p.timestamp or "").startswith("N:") for p in raw_pts)
+    has_utc = any((p.timestamp or "").startswith("Z:") for p in raw_pts)
+    has_non_utc = any(not (p.timestamp or "").startswith("Z:") for p in raw_pts)
+    if has_utc and has_non_utc:
+        min_day = min(day_of(p) for p in raw_pts)
+        max_day = max(day_of(p) for p in raw_pts)
+        same_val = len({p.value for p in raw_pts}) == 1
+        return False, same_val, list(raw_pts), list(raw_pts), min_day, max_day
     if all_utc or all_naive:
         bound_day = (
             (lambda p: (_iso10(p.timestamp[2:]) or day_of(p)))

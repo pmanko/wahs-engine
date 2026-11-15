@@ -530,6 +530,7 @@ def extract_bundle(
     encounters_by_id: Dict[str, Mapping[str, Any]] = {}
     obs_by_id: Dict[str, Mapping[str, Any]] = {}
     conds_by_id: Dict[str, str] = {}
+    cond_sens_by_id: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
     provenance_org_by_target: Dict[str, str] = {}
 
     patient_res: Optional[Mapping[str, Any]] = None
@@ -649,6 +650,47 @@ def extract_bundle(
         if not sens and fallback_kb_sensitivity:
             return str(fallback_kb_sensitivity), "kb_coded_privacy"
         return sens, src
+
+    def _classify_visit_sensitivity(
+        res: Mapping[str, Any],
+        primary_code: Optional[str],
+        disp_label: str,
+        reason_pairs: Sequence[Tuple[str, str]],
+        reasons: Sequence[str],
+        ref_cond_ids: Sequence[str],
+        org: Optional[str],
+    ) -> Tuple[Optional[str], Optional[str]]:
+        combined_text = " | ".join(
+            p for p in [disp_label, *reasons, org or ""] if p
+        )
+        sens, src = _classify_res_sensitivity(res, primary_code, combined_text)
+        if sens == "SDOH/PRIVACY-SENSITIVE":
+            return sens, src
+        fallback_pair: Tuple[Optional[str], Optional[str]] = (sens, src)
+        for r_code, r_disp in reason_pairs:
+            r_kb = resolve_condition_code(r_code, r_disp)
+            r_kb_sens = (
+                r_kb.get("sensitivity")
+                if r_kb.get("resolved_by") != "heuristic_fallback"
+                else None
+            )
+            r_sens, r_src = _classify_res_sensitivity(
+                res,
+                r_code,
+                r_disp,
+                fallback_kb_sensitivity=r_kb_sens,
+            )
+            if r_sens == "SDOH/PRIVACY-SENSITIVE":
+                return r_sens, r_src
+            if not fallback_pair[0] and r_sens:
+                fallback_pair = (r_sens, r_src)
+        for cid in ref_cond_ids:
+            c_sens, c_src = cond_sens_by_id.get(cid, (None, None))
+            if c_sens == "SDOH/PRIVACY-SENSITIVE":
+                return c_sens, c_src
+            if not fallback_pair[0] and c_sens:
+                fallback_pair = (c_sens, c_src)
+        return fallback_pair
 
     items: List[ClinicalItem] = []
     numeric_points: List[NumericPoint] = []
@@ -874,6 +916,8 @@ def extract_bundle(
         )
         conflict = condition_conflicts.get(rid)
         sens = c["sensitivity"]
+        if rid and sens:
+            cond_sens_by_id[rid] = (sens, c["sensitivity_source"] or "condition_privacy")
         event_date = c["onset"] if is_active else (c["abatement"] or c["onset"])
         details = [f"status: {c['status']}"]
         if c["verification"]:
@@ -1998,18 +2042,26 @@ def extract_bundle(
             types = res.get("type") or []
             _, t_disp = _coding_pair(types[0] if types else {})
             reasons: List[str] = []
+            reason_pairs: List[Tuple[str, str]] = []
+            ref_cond_ids: List[str] = []
             for rc in res.get("reasonCode") or []:
-                _, r_disp = _coding_pair(rc)
+                r_code, r_disp = _coding_pair(rc)
+                if r_code or r_disp:
+                    reason_pairs.append((r_code, r_disp))
                 if r_disp:
                     reasons.append(r_disp)
             for rr in res.get("reasonReference") or []:
                 if isinstance(rr, Mapping):
                     c_id = _strip_urn(rr.get("reference"))
+                    if c_id:
+                        ref_cond_ids.append(c_id)
                     r_disp = str(rr.get("display") or conds_by_id.get(c_id) or "").strip()
                     if r_disp:
                         reasons.append(r_disp)
             org = resolve_source_org(res)
-            enc_sens, enc_sens_src = _classify_res_sensitivity(res, enc_class, t_disp or "")
+            enc_sens, enc_sens_src = _classify_visit_sensitivity(
+                res, enc_class, t_disp or "", reason_pairs, reasons, ref_cond_ids, org
+            )
             is_high_acuity = enc_class in {"IMP", "INPATIENT", "EMER", "EMERGENCY"} or any(
                 w in (t_disp or "").lower() for w in ("inpatient", "emergency", "admission", "intensive")
             )
@@ -2062,12 +2114,26 @@ def extract_bundle(
             )
             appt_code = svc_code or spec_code or appt_type_code
             reasons: List[str] = []
+            reason_pairs: List[Tuple[str, str]] = []
+            ref_cond_ids: List[str] = []
             for rc in res.get("reasonCode") or []:
-                _, r_disp = _coding_pair(rc)
+                r_code, r_disp = _coding_pair(rc)
+                if r_code or r_disp:
+                    reason_pairs.append((r_code, r_disp))
                 if r_disp:
                     reasons.append(r_disp)
+            for rr in res.get("reasonReference") or []:
+                if isinstance(rr, Mapping):
+                    c_id = _strip_urn(rr.get("reference"))
+                    if c_id:
+                        ref_cond_ids.append(c_id)
+                    r_disp = str(rr.get("display") or conds_by_id.get(c_id) or "").strip()
+                    if r_disp:
+                        reasons.append(r_disp)
             org = resolve_source_org(res)
-            appt_sens, appt_sens_src = _classify_res_sensitivity(res, appt_code, appt_disp)
+            appt_sens, appt_sens_src = _classify_visit_sensitivity(
+                res, appt_code, appt_disp, reason_pairs, reasons, ref_cond_ids, org
+            )
             quals = [f"status: {appt_status}"]
             if reasons:
                 quals.append(f"reason: {', '.join(dict.fromkeys(reasons))}")
