@@ -1283,3 +1283,25 @@ def test_medication_timestamp_prevents_same_day_older_hold_note_false_positive()
     }
     g_newer = ClinicalEntityGraph.from_extracted_chart(extract_bundle(bundle_newer_hold))
     assert any(e.edge_type == "CONTRADICTED_OR_MODIFIED_BY_NOTE" for e in g_newer.edges)
+
+    # (c) Stopped medication with two same-day hold notes exercises latest_hold_ts comparator cleanly
+    bundle_two_holds = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "p-med-ts-3", "birthDate": "1964-01-01"}},
+            {
+                "resource": {
+                    "resourceType": "MedicationRequest",
+                    "id": "med-met-ts-stop",
+                    "status": "stopped",
+                    "authoredOn": "2026-01-01",
+                    "medicationCodeableConcept": {"text": "Metformin 500 MG Oral Tablet"},
+                }
+            },
+            _note("doc-hold-a", "2026-06-05", "Hold metformin during inpatient procedure."),
+            _note("doc-hold-b", "2026-06-05", "Continue to hold metformin while renal function recovers."),
+        ],
+    }
+    g_two_holds = ClinicalEntityGraph.from_extracted_chart(extract_bundle(bundle_two_holds))
+    assert not any(e.edge_type == "CONTRADICTED_OR_MODIFIED_BY_NOTE" for e in g_two_holds.edges)

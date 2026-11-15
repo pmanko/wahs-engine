@@ -1684,7 +1684,7 @@ class ClinicalEntityGraph:
                     other_med_probes=other_probes,
                 )
                 if hold_pos is not None and (res_pos is None or hold_pos > res_pos):
-                    if not latest_hold_ts or _note_is_older(latest_hold_ts, n_ts):
+                    if not latest_hold_ts or _ts_is_older(latest_hold_ts, n_ts):
                         latest_hold_ts = n_ts
                     continue
                 if res_pos is not None and res_sent:
