@@ -96,6 +96,8 @@ class NumericPoint:
     interpretation: Optional[str] = None
     reference_range: Optional[str] = None
     is_abnormal: bool = False
+    timestamp: str = ""
+    status: str = ""
 
 
 @dataclass
@@ -163,6 +165,31 @@ def _iso_timestamp(val: Optional[str]) -> Optional[str]:
     if m:
         return f"{m.group(1)}T{m.group(2)}"
     return None
+
+
+def _sort_timestamp_key(val: Optional[str]) -> str:
+    """Return canonical comparable timestamp (`Z:...` UTC or `N:...` naive) when intraday time is present."""
+    if not val:
+        return ""
+    s = str(val).strip()
+    if not re.match(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}", s):
+        return ""
+    iso_norm = re.sub(
+        r"^(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2})($|[Zz]|[+-]\d{2}(?::?\d{2})?)$",
+        r"\1:00\2",
+        s,
+    )
+    if iso_norm.endswith(("Z", "z")):
+        iso_norm = f"{iso_norm[:-1]}+00:00"
+    iso_norm = re.sub(r"(\.\d{6})\d+", r"\1", iso_norm)
+    try:
+        dt = datetime.fromisoformat(iso_norm)
+    except ValueError:
+        return ""
+    if dt.tzinfo is not None:
+        dt_utc = dt.astimezone(timezone.utc)
+        return f"Z:{dt_utc.strftime('%Y-%m-%dT%H:%M:%S')}.{dt_utc.microsecond:06d}"
+    return f"N:{dt.strftime('%Y-%m-%dT%H:%M:%S')}.{dt.microsecond:06d}"
 
 
 def _coding_pair(codeable: Optional[Mapping[str, Any]]) -> Tuple[str, str]:
@@ -503,6 +530,7 @@ def extract_bundle(
     encounters_by_id: Dict[str, Mapping[str, Any]] = {}
     obs_by_id: Dict[str, Mapping[str, Any]] = {}
     conds_by_id: Dict[str, str] = {}
+    cond_sens_by_id: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
     provenance_org_by_target: Dict[str, str] = {}
 
     patient_res: Optional[Mapping[str, Any]] = None
@@ -623,6 +651,47 @@ def extract_bundle(
             return str(fallback_kb_sensitivity), "kb_coded_privacy"
         return sens, src
 
+    def _classify_visit_sensitivity(
+        res: Mapping[str, Any],
+        primary_code: Optional[str],
+        disp_label: str,
+        reason_pairs: Sequence[Tuple[str, str]],
+        reasons: Sequence[str],
+        ref_cond_ids: Sequence[str],
+        org: Optional[str],
+    ) -> Tuple[Optional[str], Optional[str]]:
+        combined_text = " | ".join(
+            p for p in [disp_label, *reasons, org or ""] if p
+        )
+        sens, src = _classify_res_sensitivity(res, primary_code, combined_text)
+        if sens == "SDOH/PRIVACY-SENSITIVE":
+            return sens, src
+        fallback_pair: Tuple[Optional[str], Optional[str]] = (sens, src)
+        for r_code, r_disp in reason_pairs:
+            r_kb = resolve_condition_code(r_code, r_disp)
+            r_kb_sens = (
+                r_kb.get("sensitivity")
+                if r_kb.get("resolved_by") != "heuristic_fallback"
+                else None
+            )
+            r_sens, r_src = _classify_res_sensitivity(
+                res,
+                r_code,
+                r_disp,
+                fallback_kb_sensitivity=r_kb_sens,
+            )
+            if r_sens == "SDOH/PRIVACY-SENSITIVE":
+                return r_sens, r_src
+            if not fallback_pair[0] and r_sens:
+                fallback_pair = (r_sens, r_src)
+        for cid in ref_cond_ids:
+            c_sens, c_src = cond_sens_by_id.get(cid, (None, None))
+            if c_sens == "SDOH/PRIVACY-SENSITIVE":
+                return c_sens, c_src
+            if not fallback_pair[0] and c_sens:
+                fallback_pair = (c_sens, c_src)
+        return fallback_pair
+
     items: List[ClinicalItem] = []
     numeric_points: List[NumericPoint] = []
     all_clinical_dates: List[str] = []
@@ -632,26 +701,43 @@ def extract_bundle(
         "booked",
         "scheduled",
         "proposed",
+        "pending",
+        "waitlist",
         "cancelled",
         "entered-in-error",
         "noshow",
     }
 
-    # Pre-scan clinical dates to establish reference_date (excluding Patient, Device, Coverage & future/cancelled items)
+    _reference_date_clinical_resource_types = {
+        "AllergyIntolerance",
+        "Condition",
+        "MedicationRequest",
+        "MedicationAdministration",
+        "MedicationStatement",
+        "MedicationDispense",
+        "Immunization",
+        "DocumentReference",
+        "DiagnosticReport",
+        "Observation",
+        "Procedure",
+        "CarePlan",
+        "Goal",
+        "ImagingStudy",
+        "Encounter",
+        "Appointment",
+    }
+
+    # Pre-scan clinical dates to establish reference_date solely from extracted clinical resources
     for res in resources:
         rtype = str(res.get("resourceType") or "")
-        if (
-            rtype in NON_CLINICAL_RESOURCE_TYPES
-            or rtype in LOOKUP_ONLY_RESOURCE_TYPES
-            or rtype in {"Patient", "Device", "Coverage"}
-        ):
+        if rtype not in _reference_date_clinical_resource_types:
             continue
         raw_st = (
             _codeable_status(res.get("status"))
             or _codeable_status(res.get("clinicalStatus"))
         )
         ver_st = _codeable_status(res.get("verificationStatus"))
-        if raw_st in _skip_ref_date_statuses or ver_st in _skip_ref_date_statuses:
+        if raw_st in _skip_ref_date_statuses or ver_st in {"refuted", "entered-in-error"}:
             continue
         for field_name in (
             "effectiveDateTime",
@@ -671,10 +757,18 @@ def extract_bundle(
             for period_field in ("period", "effectivePeriod", "performedPeriod"):
                 p = res.get(period_field)
                 if isinstance(p, Mapping):
-                    d = _iso_date(p.get("end") or p.get("start"))
+                    if rtype == "Encounter" and raw_st not in {"finished", "completed", "fulfilled", ""}:
+                        d = _iso_date(p.get("start"))
+                    else:
+                        d = _iso_date(p.get("end") or p.get("start"))
                     if d:
                         all_clinical_dates.append(d)
                         break
+            else:
+                if rtype == "Appointment" and raw_st == "fulfilled":
+                    d = _iso_date(res.get("end") or res.get("start"))
+                    if d:
+                        all_clinical_dates.append(d)
 
     reference_date = max(all_clinical_dates) if all_clinical_dates else None
 
@@ -840,6 +934,8 @@ def extract_bundle(
         )
         conflict = condition_conflicts.get(rid)
         sens = c["sensitivity"]
+        if rid and sens:
+            cond_sens_by_id[rid] = (sens, c["sensitivity_source"] or "condition_privacy")
         event_date = c["onset"] if is_active else (c["abatement"] or c["onset"])
         details = [f"status: {c['status']}"]
         if c["verification"]:
@@ -1263,17 +1359,23 @@ def extract_bundle(
         )
 
     # 7. Extract DiagnosticReport Lab & Survey Panels (and track claimed child Observations)
+    _INVALIDATED_OBS_STATUSES = {"entered-in-error", "cancelled"}
+
     def _extract_obs_components(
         obs_res: Mapping[str, Any],
         obs_uuid: str,
         obs_date: str,
         obs_cat: str,
         obs_cats: Sequence[str],
+        obs_ts: str = "",
+        obs_status: str = "",
+        include_numeric_points: bool = True,
     ) -> Tuple[List[NumericPoint], List[str], Optional[str], List[Dict[str, Any]], bool]:
         pts: List[NumericPoint] = []
         comp_sens: List[str] = []
         comp_src: Optional[str] = None
         comp_entries: List[Dict[str, Any]] = []
+        structured_comp_count = 0
         parent_sec_codes = _extract_meta_security_codes(obs_res)
         raw_components = [c for c in (obs_res.get("component") or []) if isinstance(c, Mapping)]
         for comp in raw_components:
@@ -1293,38 +1395,45 @@ def extract_bundle(
                     comp, None if c_cmp else c_num
                 )
                 if not c_cmp and c_num is not None:
-                    pts.append(
-                        NumericPoint(
-                            resource_uuid=obs_uuid,
-                            date=obs_date,
-                            code=c_code or c_disp,
-                            concept=c_disp or c_code,
-                            value=c_num,
-                            unit=c_unit,
-                            category=obs_cat,
-                            interpretation=c_interp,
-                            reference_range=c_rr,
-                            is_abnormal=c_abn,
+                    structured_comp_count += 1
+                    if include_numeric_points:
+                        pts.append(
+                            NumericPoint(
+                                resource_uuid=obs_uuid,
+                                date=obs_date,
+                                code=c_code or c_disp,
+                                concept=c_disp or c_code,
+                                value=c_num,
+                                unit=c_unit,
+                                category=obs_cat,
+                                interpretation=c_interp,
+                                reference_range=c_rr,
+                                is_abnormal=c_abn,
+                                timestamp=obs_ts or _sort_timestamp_key(obs_date),
+                                status=obs_status,
+                            )
                         )
-                    )
                 elif c_cmp:
-                    comp_entry = {
-                        "resource_uuid": obs_uuid,
-                        "date": obs_date,
-                        "code": c_code or c_disp,
-                        "concept": c_disp or c_code or "Component",
-                        "display": c_disp or c_code or "Component",
-                        "category": obs_cat,
-                        "comparator": c_cmp,
-                        "value": c_val_str,
-                        "numeric": None,
-                        "threshold": c_num,
-                        "unit": c_unit,
-                        "interpretation": c_interp,
-                        "reference_range": c_rr,
-                        "is_abnormal": c_abn,
-                        "sensitivity": "",
-                    }
+                    structured_comp_count += 1
+                    if include_numeric_points:
+                        comp_entry = {
+                            "resource_uuid": obs_uuid,
+                            "date": obs_date,
+                            "code": c_code or c_disp,
+                            "concept": c_disp or c_code or "Component",
+                            "display": c_disp or c_code or "Component",
+                            "category": obs_cat,
+                            "comparator": c_cmp,
+                            "value": c_val_str,
+                            "numeric": None,
+                            "threshold": c_num,
+                            "unit": c_unit,
+                            "interpretation": c_interp,
+                            "reference_range": c_rr,
+                            "is_abnormal": c_abn,
+                            "status": obs_status,
+                            "sensitivity": "",
+                        }
             else:
                 _, vc_disp = _coding_pair(comp.get("valueCodeableConcept"))
                 c_val_str = vc_disp
@@ -1341,7 +1450,7 @@ def extract_bundle(
             if comp_entry is not None:
                 comp_entries.append(comp_entry)
         all_comp_structured = bool(raw_components) and (
-            len(pts) + len(comp_entries) == len(raw_components)
+            structured_comp_count == len(raw_components)
         )
         return pts, comp_sens, comp_src, comp_entries, all_comp_structured
 
@@ -1353,8 +1462,11 @@ def extract_bundle(
         if not result_refs:
             continue
         rid = str(res.get("id") or "")
+        dr_status = str(res.get("status") or "final").strip().lower()
+        dr_invalid = dr_status in _INVALIDATED_OBS_STATUSES
         code, disp = _coding_pair(res.get("code"))
-        p_date = _iso_date(res.get("effectiveDateTime") or res.get("issued"))
+        p_date_raw = res.get("effectiveDateTime") or res.get("issued")
+        p_date = _iso_date(p_date_raw)
         is_survey = bool(_SURVEY_PANEL_PATTERNS.search(disp or ""))
 
         member_uuids: List[str] = [rid]
@@ -1383,6 +1495,8 @@ def extract_bundle(
                 if r_disp:
                     child_parts.append(r_disp)
                 continue
+            child_status = str(child_obs.get("status") or "final").strip().lower()
+            child_invalid = dr_invalid or (child_status in _INVALIDATED_OBS_STATUSES)
             o_code, o_disp = _coding_pair(child_obs.get("code"))
             val_str, num_val, unit = _format_obs_value(child_obs)
             o_interp, o_range, o_abn = _extract_obs_interpretation_and_range(child_obs, num_val)
@@ -1392,6 +1506,7 @@ def extract_bundle(
                 (_iso_timestamp(o_date_raw) if preserve_intraday_timestamps else _iso_date(o_date_raw))
                 or p_date
             )
+            o_sort_ts = _sort_timestamp_key(o_date_raw if o_date_raw else p_date_raw)
             o_primary_cat = o_cats[0] if o_cats else ("survey" if is_survey else "laboratory")
             o_sens, o_sens_src = _classify_res_sensitivity(
                 child_obs, o_code, f"{o_disp} {val_str}", o_cats
@@ -1401,7 +1516,7 @@ def extract_bundle(
             if o_sens_src:
                 child_sens_sources.append(o_sens_src)
             short_label = o_disp or o_code or "item"
-            if o_abn:
+            if o_abn and not child_invalid:
                 panel_abn = True
                 if o_interp:
                     panel_interps.append(o_interp)
@@ -1416,7 +1531,14 @@ def extract_bundle(
                     child_comp_entries,
                     child_comp_structured,
                 ) = _extract_obs_components(
-                    child_obs, oid, o_date or "", o_primary_cat, o_cats
+                    child_obs,
+                    oid,
+                    o_date or "",
+                    o_primary_cat,
+                    o_cats,
+                    obs_ts=o_sort_ts,
+                    obs_status=child_status,
+                    include_numeric_points=not child_invalid,
                 )
                 if child_comp_structured:
                     structured_child_count += 1
@@ -1437,20 +1559,23 @@ def extract_bundle(
                         panel_interps.append(pt.interpretation)
             elif num_val is not None:
                 structured_child_count += 1
-                numeric_points.append(
-                    NumericPoint(
-                        resource_uuid=oid,
-                        date=o_date or "",
-                        code=o_code or short_label,
-                        concept=short_label,
-                        value=num_val,
-                        unit=unit,
-                        category=o_primary_cat,
-                        interpretation=o_interp,
-                        reference_range=o_range,
-                        is_abnormal=o_abn,
+                if not child_invalid:
+                    numeric_points.append(
+                        NumericPoint(
+                            resource_uuid=oid,
+                            date=o_date or "",
+                            code=o_code or short_label,
+                            concept=short_label,
+                            value=num_val,
+                            unit=unit,
+                            category=o_primary_cat,
+                            interpretation=o_interp,
+                            reference_range=o_range,
+                            is_abnormal=o_abn,
+                            timestamp=o_sort_ts,
+                            status=child_status,
+                        )
                     )
-                )
             else:
                 vq_child = child_obs.get("valueQuantity")
                 o_cmp = (
@@ -1464,25 +1589,27 @@ def extract_bundle(
                         o_thresh: Optional[float] = float(vq_child["value"])
                     except (TypeError, ValueError):
                         o_thresh = None
-                    panel_comp_entries.append(
-                        {
-                            "resource_uuid": oid,
-                            "date": o_date or "",
-                            "code": o_code or short_label,
-                            "concept": short_label,
-                            "display": short_label,
-                            "category": o_primary_cat,
-                            "comparator": o_cmp,
-                            "value": val_str,
-                            "numeric": None,
-                            "threshold": o_thresh,
-                            "unit": unit,
-                            "interpretation": o_interp,
-                            "reference_range": o_range,
-                            "is_abnormal": o_abn,
-                            "sensitivity": o_sens or "",
-                        }
-                    )
+                    if not child_invalid:
+                        panel_comp_entries.append(
+                            {
+                                "resource_uuid": oid,
+                                "date": o_date or "",
+                                "code": o_code or short_label,
+                                "concept": short_label,
+                                "display": short_label,
+                                "category": o_primary_cat,
+                                "comparator": o_cmp,
+                                "value": val_str,
+                                "numeric": None,
+                                "threshold": o_thresh,
+                                "unit": unit,
+                                "interpretation": o_interp,
+                                "reference_range": o_range,
+                                "is_abnormal": o_abn,
+                                "status": child_status,
+                                "sensitivity": o_sens or "",
+                            }
+                        )
             if val_str:
                 annot_bits: List[str] = []
                 child_interp_disp = o_interp or ", ".join(
@@ -1541,14 +1668,14 @@ def extract_bundle(
                 resource_type="DiagnosticReport",
                 resource_uuid=rid,
                 date=p_date,
-                clinical_date=p_date,
-                date_kind="clinical_event" if p_date else "unknown",
+                clinical_date=None if dr_invalid else p_date,
+                date_kind="clinical_event" if (p_date and not dr_invalid) else "unknown",
                 section="survey_panel" if is_survey else "lab_panel",
                 code=code or disp,
                 display=disp or code or "Diagnostic Report",
                 text=f"{panel_prefix} — {disp or code}: {joined_children}",
                 mandatory=False,
-                status=str(res.get("status") or "final").lower(),
+                status=dr_status,
                 source_org=resolve_source_org(res),
                 sensitivity=panel_sens,
                 is_routine=is_survey,
@@ -1564,10 +1691,13 @@ def extract_bundle(
         rid = str(res.get("id") or "")
         if rid in claimed_obs_ids:
             continue
+        obs_status = str(res.get("status") or "final").strip().lower()
+        obs_invalid = obs_status in _INVALIDATED_OBS_STATUSES
         code, disp = _coding_pair(res.get("code"))
         raw_obs_dt = res.get("effectiveDateTime") or res.get("issued")
         o_date = _iso_date(raw_obs_dt)
         o_ts = (_iso_timestamp(raw_obs_dt) if preserve_intraday_timestamps else None) or o_date
+        o_sort_ts = _sort_timestamp_key(raw_obs_dt)
         cats = _categories(res)
         val_str, num_val, unit = _format_obs_value(res)
         obs_interp, obs_range, obs_abn = _extract_obs_interpretation_and_range(res, num_val)
@@ -1585,7 +1715,14 @@ def extract_bundle(
                 comp_entries,
                 all_comp_structured,
             ) = _extract_obs_components(
-                res, rid, o_ts or o_date or "", primary_cat, cats
+                res,
+                rid,
+                o_ts or o_date or "",
+                primary_cat,
+                cats,
+                obs_ts=o_sort_ts,
+                obs_status=obs_status,
+                include_numeric_points=not obs_invalid,
             )
             numeric_points.extend(comp_pts)
             if any(pt.is_abnormal for pt in comp_pts) or any(
@@ -1618,7 +1755,7 @@ def extract_bundle(
             elif not sens and comp_sens:
                 sens = comp_sens[0]
                 sens_src = comp_src or sens_src
-        elif num_val is not None:
+        elif num_val is not None and not obs_invalid:
             numeric_points.append(
                 NumericPoint(
                     resource_uuid=rid,
@@ -1631,6 +1768,8 @@ def extract_bundle(
                     interpretation=obs_interp,
                     reference_range=obs_range,
                     is_abnormal=obs_abn,
+                    timestamp=o_sort_ts,
+                    status=obs_status,
                 )
             )
 
@@ -1687,14 +1826,14 @@ def extract_bundle(
                 resource_type="Observation",
                 resource_uuid=rid,
                 date=o_date,
-                clinical_date=o_date,
-                date_kind="clinical_event" if o_date else "unknown",
+                clinical_date=None if obs_invalid else o_date,
+                date_kind="clinical_event" if (o_date and not obs_invalid) else "unknown",
                 section=sec,
                 code=code or disp,
                 display=disp or code or "Observation",
                 text=f"{cls_label} — {disp or code}{body_val}{ts_suffix}",
                 mandatory=False,
-                status=str(res.get("status") or "final").lower(),
+                status=obs_status,
                 source_org=resolve_source_org(res),
                 sensitivity=sens,
                 is_routine=(sec in {"survey_observation", "vital_sign"}),
@@ -1916,29 +2055,56 @@ def extract_bundle(
             enc_period = res.get("period") or {}
             e_start = _iso_date(enc_period.get("start"))
             e_end = _iso_date(enc_period.get("end"))
-            enc_date = e_end or e_start
+            enc_status = str(res.get("status") or "finished").strip().lower()
+            _terminal_enc_statuses = {"finished", "completed", "fulfilled", ""}
+            _planned_enc_statuses = {"planned", "booked", "scheduled", "proposed", "pending", "waitlist"}
+            _excluded_enc_statuses = {"cancelled", "entered-in-error", "noshow"}
+            if enc_status in _terminal_enc_statuses:
+                enc_date = e_end or e_start
+                enc_clinical_date = enc_date
+                enc_date_kind = "clinical_event" if enc_date else "unknown"
+            elif enc_status in _planned_enc_statuses or enc_status in _excluded_enc_statuses:
+                enc_date = e_start or e_end
+                enc_clinical_date = None
+                enc_date_kind = "planned" if (enc_date and enc_status in _planned_enc_statuses) else "unknown"
+            else:
+                # Active non-terminal encounters (e.g. in-progress, onleave, arrived, triaged)
+                # anchor clinical realization strictly on start, never future estimated end.
+                enc_date = e_start or e_end
+                enc_clinical_date = e_start
+                enc_date_kind = "clinical_event" if e_start else ("planned" if e_end else "unknown")
             enc_class = str((res.get("class") or {}).get("code") or "AMB").upper()
             types = res.get("type") or []
             _, t_disp = _coding_pair(types[0] if types else {})
             reasons: List[str] = []
+            reason_pairs: List[Tuple[str, str]] = []
+            ref_cond_ids: List[str] = []
             for rc in res.get("reasonCode") or []:
-                _, r_disp = _coding_pair(rc)
+                r_code, r_disp = _coding_pair(rc)
+                if r_code or r_disp:
+                    reason_pairs.append((r_code, r_disp))
                 if r_disp:
                     reasons.append(r_disp)
             for rr in res.get("reasonReference") or []:
                 if isinstance(rr, Mapping):
                     c_id = _strip_urn(rr.get("reference"))
+                    if c_id:
+                        ref_cond_ids.append(c_id)
                     r_disp = str(rr.get("display") or conds_by_id.get(c_id) or "").strip()
                     if r_disp:
                         reasons.append(r_disp)
             org = resolve_source_org(res)
-            enc_sens, enc_sens_src = _classify_res_sensitivity(res, enc_class, t_disp or "")
+            enc_sens, enc_sens_src = _classify_visit_sensitivity(
+                res, enc_class, t_disp or "", reason_pairs, reasons, ref_cond_ids, org
+            )
             is_high_acuity = enc_class in {"IMP", "INPATIENT", "EMER", "EMERGENCY"} or any(
                 w in (t_disp or "").lower() for w in ("inpatient", "emergency", "admission", "intensive")
             )
             quals = [f"class: {enc_class}"]
             if e_end and e_end != e_start:
-                quals.append(f"discharged: {e_end}")
+                quals.append(
+                    f"discharged: {e_end}" if enc_status in _terminal_enc_statuses else f"est. end: {e_end}"
+                )
             if reasons:
                 quals.append(f"reason: {', '.join(dict.fromkeys(reasons))}")
             if org:
@@ -1951,19 +2117,91 @@ def extract_bundle(
                     resource_type="Encounter",
                     resource_uuid=rid,
                     date=enc_date,
-                    clinical_date=enc_date,
-                    date_kind="clinical_event" if enc_date else "unknown",
+                    clinical_date=enc_clinical_date,
+                    date_kind=enc_date_kind,
                     section="encounter_acuity" if is_high_acuity else "encounter_routine",
                     code=enc_class,
                     display=t_disp or enc_class,
                     text=f"Encounter: {t_disp or enc_class} ({', '.join(quals)})",
                     mandatory=False,
-                    status=str(res.get("status") or "finished").lower(),
+                    status=enc_status or "finished",
                     end_date=e_end,
                     source_org=org,
                     sensitivity=enc_sens,
                     is_routine=not is_high_acuity,
                     metadata=enc_meta,
+                )
+            )
+        elif rtype == "Appointment":
+            appt_start = _iso_date(res.get("start"))
+            appt_end = _iso_date(res.get("end"))
+            appt_date = appt_start or appt_end
+            appt_status = str(res.get("status") or "booked").strip().lower()
+            appt_type_code, appt_type_disp = _coding_pair(res.get("appointmentType") or {})
+            svc_types = res.get("serviceType") or []
+            svc_code, svc_disp = _coding_pair(svc_types[0] if svc_types else {})
+            specs = res.get("specialty") or []
+            spec_code, spec_disp = _coding_pair(specs[0] if specs else {})
+            appt_disp = (
+                str(res.get("description") or "").strip()
+                or svc_disp
+                or spec_disp
+                or appt_type_disp
+                or "Scheduled Appointment"
+            )
+            appt_code = svc_code or spec_code or appt_type_code
+            reasons: List[str] = []
+            reason_pairs: List[Tuple[str, str]] = []
+            ref_cond_ids: List[str] = []
+            for rc in res.get("reasonCode") or []:
+                r_code, r_disp = _coding_pair(rc)
+                if r_code or r_disp:
+                    reason_pairs.append((r_code, r_disp))
+                if r_disp:
+                    reasons.append(r_disp)
+            for rr in res.get("reasonReference") or []:
+                if isinstance(rr, Mapping):
+                    c_id = _strip_urn(rr.get("reference"))
+                    if c_id:
+                        ref_cond_ids.append(c_id)
+                    r_disp = str(rr.get("display") or conds_by_id.get(c_id) or "").strip()
+                    if r_disp:
+                        reasons.append(r_disp)
+            org = resolve_source_org(res)
+            appt_sens, appt_sens_src = _classify_visit_sensitivity(
+                res, appt_code, appt_disp, reason_pairs, reasons, ref_cond_ids, org
+            )
+            quals = [f"status: {appt_status}"]
+            if reasons:
+                quals.append(f"reason: {', '.join(dict.fromkeys(reasons))}")
+            if org:
+                quals.append(f"facility: {org}")
+            appt_meta: Dict[str, Any] = {"start": appt_start, "end": appt_end}
+            if appt_sens_src:
+                appt_meta["sensitivity_source"] = appt_sens_src
+            is_fulfilled = appt_status == "fulfilled"
+            items.append(
+                ClinicalItem(
+                    resource_type="Appointment",
+                    resource_uuid=rid,
+                    date=appt_date,
+                    clinical_date=appt_date if is_fulfilled else None,
+                    date_kind=(
+                        "clinical_event"
+                        if (is_fulfilled and appt_date)
+                        else ("planned" if appt_date else "unknown")
+                    ),
+                    section="encounter_routine",
+                    code=appt_code,
+                    display=appt_disp,
+                    text=f"Appointment: {appt_disp} ({', '.join(quals)})",
+                    mandatory=False,
+                    status=appt_status,
+                    end_date=appt_end,
+                    source_org=org,
+                    sensitivity=appt_sens,
+                    is_routine=True,
+                    metadata=appt_meta,
                 )
             )
 

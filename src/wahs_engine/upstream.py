@@ -14,6 +14,7 @@ from fastapi import HTTPException
 import httpx
 
 from wahs_core import (
+    build_temporal_digest,
     build_wahs_hub_enrichment_block,
     extract_clean_user_query,
     get_lab_history,
@@ -234,6 +235,30 @@ def _should_allow_overflow_tools(
     return allow, omitted_total, omitted_by_cat
 
 
+def _uuid_to_citation_from_map(citation_map: Mapping[str, Any]) -> Dict[str, int]:
+    """Extract UUID -> [N] mapping (including memberIds) from assembled `citation_map`."""
+    out: Dict[str, int] = {}
+    for k_str, entry in citation_map.items():
+        if not isinstance(entry, Mapping):
+            continue
+        idx_raw = entry.get("index")
+        c_idx = (
+            int(idx_raw)
+            if isinstance(idx_raw, int)
+            else (int(k_str) if str(k_str).isdigit() else 0)
+        )
+        if c_idx <= 0:
+            continue
+        eid = str(entry.get("id") or "").strip()
+        if eid:
+            out.setdefault(eid, c_idx)
+        for m_id in entry.get("memberIds") or ():
+            ms = str(m_id or "").strip()
+            if ms:
+                out.setdefault(ms, c_idx)
+    return out
+
+
 def build_x_wahs_envelope(
     *,
     ctx: AssembledWahsContext,
@@ -244,6 +269,7 @@ def build_x_wahs_envelope(
     overflow_recovered: int = 0,
     kb_meta: Optional[Dict[str, Any]] = None,
     note_rag_meta: Optional[Dict[str, Any]] = None,
+    temporal_digest_meta: Optional[Dict[str, Any]] = None,
     tool_calls_log: Optional[List[Dict[str, Any]]] = None,
     timings: Optional[Dict[str, Any]] = None,
     exact_prompt_tokens: int = 0,
@@ -302,6 +328,11 @@ def build_x_wahs_envelope(
             "kb_enrichment": kb_meta,
             "human_review_required": True,
         },
+        "temporal_digest": (
+            dict(temporal_digest_meta)
+            if temporal_digest_meta is not None
+            else {"enabled": False}
+        ),
     }
     if note_rag_meta is not None:
         env["note_rag"] = note_rag_meta
@@ -509,7 +540,15 @@ def prepare_upstream_messages(
     spec: Optional[ModelSpec] = None,
     effective_max_tokens: int = 1024,
     tools: Optional[Sequence[Mapping[str, Any]]] = None,
-) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], int, Optional[Dict[str, Any]], int, int]:
+) -> Tuple[
+    List[Dict[str, Any]],
+    Optional[Dict[str, Any]],
+    int,
+    Optional[Dict[str, Any]],
+    Dict[str, Any],
+    int,
+    int,
+]:
     tok_family = spec.tokenizer_family if spec is not None else ctx.tokenizer_family
     ctx_window = spec.context_window if spec is not None else ctx.context_window
     exact_counter = get_exact_token_counter(tok_family)
@@ -552,26 +591,123 @@ def prepare_upstream_messages(
 
     kb_meta: Optional[Dict[str, Any]] = None
     note_rag_meta: Optional[Dict[str, Any]] = None
+    temporal_meta: Dict[str, Any] = {"enabled": False}
     overflow_recovered = 0
     effective_kb = bool(options.enable_kb) and options.retrieval_strategy != "chart_only"
+    effective_temporal_digest = (
+        bool(options.enable_temporal_digest) and options.retrieval_strategy != "chart_only"
+    )
 
-    if effective_kb:
+    minimal_turn_toks = count_chat_messages_tokens(
+        [messages[0], messages[-1]], tools=tools, tokenizer_family=tok_family
+    )
+    true_window_slack = max(
+        0, ctx_window - effective_max_tokens - minimal_turn_toks - 64
+    )
+
+    tool_hint = ""
+    if options.retrieval_strategy == "dynamic_fhir_tools":
+        tool_hint = (
+            "=== DYNAMIC FHIR CHART TOOLS ACTIVE ===\n"
+            "The Condensed Clinical Record above is a compact IPS safety header. "
+            "Whenever the question asks about prior hospital admissions, clinical notes, procedures, "
+            "microbiology/pathology reports, or specific longitudinal lab dates not shown in full above, "
+            "call `search_chart_entries`, `read_clinical_note`, or `get_lab_history` first, then synthesize "
+            "your final patient-friendly answer citing each item's `[N]` (`citation_tag`) inline."
+        )
+    tool_hint_toks = exact_counter(tool_hint) if tool_hint else 0
+
+    rag_block = ""
+    if options.retrieval_strategy == "note_rag":
         try:
-            minimal_turn_toks = count_chat_messages_tokens(
-                [messages[0], messages[-1]], tools=tools, tokenizer_family=tok_family
+            rag_header = (
+                "=== SINGLE-PATIENT CLINICAL NOTE & REPORT PASSAGES (BM25 RAG — cite inline as [N]) ===\n"
+                "Note Precedence: Reconcile retrieved passages by date—newer Discharge Summaries, Addenda, or hold/stop instructions supersede older admission or baseline notes. Answer strictly what the user asked without listing unrelated conditions.\n"
             )
-            window_slack = max(
-                256, ctx_window - effective_max_tokens - minimal_turn_toks - 128
+            rag_avail = max(0, true_window_slack - tool_hint_toks)
+            rag_res = retrieve_clinical_note_passages(
+                ctx.extracted,
+                clean_last_user_query,
+                sharing_posture=options.sharing_posture,
+                top_k=5,
             )
-            enrichment_max_tokens = min(
-                window_slack, max(1280, int(ctx.condensed.target_tokens * 0.25))
+            passages = rag_res.get("results") or []
+            rag_lines: List[str] = []
+            rag_indices: List[int] = []
+            for p in passages:
+                if not isinstance(p, Mapping) or rag_avail < 48:
+                    continue
+                c_idx = _register_or_get_citation_index(
+                    ctx,
+                    resource_uuid=str(p.get("resource_uuid") or ""),
+                    resource_type=str(p.get("resource_type") or "DocumentReference"),
+                    display=str(p.get("display") or "Clinical Note"),
+                    date=str(p.get("date") or ""),
+                    source=str(p.get("source_org") or "Clinical Note"),
+                    section=str(p.get("section") or "clinical_note"),
+                    member_uuids=p.get("member_uuids"),
+                )
+                cite_prefix = f"[{c_idx}] " if c_idx is not None else ""
+                line_prefix = (
+                    f"{cite_prefix}({p.get('date') or 'undated'} | {p.get('display')} | "
+                    f"source={p.get('source_org') or 'Chart'} | bm25={p.get('bm25_score')}): "
+                )
+                passage_txt = str(p.get("passage_text") or "")
+                cand_line = f"{line_prefix}{passage_txt}"
+                cand_block = rag_header + "\n".join([*rag_lines, cand_line])
+                if exact_counter(cand_block) <= rag_avail:
+                    rag_lines.append(cand_line)
+                    if c_idx is not None and c_idx not in rag_indices:
+                        rag_indices.append(c_idx)
+                elif not rag_lines and passage_txt:
+                    lo, hi = 0, len(passage_txt)
+                    while lo < hi:
+                        mid = (lo + hi + 1) // 2
+                        trunc_txt = passage_txt[:mid].rstrip() + ("..." if mid < len(passage_txt) else "")
+                        if exact_counter(rag_header + line_prefix + trunc_txt) <= rag_avail:
+                            lo = mid
+                        else:
+                            hi = mid - 1
+                    if lo >= 24:
+                        trunc_txt = passage_txt[:lo].rstrip() + ("..." if lo < len(passage_txt) else "")
+                        rag_lines.append(f"{line_prefix}{trunc_txt}")
+                        if c_idx is not None and c_idx not in rag_indices:
+                            rag_indices.append(c_idx)
+                    break
+                else:
+                    break
+            note_rag_meta = {
+                "total_chunks_indexed": int(rag_res.get("total_chunks_indexed") or 0),
+                "passages_retrieved": len(rag_lines),
+                "cited_indices": rag_indices,
+                "redacted_for_privacy_count": int(rag_res.get("redacted_for_privacy_count") or 0),
+            }
+            if rag_lines:
+                rag_block = rag_header + "\n".join(rag_lines)
+        except Exception as exc:
+            logger.warning("WAHS Note RAG skipped: %s", exc)
+
+    rag_toks_used = exact_counter(rag_block) if rag_block else 0
+    remaining_after_rag = max(0, true_window_slack - tool_hint_toks - rag_toks_used)
+    total_headroom = min(
+        remaining_after_rag, max(1280, int(ctx.condensed.target_tokens * 0.25))
+    )
+
+    kb_enrichment_text = ""
+    if effective_kb and total_headroom >= 64:
+        try:
+            kb_reserve_for_digest = (
+                min(max(128, total_headroom // 3), 512)
+                if (effective_temporal_digest and total_headroom >= 256)
+                else 0
             )
+            kb_budget = max(64, total_headroom - kb_reserve_for_digest)
             enrichment = build_wahs_hub_enrichment_block(
                 messages,
                 extracted=ctx.extracted,
                 condensed=ctx.condensed,
                 citation_map=ctx.citation_map,
-                max_tokens=enrichment_max_tokens,
+                max_tokens=kb_budget,
                 sharing_posture=options.sharing_posture,
                 token_counter=exact_counter,
                 max_overflow_recover=(
@@ -603,77 +739,70 @@ def prepare_upstream_messages(
                             ),
                         }
             if enrichment.enrichment_text:
-                messages[-1] = {
-                    "role": messages[-1]["role"],
-                    "content": f"{messages[-1]['content'].rstrip()}\n\n{enrichment.enrichment_text}",
-                }
+                kb_enrichment_text = enrichment.enrichment_text
         except Exception as exc:
             logger.warning("WAHS KB enrichment skipped: %s", exc)
 
-    if options.retrieval_strategy == "note_rag":
+    temporal_digest_block = ""
+    if effective_temporal_digest:
         try:
-            rag_res = retrieve_clinical_note_passages(
-                ctx.extracted,
-                clean_last_user_query,
-                sharing_posture=options.sharing_posture,
-                top_k=5,
-            )
-            passages = rag_res.get("results") or []
-            rag_lines: List[str] = []
-            rag_indices: List[int] = []
-            for p in passages:
-                if not isinstance(p, Mapping):
-                    continue
-                c_idx = _register_or_get_citation_index(
-                    ctx,
-                    resource_uuid=str(p.get("resource_uuid") or ""),
-                    resource_type=str(p.get("resource_type") or "DocumentReference"),
-                    display=str(p.get("display") or "Clinical Note"),
-                    date=str(p.get("date") or ""),
-                    source=str(p.get("source_org") or "Clinical Note"),
-                    section=str(p.get("section") or "clinical_note"),
-                    member_uuids=p.get("member_uuids"),
-                )
-                cite_prefix = f"[{c_idx}] " if c_idx is not None else ""
-                if c_idx is not None and c_idx not in rag_indices:
-                    rag_indices.append(c_idx)
-                rag_lines.append(
-                    f"{cite_prefix}({p.get('date') or 'undated'} | {p.get('display')} | "
-                    f"source={p.get('source_org') or 'Chart'} | bm25={p.get('bm25_score')}): "
-                    f"{p.get('passage_text')}"
-                )
-            note_rag_meta = {
-                "total_chunks_indexed": int(rag_res.get("total_chunks_indexed") or 0),
-                "passages_retrieved": len(passages),
-                "cited_indices": rag_indices,
-                "redacted_for_privacy_count": int(rag_res.get("redacted_for_privacy_count") or 0),
-            }
-            if rag_lines:
-                rag_block = (
-                    "=== SINGLE-PATIENT CLINICAL NOTE & REPORT PASSAGES (BM25 RAG — cite inline as [N]) ===\n"
-                    "Note Precedence: Reconcile retrieved passages by date—newer Discharge Summaries, Addenda, or hold/stop instructions supersede older admission or baseline notes. Answer strictly what the user asked without listing unrelated conditions.\n"
-                    + "\n".join(rag_lines)
-                )
-                messages[-1] = {
-                    "role": messages[-1]["role"],
-                    "content": f"{messages[-1]['content'].rstrip()}\n\n{rag_block}",
+            kb_toks_used = exact_counter(kb_enrichment_text) if kb_enrichment_text else 0
+            digest_budget = max(0, total_headroom - kb_toks_used)
+            if digest_budget < 64:
+                temporal_meta = {
+                    "enabled": False,
+                    "skipped_reason": "insufficient_context_headroom",
                 }
+            else:
+                extra_cits = _uuid_to_citation_from_map(ctx.citation_map)
+                temporal_res = build_temporal_digest(
+                    ctx.extracted,
+                    ctx.condensed,
+                    question=clean_last_user_query,
+                    sharing_posture=options.sharing_posture,
+                    extra_uuid_to_citation=extra_cits,
+                    max_tokens=digest_budget,
+                    token_counter=exact_counter,
+                )
+                temporal_meta = dict(temporal_res.summary)
+                temporal_digest_block = temporal_res.digest_text
         except Exception as exc:
-            logger.warning("WAHS Note RAG skipped: %s", exc)
+            logger.warning("WAHS Temporal Digest skipped: %s", exc)
+            temporal_meta = {"enabled": False, "error": str(exc)}
 
-    if options.retrieval_strategy == "dynamic_fhir_tools":
-        tool_hint = (
-            "=== DYNAMIC FHIR CHART TOOLS ACTIVE ===\n"
-            "The Condensed Clinical Record above is a compact IPS safety header. "
-            "Whenever the question asks about prior hospital admissions, clinical notes, procedures, "
-            "microbiology/pathology reports, or specific longitudinal lab dates not shown in full above, "
-            "call `search_chart_entries`, `read_clinical_note`, or `get_lab_history` first, then synthesize "
-            "your final patient-friendly answer citing each item's `[N]` (`citation_tag`) inline."
+    max_prompt_budget = max(0, ctx_window - effective_max_tokens)
+    orig_last_content = str(messages[-1]["content"] or "")
+    candidate_blocks = [
+        ("temporal_digest", temporal_digest_block),
+        ("kb", kb_enrichment_text),
+        ("rag", rag_block),
+        ("tool_hint", tool_hint),
+    ]
+    while any(text for _, text in candidate_blocks):
+        active_texts = [text for _, text in candidate_blocks if text]
+        cand_last = f"{orig_last_content.rstrip()}\n\n" + "\n\n".join(active_texts)
+        cand_toks = count_chat_messages_tokens(
+            [messages[0], {"role": messages[-1]["role"], "content": cand_last}],
+            tools=tools,
+            tokenizer_family=tok_family,
         )
-        messages[-1] = {
-            "role": messages[-1]["role"],
-            "content": f"{messages[-1]['content'].rstrip()}\n\n{tool_hint}",
-        }
+        if cand_toks <= max_prompt_budget:
+            messages[-1] = {"role": messages[-1]["role"], "content": cand_last}
+            break
+        # Drop lowest-priority optional enrichment block first so the base prompt stays within context_window.
+        dropped = False
+        for idx_drop, (kind, text) in enumerate(candidate_blocks):
+            if text:
+                candidate_blocks[idx_drop] = (kind, "")
+                if kind == "temporal_digest" and temporal_meta.get("enabled"):
+                    temporal_meta = {
+                        "enabled": False,
+                        "skipped_reason": "insufficient_context_headroom",
+                    }
+                dropped = True
+                break
+        if not dropped:
+            break
 
     exact_prompt_tokens, history_trimmed_turns = _trim_history_to_fit(
         messages,
@@ -687,6 +816,7 @@ def prepare_upstream_messages(
         kb_meta,
         overflow_recovered,
         note_rag_meta,
+        temporal_meta,
         exact_prompt_tokens,
         history_trimmed_turns,
     )
@@ -892,6 +1022,7 @@ class SouthboundOpenAIClient:
             kb_meta,
             overflow_recovered,
             note_rag_meta,
+            temporal_digest_meta,
             exact_prompt_tokens,
             history_trimmed_turns,
         ) = prepare_upstream_messages(
@@ -1047,6 +1178,7 @@ class SouthboundOpenAIClient:
             overflow_recovered=overflow_recovered,
             kb_meta=kb_meta,
             note_rag_meta=note_rag_meta,
+            temporal_digest_meta=temporal_digest_meta,
             tool_calls_log=tool_calls_log if (allow_tools or tool_calls_log) else None,
             timings=timings_envelope,
             exact_prompt_tokens=exact_prompt_tokens,
@@ -1143,6 +1275,7 @@ class SouthboundOpenAIClient:
             kb_meta,
             overflow_recovered,
             note_rag_meta,
+            temporal_digest_meta,
             exact_prompt_tokens,
             history_trimmed_turns,
         ) = prepare_upstream_messages(
@@ -1313,6 +1446,7 @@ class SouthboundOpenAIClient:
             overflow_recovered=overflow_recovered,
             kb_meta=kb_meta,
             note_rag_meta=note_rag_meta,
+            temporal_digest_meta=temporal_digest_meta,
             tool_calls_log=tool_calls_log if (allow_tools or tool_calls_log) else None,
             timings={
                 "engine_prep_ms": engine_prep_ms,

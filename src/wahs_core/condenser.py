@@ -200,9 +200,18 @@ def _fold_social_history(social_items: Sequence[ClinicalItem]) -> List[ClinicalI
 
 
 def _fold_encounters(encounters: Sequence[ClinicalItem], *, keep_latest_individual: int = 3) -> List[ClinicalItem]:
-    """Keep the `keep_latest_individual` most recent encounters unpacked and fold older repeated encounters."""
-    ordered_desc = sorted(encounters, key=lambda x: _date_sort_key(x.date), reverse=True)
-    kept = list(ordered_desc[:keep_latest_individual])
+    """Keep the `keep_latest_individual` most recent encounters unpacked and fold older repeated encounters.
+
+    Unfulfilled future/pre-visit Appointments remain unpacked so upcoming visit details stay intact.
+    """
+    unfulfilled_appts = [
+        e for e in encounters if e.resource_type == "Appointment" and (e.status or "").lower() != "fulfilled"
+    ]
+    completed_encounters = [
+        e for e in encounters if not (e.resource_type == "Appointment" and (e.status or "").lower() != "fulfilled")
+    ]
+    ordered_desc = sorted(completed_encounters, key=lambda x: _date_sort_key(x.date), reverse=True)
+    kept = sorted(unfulfilled_appts + list(ordered_desc[:keep_latest_individual]), key=lambda x: _date_sort_key(x.date), reverse=True)
     older = ordered_desc[keep_latest_individual:]
     if not older:
         return kept
@@ -933,7 +942,9 @@ def _filter_source_items_for_posture(
     allowed_numeric_points = [
         pt
         for pt in extracted.numeric_points
-        if pt.resource_uuid not in redacted_uuids
+        if str(getattr(pt, "status", "") or "").strip().lower()
+        not in {"entered-in-error", "cancelled", "noshow"}
+        and pt.resource_uuid not in redacted_uuids
         and not (
             sharing_posture == "external_share"
             and classify_sensitivity(pt.code, pt.concept, [pt.category]) == "SDOH/PRIVACY-SENSITIVE"
