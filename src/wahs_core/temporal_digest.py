@@ -31,6 +31,7 @@ _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 _UPCOMING_ENCOUNTER_STATUSES: Set[str] = {"planned", "booked", "scheduled", "proposed", "pending", "waitlist"}
 _FUTURE_APPT_STATUSES: Set[str] = {"planned", "booked", "scheduled", "proposed", "pending", "waitlist"}
 _EXCLUDED_EVENT_STATUSES: Set[str] = {"cancelled", "entered-in-error", "noshow"}
+_EXCLUDED_VERIFICATION_STATUSES: Set[str] = {"refuted", "entered-in-error"}
 _COMPLETED_ENCOUNTER_STATUSES: Set[str] = {"finished", "completed", "fulfilled", ""}
 _STOPPED_MED_STATUSES: Set[str] = {
     "stopped",
@@ -120,6 +121,12 @@ def _any_non_patient_date(item: ClinicalItem) -> Optional[str]:
     if item.resource_type in {"Goal", "CarePlan"}:
         return _iso10(item.clinical_date or item.date)
     return _iso10(item.clinical_date or item.date or item.end_date)
+
+
+def _is_verification_invalid(item: ClinicalItem) -> bool:
+    """Return True when Condition/AllergyIntolerance verificationStatus refutes/invalidates the record."""
+    ver = str((item.metadata or {}).get("verification_status") or "").strip().lower()
+    return ver in _EXCLUDED_VERIFICATION_STATUSES
 
 
 def _format_num(value: float) -> str:
@@ -424,7 +431,7 @@ def build_temporal_digest(
     kept_items: List[ClinicalItem] = []
     for it in extracted.items:
         st_it = (it.status or "").strip().lower()
-        if st_it in _EXCLUDED_EVENT_STATUSES:
+        if st_it in _EXCLUDED_EVENT_STATUSES or _is_verification_invalid(it):
             if it.resource_uuid:
                 invalidated_uuids.add(it.resource_uuid)
             invalidated_uuids.update(u for u in it.member_uuids if u)
@@ -446,10 +453,20 @@ def build_temporal_digest(
         if it.section in {"patient", "manifest"}:
             continue
         st = (it.status or "").strip().lower()
-        if st in _EXCLUDED_EVENT_STATUSES:
+        if st in _EXCLUDED_EVENT_STATUSES or _is_verification_invalid(it):
             continue
         c_dt = _clinical_item_date(it)
         any_dt = _any_non_patient_date(it)
+        if it.resource_type == "Encounter" and st not in _COMPLETED_ENCOUNTER_STATUSES and st not in _FUTURE_APPT_STATUSES:
+            enc_meta = it.metadata or {}
+            realized_start = _iso10(enc_meta.get("start"))
+            unrealized_end = _iso10(enc_meta.get("end") or it.end_date)
+            if realized_start:
+                c_dt = realized_start
+                any_dt = realized_start
+            elif "start" in enc_meta or unrealized_end:
+                c_dt = None
+                any_dt = None
         is_visit_item = (
             it.section in {"encounter_acuity", "encounter_routine"}
             or it.resource_type in {"Encounter", "Appointment"}
@@ -539,6 +556,8 @@ def build_temporal_digest(
     if compare_floor:
         for it in kept_items:
             if it.section in {"patient", "manifest"}:
+                continue
+            if (it.status or "").strip().lower() in _EXCLUDED_EVENT_STATUSES or _is_verification_invalid(it):
                 continue
             if it.date_kind == "administrative" or it.section in {"device", "coverage"}:
                 a_dt = _iso10(it.date or it.end_date)

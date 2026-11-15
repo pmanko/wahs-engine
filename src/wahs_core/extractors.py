@@ -722,7 +722,7 @@ def extract_bundle(
             or _codeable_status(res.get("clinicalStatus"))
         )
         ver_st = _codeable_status(res.get("verificationStatus"))
-        if raw_st in _skip_ref_date_statuses or ver_st in _skip_ref_date_statuses:
+        if raw_st in _skip_ref_date_statuses or ver_st in {"refuted", "entered-in-error"}:
             continue
         for field_name in (
             "effectiveDateTime",
@@ -742,7 +742,10 @@ def extract_bundle(
             for period_field in ("period", "effectivePeriod", "performedPeriod"):
                 p = res.get(period_field)
                 if isinstance(p, Mapping):
-                    d = _iso_date(p.get("end") or p.get("start"))
+                    if rtype == "Encounter" and raw_st not in {"finished", "completed", "fulfilled", ""}:
+                        d = _iso_date(p.get("start"))
+                    else:
+                        d = _iso_date(p.get("end") or p.get("start"))
                     if d:
                         all_clinical_dates.append(d)
                         break
@@ -2037,7 +2040,24 @@ def extract_bundle(
             enc_period = res.get("period") or {}
             e_start = _iso_date(enc_period.get("start"))
             e_end = _iso_date(enc_period.get("end"))
-            enc_date = e_end or e_start
+            enc_status = str(res.get("status") or "finished").strip().lower()
+            _terminal_enc_statuses = {"finished", "completed", "fulfilled", ""}
+            _planned_enc_statuses = {"planned", "booked", "scheduled", "proposed", "pending", "waitlist"}
+            _excluded_enc_statuses = {"cancelled", "entered-in-error", "noshow"}
+            if enc_status in _terminal_enc_statuses:
+                enc_date = e_end or e_start
+                enc_clinical_date = enc_date
+                enc_date_kind = "clinical_event" if enc_date else "unknown"
+            elif enc_status in _planned_enc_statuses or enc_status in _excluded_enc_statuses:
+                enc_date = e_start or e_end
+                enc_clinical_date = None
+                enc_date_kind = "planned" if (enc_date and enc_status in _planned_enc_statuses) else "unknown"
+            else:
+                # Active non-terminal encounters (e.g. in-progress, onleave, arrived, triaged)
+                # anchor clinical realization strictly on start, never future estimated end.
+                enc_date = e_start or e_end
+                enc_clinical_date = e_start
+                enc_date_kind = "clinical_event" if e_start else ("planned" if e_end else "unknown")
             enc_class = str((res.get("class") or {}).get("code") or "AMB").upper()
             types = res.get("type") or []
             _, t_disp = _coding_pair(types[0] if types else {})
@@ -2067,7 +2087,9 @@ def extract_bundle(
             )
             quals = [f"class: {enc_class}"]
             if e_end and e_end != e_start:
-                quals.append(f"discharged: {e_end}")
+                quals.append(
+                    f"discharged: {e_end}" if enc_status in _terminal_enc_statuses else f"est. end: {e_end}"
+                )
             if reasons:
                 quals.append(f"reason: {', '.join(dict.fromkeys(reasons))}")
             if org:
@@ -2080,14 +2102,14 @@ def extract_bundle(
                     resource_type="Encounter",
                     resource_uuid=rid,
                     date=enc_date,
-                    clinical_date=enc_date,
-                    date_kind="clinical_event" if enc_date else "unknown",
+                    clinical_date=enc_clinical_date,
+                    date_kind=enc_date_kind,
                     section="encounter_acuity" if is_high_acuity else "encounter_routine",
                     code=enc_class,
                     display=t_disp or enc_class,
                     text=f"Encounter: {t_disp or enc_class} ({', '.join(quals)})",
                     mandatory=False,
-                    status=str(res.get("status") or "finished").lower(),
+                    status=enc_status or "finished",
                     end_date=e_end,
                     source_org=org,
                     sensitivity=enc_sens,

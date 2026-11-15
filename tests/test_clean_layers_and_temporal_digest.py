@@ -1642,3 +1642,230 @@ def test_graph_trajectory_indeterminate_boundary_is_uuid_invariant() -> None:
     cr_sep = next(n for n in g_sep.nodes.values() if n.category == "Observation" and "creatinine" in n.label.lower())
     assert cr_sep.metadata.get("latest_value") == 1.9
     assert cr_sep.metadata.get("latest_indeterminate") is None
+
+
+def test_temporal_digest_excludes_verification_invalid_condition_and_allergy() -> None:
+    """Verification-invalid Conditions/Allergies (refuted/entered-in-error) never anchor dates or activity."""
+    from wahs_core.extractors import ClinicalItem, ExtractedChart
+
+    bundle = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "pat-verif", "birthDate": "1970-01-01"}},
+            {
+                "resource": {
+                    "resourceType": "Encounter",
+                    "id": "enc-real",
+                    "status": "finished",
+                    "type": [{"text": "Primary Care Visit"}],
+                    "period": {"start": "2026-10-10", "end": "2026-10-10"},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Condition",
+                    "id": "cond-err",
+                    "clinicalStatus": {"coding": [{"code": "active"}]},
+                    "verificationStatus": {"coding": [{"code": "entered-in-error"}]},
+                    "code": {"text": "Erroneous Condition"},
+                    "onsetDateTime": "2030-05-01",
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "AllergyIntolerance",
+                    "id": "alg-refuted",
+                    "clinicalStatus": {"coding": [{"code": "active"}]},
+                    "verificationStatus": {"coding": [{"code": "refuted"}]},
+                    "code": {"text": "Refuted Allergy"},
+                    "recordedDate": "2030-06-01",
+                }
+            },
+        ],
+    }
+    ext = extract_bundle(bundle)
+    assert ext.reference_date == "2026-10-10"
+    cond = condense_bundle_to_budget(ext, target_tokens=8192)
+    dig = build_temporal_digest(ext, condensed=cond, question="What happened most recently?")
+    assert dig.reference_date == "2026-10-10"
+    assert dig.summary["latest_clinical_activity_date"] == "2026-10-10"
+    assert "2030-05-01" not in dig.digest_text
+    assert "2030-06-01" not in dig.digest_text
+    assert "Erroneous Condition" not in dig.digest_text
+    assert "Refuted Allergy" not in dig.digest_text
+
+    # Direct ClinicalItem inputs with normal clinical status + refuted/entered-in-error verification_status
+    manual = ExtractedChart(
+        patient_id="pat-verif-m",
+        patient_name="Manual Verification Patient",
+        birth_date="1970-01-01",
+        reference_date="2026-10-10",
+        items=[
+            ClinicalItem(
+                resource_type="Encounter",
+                resource_uuid="enc-m1",
+                date="2026-10-10",
+                clinical_date="2026-10-10",
+                date_kind="clinical_event",
+                section="encounter_routine",
+                code="AMB",
+                display="Realized Clinic Visit",
+                text="Encounter: Realized Clinic Visit",
+                status="finished",
+            ),
+            ClinicalItem(
+                resource_type="Condition",
+                resource_uuid="cond-m-err",
+                date="2030-05-01",
+                clinical_date="2030-05-01",
+                date_kind="clinical_event",
+                section="condition_active",
+                code="X",
+                display="Erroneous Direct Condition",
+                text="Condition: Erroneous Direct Condition",
+                status="active",
+                metadata={"verification_status": "entered-in-error"},
+            ),
+            ClinicalItem(
+                resource_type="AllergyIntolerance",
+                resource_uuid="alg-m-refuted",
+                date="2030-06-01",
+                clinical_date="2030-06-01",
+                date_kind="clinical_event",
+                section="allergy",
+                code="Y",
+                display="Refuted Direct Allergy",
+                text="Allergy: Refuted Direct Allergy",
+                status="active",
+                metadata={"verification_status": "refuted"},
+            ),
+        ],
+        numeric_points=[],
+        excluded_resource_counts={},
+        deduplicated_note_count=0,
+        total_bundle_entries=0,
+    )
+    dig_m = build_temporal_digest(manual, condensed=None, question="Latest clinical activity?")
+    assert dig_m.reference_date == "2026-10-10"
+    assert dig_m.summary["latest_clinical_activity_date"] == "2026-10-10"
+    assert "2030-05-01" not in dig_m.digest_text
+    assert "2030-06-01" not in dig_m.digest_text
+
+
+def test_temporal_digest_anchors_active_nonterminal_encounters_on_realized_start() -> None:
+    """in-progress/onleave encounters with future estimated period.end anchor on realized start only."""
+    from wahs_core.extractors import ClinicalItem, ExtractedChart
+
+    bundle = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "pat-active-enc", "birthDate": "1968-03-04"}},
+            {
+                "resource": {
+                    "resourceType": "Encounter",
+                    "id": "enc-prev-fin",
+                    "status": "finished",
+                    "type": [{"text": "Earlier Clinic Visit"}],
+                    "period": {"start": "2026-09-01", "end": "2026-09-01"},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Encounter",
+                    "id": "enc-inprog-est",
+                    "status": "in-progress",
+                    "type": [{"text": "Ongoing Inpatient Stay"}],
+                    "period": {"start": "2026-10-10", "end": "2026-12-31"},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Encounter",
+                    "id": "enc-onleave-est",
+                    "status": "onleave",
+                    "type": [{"text": "Therapeutic Leave Stay"}],
+                    "period": {"start": "2026-10-11", "end": "2027-01-15"},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Encounter",
+                    "id": "enc-inprog-end-only",
+                    "status": "in-progress",
+                    "type": [{"text": "End-Only Active Encounter"}],
+                    "period": {"end": "2028-02-01"},
+                }
+            },
+        ],
+    }
+    ext = extract_bundle(bundle)
+    assert ext.reference_date == "2026-10-11"
+    cond = condense_bundle_to_budget(ext, target_tokens=8192)
+    dig = build_temporal_digest(ext, condensed=cond, question="When was my last completed visit?")
+    assert dig.reference_date == "2026-10-11"
+    assert dig.summary["last_clinical_encounter_date"] == "2026-09-01"
+    assert dig.summary["latest_clinical_activity_date"] == "2026-10-11"
+    assert "2026-12-31" not in dig.digest_text
+    assert "2027-01-15" not in dig.digest_text
+    assert "2028-02-01" not in dig.digest_text
+
+    # Guard direct ClinicalItem callers that set clinical_date from future period.end
+    direct_chart = ExtractedChart(
+        patient_id="pat-active-direct",
+        patient_name="Direct Active Enc Patient",
+        birth_date="1968-03-04",
+        reference_date="2026-09-01",
+        items=[
+            ClinicalItem(
+                resource_type="Encounter",
+                resource_uuid="enc-d-fin",
+                date="2026-09-01",
+                clinical_date="2026-09-01",
+                date_kind="clinical_event",
+                section="encounter_routine",
+                code="AMB",
+                display="Finished Visit",
+                text="Encounter: Finished Visit",
+                status="finished",
+                metadata={"start": "2026-09-01", "end": "2026-09-01"},
+            ),
+            ClinicalItem(
+                resource_type="Encounter",
+                resource_uuid="enc-d-inprog",
+                date="2026-12-31",
+                clinical_date="2026-12-31",
+                date_kind="clinical_event",
+                section="encounter_acuity",
+                code="IMP",
+                display="Ongoing Stay",
+                text="Encounter: Ongoing Stay",
+                status="in-progress",
+                end_date="2026-12-31",
+                metadata={"start": "2026-10-10", "end": "2026-12-31"},
+            ),
+            ClinicalItem(
+                resource_type="Encounter",
+                resource_uuid="enc-d-end-only",
+                date="2028-02-01",
+                clinical_date="2028-02-01",
+                date_kind="clinical_event",
+                section="encounter_acuity",
+                code="IMP",
+                display="Estimated Only Stay",
+                text="Encounter: Estimated Only Stay",
+                status="onleave",
+                end_date="2028-02-01",
+                metadata={"start": None, "end": "2028-02-01"},
+            ),
+        ],
+        numeric_points=[],
+        excluded_resource_counts={},
+        deduplicated_note_count=0,
+        total_bundle_entries=0,
+    )
+    dig_direct = build_temporal_digest(direct_chart, condensed=None, question="Current anchor date?")
+    assert dig_direct.reference_date == "2026-10-10"
+    assert dig_direct.summary["latest_clinical_activity_date"] == "2026-10-10"
+    assert dig_direct.summary["last_clinical_encounter_date"] == "2026-09-01"
