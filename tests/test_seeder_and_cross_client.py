@@ -815,6 +815,11 @@ async def test_bundle_star_graph_partitioning_batching_and_keycloak_sync(tmp_pat
     @kc_app.post("/admin/realms/wahs/users", status_code=201)
     async def _kc_create(request: Request) -> Dict[str, Any]:
         body = await request.json()
+        attrs = body.get("attributes") or {}
+        assert body.get("requiredActions") == []
+        assert attrs.get("gender", [""])[0] in {"Female", "Male", "Non-Binary", "Decline to State"}
+        assert int(attrs.get("terms_and_conditions", ["0"])[0]) >= 1759276800
+        assert attrs.get("birthday", [""])[0]
         kc_users[body["username"]] = {"id": f"kc-new-{body['username']}", "username": body["username"]}
         return {}
 

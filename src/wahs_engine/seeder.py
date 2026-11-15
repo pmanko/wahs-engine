@@ -1363,6 +1363,12 @@ async def ensure_keycloak_demo_users(
             user_id = str(matches[0]["id"]) if matches else ""
 
             if not user_id:
+                raw_gender = str(acct.get("gender") or "").strip().lower()
+                kc_gender = {
+                    "female": "Female",
+                    "male": "Male",
+                    "other": "Non-Binary",
+                }.get(raw_gender, "Decline to State")
                 create_payload = {
                     "username": username,
                     "email": email,
@@ -1370,9 +1376,11 @@ async def ensure_keycloak_demo_users(
                     "lastName": str(acct.get("family") or ""),
                     "enabled": True,
                     "emailVerified": True,
+                    "requiredActions": [],
                     "attributes": {
-                        "birthday": [str(acct.get("birthDate") or "")],
-                        "gender": [str(acct.get("gender") or "")],
+                        "birthday": [str(acct.get("birthDate") or "1970-01-01")],
+                        "gender": [kc_gender],
+                        "terms_and_conditions": ["1759276801"],
                     },
                     "credentials": [
                         {
