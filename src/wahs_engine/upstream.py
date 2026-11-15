@@ -967,6 +967,14 @@ class SouthboundOpenAIClient:
                 overflow_recovered += rec_delta
                 followup_msgs.extend(tool_msgs)
                 next_tools = _OVERFLOW_TOOLS_SPEC if round_idx + 1 < max_tool_rounds else None
+                _, extra_trimmed = _trim_history_to_fit(
+                    followup_msgs,
+                    tools=next_tools,
+                    tokenizer_family=spec.tokenizer_family,
+                    context_window=spec.context_window,
+                    max_output_tokens=effective_max_tokens,
+                )
+                history_trimmed_turns += extra_trimmed
                 next_payload = _build_southbound_payload(
                     upstream_model=upstream_model,
                     messages=followup_msgs,
@@ -976,17 +984,6 @@ class SouthboundOpenAIClient:
                     stream=False,
                     tools=next_tools,
                 )
-                round_toks = count_chat_messages_tokens(
-                    followup_msgs, tools=next_tools, tokenizer_family=spec.tokenizer_family
-                )
-                if round_toks > (spec.context_window - effective_max_tokens):
-                    raise HTTPException(
-                        status_code=422,
-                        detail=(
-                            f"Tool follow-up prompt ({round_toks} exact {spec.tokenizer_family} tokens) "
-                            f"+ max_tokens ({effective_max_tokens}) exceeds model context_window ({spec.context_window})."
-                        ),
-                    )
                 resp_next = await client.post(
                     self.settings.upstream_chat_completions_url,
                     headers=self._headers(),

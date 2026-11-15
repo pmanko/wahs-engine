@@ -1305,3 +1305,81 @@ def test_medication_timestamp_prevents_same_day_older_hold_note_false_positive()
     }
     g_two_holds = ClinicalEntityGraph.from_extracted_chart(extract_bundle(bundle_two_holds))
     assert not any(e.edge_type == "CONTRADICTED_OR_MODIFIED_BY_NOTE" for e in g_two_holds.edges)
+
+
+def test_graph_preserves_linked_medication_order_uuids_against_duplicate_conflicts() -> None:
+    """Linked MedicationDispense/MedicationAdministration fulfillments never emit false CONFLICTS_WITH."""
+    linked_bundle = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "p-med-link", "birthDate": "1964-01-01"}},
+            {
+                "resource": {
+                    "resourceType": "MedicationRequest",
+                    "id": "mr-lis-1",
+                    "status": "active",
+                    "authoredOn": "2026-06-01",
+                    "medicationCodeableConcept": {"text": "Lisinopril 10 MG Oral Tablet"},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "MedicationDispense",
+                    "id": "md-lis-1",
+                    "status": "in-progress",
+                    "whenHandedOver": "2026-06-02",
+                    "authorizingPrescription": [{"reference": "MedicationRequest/mr-lis-1"}],
+                    "medicationCodeableConcept": {"text": "Lisinopril 10 MG Oral Tablet"},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "MedicationAdministration",
+                    "id": "ma-lis-1",
+                    "status": "in-progress",
+                    "effectiveDateTime": "2026-06-03",
+                    "request": {"reference": "MedicationRequest/mr-lis-1"},
+                    "medicationCodeableConcept": {"text": "Lisinopril 10 MG Oral Tablet"},
+                }
+            },
+        ],
+    }
+    ext_linked = extract_bundle(linked_bundle)
+    disp_item = next(it for it in ext_linked.items if it.resource_uuid == "md-lis-1")
+    admin_item = next(it for it in ext_linked.items if it.resource_uuid == "ma-lis-1")
+    assert "mr-lis-1" in (disp_item.metadata or {}).get("linked_order_uuids", [])
+    assert "mr-lis-1" in (admin_item.metadata or {}).get("linked_order_uuids", [])
+
+    g_linked = ClinicalEntityGraph.from_extracted_chart(ext_linked)
+    assert not any(e.edge_type == "CONFLICTS_WITH" for e in g_linked.edges)
+    assert g_linked.conflict_alerts == []
+
+    # Unlinked independent active MedicationRequest orders for the same ingredient still conflict
+    unlinked_bundle = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "p-med-unlinked", "birthDate": "1964-01-01"}},
+            {
+                "resource": {
+                    "resourceType": "MedicationRequest",
+                    "id": "mr-lis-a",
+                    "status": "active",
+                    "authoredOn": "2026-06-01",
+                    "medicationCodeableConcept": {"text": "Lisinopril 10 MG Oral Tablet"},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "MedicationRequest",
+                    "id": "mr-lis-b",
+                    "status": "active",
+                    "authoredOn": "2026-06-05",
+                    "medicationCodeableConcept": {"text": "Lisinopril 20 MG Oral Tablet"},
+                }
+            },
+        ],
+    }
+    g_unlinked = ClinicalEntityGraph.from_extracted_chart(extract_bundle(unlinked_bundle))
+    assert any(e.edge_type == "CONFLICTS_WITH" for e in g_unlinked.edges)

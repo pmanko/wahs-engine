@@ -1208,6 +1208,7 @@ class ClinicalEntityGraph:
                 "display": it.display,
                 "setting": str((it.metadata or {}).get("setting") or "prescribed"),
                 "date": it.date or "",
+                "linked_order_uuids": tuple((it.metadata or {}).get("linked_order_uuids") or ()),
             }
             for it in kept_items
             if it.section == "med_active" and it.resource_uuid

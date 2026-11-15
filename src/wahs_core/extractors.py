@@ -1022,6 +1022,8 @@ def extract_bundle(
             med_meta["raw_timestamp"] = m["raw_timestamp"]
         if m["end_raw_timestamp"]:
             med_meta["end_raw_timestamp"] = m["end_raw_timestamp"]
+        if m["linked_order_uuids"]:
+            med_meta["linked_order_uuids"] = list(m["linked_order_uuids"])
         items.append(
             ClinicalItem(
                 resource_type=m["resourceType"],

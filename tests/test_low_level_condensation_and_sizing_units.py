@@ -867,9 +867,124 @@ async def test_upstream_helpers_flavors_truncation_trimming_and_tool_round_422()
         messages=[{"role": "user", "content": "Read my notes"}],
     )
     opts_t = WahsRequestOptions(enable_kb=False, enable_overflow_tools=True)
-    async with httpx.AsyncClient(transport=httpx.MockTransport(tool_llm_handler)) as llm_client:
-        southbound = SouthboundOpenAIClient(settings_t, http_client=llm_client)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(tool_llm_handler)) as client:
+        southbound = SouthboundOpenAIClient(settings_t, http_client=client)
         with pytest.raises(HTTPException) as exc_round2:
             await southbound.complete(ctx=ctx_tiny, req=req_t, options=opts_t)
     assert exc_round2.value.status_code == 422
     assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_nonstreaming_followup_trims_history_before_rejecting_overflow() -> None:
+    """Non-streaming follow-up rounds trim older conversation turns before enforcing context limit."""
+    from wahs_core import condense_bundle_to_budget, extract_bundle
+    from wahs_engine.assembler import AssembledWahsContext
+    from wahs_engine.config import ModelSpec, WahsEngineSettings
+    from wahs_engine.schemas import OpenAIChatCompletionRequest, WahsRequestOptions
+    from wahs_engine.upstream import SouthboundOpenAIClient
+
+    bundle = _make_dense_safety_bundle()
+    extracted = extract_bundle(bundle)
+    condensed_512 = condense_bundle_to_budget(extracted, target_tokens=512)
+    ctx = AssembledWahsContext(
+        verified_sub="sub-trim",
+        patient_id="pat-1",
+        patient_name="Alex Rivera",
+        birth_date="1985-04-10",
+        system_prompt=condensed_512.chart_text,
+        prefix_cache_key_hash="h-trim",
+        datasets_fingerprint="f-trim",
+        scope_hash="s-trim",
+        datasets_included=[],
+        scope_applied={},
+        security_audit={},
+        extracted=extracted,
+        condensed=condensed_512,
+        citation_map={},
+        privacy_notices=[],
+        context_window=2800,
+        chart_budget_ceiling=512,
+        budget_effective=512,
+    )
+    prior_hist = "Earlier visit context: " + ("creatinine stable " * 140)
+    sent_payloads: List[Dict[str, Any]] = []
+
+    def trim_llm_handler(request: httpx.Request) -> httpx.Response:
+        body_in = json.loads(request.content.decode("utf-8"))
+        sent_payloads.append(body_in)
+        if len(sent_payloads) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "id": "cmpl-trim-1",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "tc-trim-1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "read_clinical_note",
+                                            "arguments": json.dumps({"note_id_or_query": "Progress", "max_chars": 250}),
+                                        },
+                                    }
+                                ],
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 900, "completion_tokens": 20},
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": "cmpl-trim-2",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "Note reviewed cleanly."},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 850, "completion_tokens": 8},
+            },
+        )
+
+    settings = WahsEngineSettings(
+        llm_base_url="http://llm-backend:4000/v1",
+        default_model="trim-tool",
+        model_specs={
+            "trim-tool": ModelSpec(
+                upstream_model="ollama/gemma4:12b",
+                context_window=2800,
+                chart_budget_ceiling=512,
+                default_max_output_tokens=128,
+            )
+        },
+    )
+    req = OpenAIChatCompletionRequest(
+        model="trim-tool",
+        stream=False,
+        max_tokens=128,
+        messages=[
+            {"role": "user", "content": prior_hist},
+            {"role": "assistant", "content": "Understood earlier context."},
+            {"role": "user", "content": "Read my notes"},
+        ],
+    )
+    opts = WahsRequestOptions(enable_kb=False, enable_overflow_tools=True)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(trim_llm_handler)) as llm_client:
+        southbound = SouthboundOpenAIClient(settings, http_client=llm_client)
+        out = await southbound.complete(ctx=ctx, req=req, options=opts)
+    assert len(sent_payloads) == 2
+    assert out["choices"][0]["message"]["content"] == "Note reviewed cleanly."
+    assert out["x_wahs"]["condensation"]["history_trimmed_turns"] >= 2
+    second_contents = [str(m.get("content") or "") for m in sent_payloads[1]["messages"]]
+    assert not any("Earlier visit context:" in c for c in second_contents)
+    assert any(m.get("role") == "tool" for m in sent_payloads[1]["messages"])
