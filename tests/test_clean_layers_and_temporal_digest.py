@@ -993,17 +993,43 @@ def test_appointment_resource_extracted_into_upcoming_visits() -> None:
                     "end": "2026-07-01T10:00:00Z",
                 }
             },
+            {
+                "resource": {
+                    "resourceType": "Appointment",
+                    "id": "appt-2026-2",
+                    "status": "pending",
+                    "description": "Nephrology Consult",
+                    "start": "2026-07-15T14:00:00Z",
+                    "end": "2026-07-15T14:30:00Z",
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Appointment",
+                    "id": "appt-2026-3",
+                    "status": "waitlist",
+                    "description": "Ophthalmology Annual Screening",
+                    "start": "2026-08-01T11:00:00Z",
+                    "end": "2026-08-01T11:30:00Z",
+                }
+            },
         ],
     }
     ext = extract_bundle(bundle)
     assert any(it.resource_type == "Appointment" and it.status == "booked" for it in ext.items)
+    assert any(it.resource_type == "Appointment" and it.status == "pending" for it in ext.items)
+    assert any(it.resource_type == "Appointment" and it.status == "waitlist" for it in ext.items)
     condensed = condense_bundle_to_budget(ext, target_tokens=8192)
     digest = build_temporal_digest(ext, condensed=condensed)
     assert digest.reference_date == "2025-11-01"
-    upcoming_lines = [line for line in digest.digest_text.splitlines() if line.startswith("- Upcoming/Scheduled Visits (1):")]
+    upcoming_lines = [line for line in digest.digest_text.splitlines() if line.startswith("- Upcoming/Scheduled Visits (3):")]
     assert len(upcoming_lines) == 1
     assert "Cardiology Follow-Up" in upcoming_lines[0]
     assert "2026-07-01" in upcoming_lines[0]
+    assert "Nephrology Consult" in upcoming_lines[0]
+    assert "2026-07-15" in upcoming_lines[0]
+    assert "Ophthalmology Annual Screening" in upcoming_lines[0]
+    assert "2026-08-01" in upcoming_lines[0]
 
 
 def test_offset_aware_timestamps_across_utc_midnight_keep_consistent_series_bounds() -> None:

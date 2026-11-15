@@ -28,8 +28,8 @@ from .extractors import ClinicalItem, ExtractedChart, NumericPoint
 from .normalizers import classify_sensitivity, is_non_medical_admin_code
 
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
-_UPCOMING_ENCOUNTER_STATUSES: Set[str] = {"planned", "booked", "scheduled", "proposed"}
-_FUTURE_APPT_STATUSES: Set[str] = {"planned", "booked", "scheduled", "proposed"}
+_UPCOMING_ENCOUNTER_STATUSES: Set[str] = {"planned", "booked", "scheduled", "proposed", "pending", "waitlist"}
+_FUTURE_APPT_STATUSES: Set[str] = {"planned", "booked", "scheduled", "proposed", "pending", "waitlist"}
 _EXCLUDED_EVENT_STATUSES: Set[str] = {"cancelled", "entered-in-error", "noshow"}
 _COMPLETED_ENCOUNTER_STATUSES: Set[str] = {"finished", "completed", ""}
 _STOPPED_MED_STATUSES: Set[str] = {

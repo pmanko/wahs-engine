@@ -658,6 +658,8 @@ def extract_bundle(
         "booked",
         "scheduled",
         "proposed",
+        "pending",
+        "waitlist",
         "cancelled",
         "entered-in-error",
         "noshow",
@@ -701,6 +703,11 @@ def extract_bundle(
                     if d:
                         all_clinical_dates.append(d)
                         break
+            else:
+                if rtype == "Appointment" and raw_st == "fulfilled":
+                    d = _iso_date(res.get("end") or res.get("start"))
+                    if d:
+                        all_clinical_dates.append(d)
 
     reference_date = max(all_clinical_dates) if all_clinical_dates else None
 
