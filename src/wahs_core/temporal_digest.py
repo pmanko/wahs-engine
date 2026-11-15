@@ -497,10 +497,25 @@ def build_temporal_digest(
         elif any_dt is not None and it.section not in _ADMIN_SECTIONS and it.date_kind != "administrative":
             fallback_clinical_dates.append(any_dt)
 
+    valid_numeric_dates: List[str] = []
+    for pt in extracted.numeric_points:
+        pt_status = str(getattr(pt, "status", "") or "").strip().lower()
+        if pt_status in _EXCLUDED_EVENT_STATUSES:
+            continue
+        if pt.resource_uuid and pt.resource_uuid in (redacted_uuids | invalidated_uuids):
+            continue
+        if is_external and classify_sensitivity(pt.code, pt.concept, [pt.category]) == "SDOH/PRIVACY-SENSITIVE":
+            continue
+        pt_dt = _iso10(pt.date)
+        if pt_dt:
+            valid_numeric_dates.append(pt_dt)
+
     if completed_clinical_dates:
         realized_anchor: Optional[str] = max(dt for dt, _ in completed_clinical_dates)
     elif fallback_clinical_dates:
         realized_anchor = max(fallback_clinical_dates)
+    elif valid_numeric_dates:
+        realized_anchor = max(valid_numeric_dates)
     else:
         realized_anchor = None
 
@@ -509,7 +524,7 @@ def build_temporal_digest(
     elif active_careplans_dated:
         reference_date = max(dt for dt, _ in active_careplans_dated)
     else:
-        reference_date = None if is_external else _iso10(extracted.reference_date)
+        reference_date = None
 
     # Reclassify any Encounter or active CarePlan dated strictly after reference_date as upcoming.
     filtered_completed_encounters: List[Tuple[str, ClinicalItem]] = []

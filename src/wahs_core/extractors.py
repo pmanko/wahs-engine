@@ -708,14 +708,29 @@ def extract_bundle(
         "noshow",
     }
 
-    # Pre-scan clinical dates to establish reference_date (excluding Patient, Device, Coverage & future/cancelled items)
+    _reference_date_clinical_resource_types = {
+        "AllergyIntolerance",
+        "Condition",
+        "MedicationRequest",
+        "MedicationAdministration",
+        "MedicationStatement",
+        "MedicationDispense",
+        "Immunization",
+        "DocumentReference",
+        "DiagnosticReport",
+        "Observation",
+        "Procedure",
+        "CarePlan",
+        "Goal",
+        "ImagingStudy",
+        "Encounter",
+        "Appointment",
+    }
+
+    # Pre-scan clinical dates to establish reference_date solely from extracted clinical resources
     for res in resources:
         rtype = str(res.get("resourceType") or "")
-        if (
-            rtype in NON_CLINICAL_RESOURCE_TYPES
-            or rtype in LOOKUP_ONLY_RESOURCE_TYPES
-            or rtype in {"Patient", "Device", "Coverage"}
-        ):
+        if rtype not in _reference_date_clinical_resource_types:
             continue
         raw_st = (
             _codeable_status(res.get("status"))

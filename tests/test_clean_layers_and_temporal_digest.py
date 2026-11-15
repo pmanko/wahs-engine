@@ -1869,3 +1869,74 @@ def test_temporal_digest_anchors_active_nonterminal_encounters_on_realized_start
     assert dig_direct.reference_date == "2026-10-10"
     assert dig_direct.summary["latest_clinical_activity_date"] == "2026-10-10"
     assert dig_direct.summary["last_clinical_encounter_date"] == "2026-09-01"
+
+
+def test_temporal_digest_never_falls_back_to_unextracted_resource_dates() -> None:
+    """Unhandled workflow resources (e.g. Task) or unbacked chart.reference_date never anchor 'Now'."""
+    from wahs_core.extractors import ExtractedChart, NumericPoint
+
+    task_only_bundle = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "pat-task-only", "birthDate": "1975-01-01"}},
+            {
+                "resource": {
+                    "resourceType": "Task",
+                    "id": "task-admin-2030",
+                    "status": "completed",
+                    "authoredOn": "2030-01-01",
+                    "description": "Administrative chart routing task",
+                }
+            },
+        ],
+    }
+    ext_task = extract_bundle(task_only_bundle)
+    assert ext_task.reference_date is None
+    cond_task = condense_bundle_to_budget(ext_task, target_tokens=8192)
+    dig_task = build_temporal_digest(ext_task, condensed=cond_task, question="What is the chart date?")
+    assert dig_task.reference_date is None
+    assert "Reference Date Anchor: undetermined" in dig_task.digest_text
+    assert "2030-01-01" not in dig_task.digest_text
+
+    # Even if an upstream caller passes a populated ExtractedChart.reference_date with no retained items/points
+    unbacked_chart = ExtractedChart(
+        patient_id="pat-unbacked",
+        patient_name="Unbacked Chart",
+        birth_date="1975-01-01",
+        reference_date="2030-01-01",
+        items=[],
+        numeric_points=[],
+        excluded_resource_counts={},
+        deduplicated_note_count=0,
+        total_bundle_entries=1,
+    )
+    dig_unbacked = build_temporal_digest(unbacked_chart, condensed=None, question="What is the chart date?")
+    assert dig_unbacked.reference_date is None
+    assert "2030-01-01" not in dig_unbacked.digest_text
+
+    # Valid NumericPoint objects without ClinicalItem entries still ground the realized anchor
+    points_only_chart = ExtractedChart(
+        patient_id="pat-pts-only",
+        patient_name="Points Only",
+        birth_date="1975-01-01",
+        reference_date="2030-01-01",
+        items=[],
+        numeric_points=[
+            NumericPoint(
+                resource_uuid="obs-pt-1",
+                date="2026-04-12",
+                code="2160-0",
+                concept="Creatinine",
+                value=1.0,
+                unit="mg/dL",
+                category="lab",
+                status="final",
+            )
+        ],
+        excluded_resource_counts={},
+        deduplicated_note_count=0,
+        total_bundle_entries=1,
+    )
+    dig_pts = build_temporal_digest(points_only_chart, condensed=None, question="Latest creatinine?")
+    assert dig_pts.reference_date == "2026-04-12"
