@@ -905,13 +905,16 @@ def extract_bundle(
             else:
                 disp = str(res["medicationReference"].get("display") or "")
         status = str(res.get("status") or "unknown").strip().lower()
-        m_date = _iso_date(
+        m_raw_ts = str(
             res.get("authoredOn")
             or res.get("effectiveDateTime")
             or (res.get("effectivePeriod") or {}).get("start")
             or res.get("whenHandedOver")
-        )
-        end_date = _iso_date((res.get("effectivePeriod") or {}).get("end"))
+            or ""
+        ).strip()
+        end_raw_ts = str((res.get("effectivePeriod") or {}).get("end") or "").strip()
+        m_date = _iso_date(m_raw_ts)
+        end_date = _iso_date(end_raw_ts)
 
         # Extract dosage text and/or structured dosage instructions if available
         dose_strs: List[str] = []
@@ -971,6 +974,8 @@ def extract_bundle(
                 "is_active": is_active,
                 "date": m_date,
                 "end_date": end_date,
+                "raw_timestamp": m_raw_ts,
+                "end_raw_timestamp": end_raw_ts,
                 "dose_strs": dose_strs,
                 "reasons": reasons,
                 "setting": setting,
@@ -1013,6 +1018,10 @@ def extract_bundle(
         }
         if m["sensitivity_source"]:
             med_meta["sensitivity_source"] = m["sensitivity_source"]
+        if m["raw_timestamp"]:
+            med_meta["raw_timestamp"] = m["raw_timestamp"]
+        if m["end_raw_timestamp"]:
+            med_meta["end_raw_timestamp"] = m["end_raw_timestamp"]
         items.append(
             ClinicalItem(
                 resource_type=m["resourceType"],

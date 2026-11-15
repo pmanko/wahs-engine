@@ -1215,3 +1215,71 @@ def test_same_note_directive_order_reconciles_hold_vs_resume() -> None:
     }
     g_tz = ClinicalEntityGraph.from_extracted_chart(extract_bundle(cross_offset_notes))
     assert not any(e.edge_type == "CONTRADICTED_OR_MODIFIED_BY_NOTE" for e in g_tz.edges)
+
+
+def test_medication_timestamp_prevents_same_day_older_hold_note_false_positive() -> None:
+    """PRRT_kwDOVrPAic63lAHO: same-day hold note older than MedicationRequest timestamp must not trigger contradiction."""
+    import base64
+    from wahs_core import ClinicalEntityGraph, extract_bundle
+
+    def _note(nid: str, ndate: str, text: str) -> Dict[str, Any]:
+        return {
+            "resource": {
+                "resourceType": "DocumentReference",
+                "id": nid,
+                "status": "current",
+                "date": ndate,
+                "type": {"text": "Progress Note"},
+                "content": [
+                    {
+                        "attachment": {
+                            "contentType": "text/plain",
+                            "data": base64.b64encode(text.encode("utf-8")).decode("ascii"),
+                        }
+                    }
+                ],
+            }
+        }
+
+    # (a) 09:00Z hold note precedes 15:00Z (and cross-offset 10:00-05:00) MedicationRequest -> NO contradiction
+    for authored_on in ("2026-06-05T15:00:00Z", "2026-06-05T10:00:00-05:00"):
+        bundle_older_hold = {
+            "resourceType": "Bundle",
+            "type": "collection",
+            "entry": [
+                {"resource": {"resourceType": "Patient", "id": "p-med-ts-1", "birthDate": "1964-01-01"}},
+                {
+                    "resource": {
+                        "resourceType": "MedicationRequest",
+                        "id": "med-met-ts",
+                        "status": "active",
+                        "authoredOn": authored_on,
+                        "medicationCodeableConcept": {"text": "Metformin 500 MG Oral Tablet"},
+                    }
+                },
+                _note("doc-morning-hold", "2026-06-05T09:00:00Z", "Hold metformin during inpatient procedure."),
+            ],
+        }
+        g_older = ClinicalEntityGraph.from_extracted_chart(extract_bundle(bundle_older_hold))
+        assert not any(e.edge_type == "CONTRADICTED_OR_MODIFIED_BY_NOTE" for e in g_older.edges)
+
+    # (b) 17:00Z hold note after 15:00Z MedicationRequest -> MUST emit contradiction
+    bundle_newer_hold = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "p-med-ts-2", "birthDate": "1964-01-01"}},
+            {
+                "resource": {
+                    "resourceType": "MedicationRequest",
+                    "id": "med-met-ts-2",
+                    "status": "active",
+                    "authoredOn": "2026-06-05T15:00:00Z",
+                    "medicationCodeableConcept": {"text": "Metformin 500 MG Oral Tablet"},
+                }
+            },
+            _note("doc-evening-hold", "2026-06-05T17:00:00Z", "Hold metformin at discharge due to AKI."),
+        ],
+    }
+    g_newer = ClinicalEntityGraph.from_extracted_chart(extract_bundle(bundle_newer_hold))
+    assert any(e.edge_type == "CONTRADICTED_OR_MODIFIED_BY_NOTE" for e in g_newer.edges)

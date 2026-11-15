@@ -616,11 +616,59 @@ def _med_name_probes(node: ClinicalNode) -> Set[str]:
     return probes
 
 
+def _parse_iso_dt_for_order(ts: str) -> Optional[datetime]:
+    raw = (ts or "").strip()
+    if len(raw) <= 10:
+        return None
+    norm = re.sub(r"(\.\d{6})\d+", r"\1", raw)
+    if norm.endswith(("Z", "z")):
+        norm = f"{norm[:-1]}+00:00"
+    try:
+        return datetime.fromisoformat(norm)
+    except ValueError:
+        return None
+
+
+def _ts_sort_key(ts: str) -> str:
+    """Normalize timezone-aware ISO timestamps to UTC for consistent descending sort."""
+    raw = (ts or "").strip()
+    dt = _parse_iso_dt_for_order(raw)
+    if dt is not None and dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).isoformat(timespec="microseconds")
+    return raw
+
+
+def _ts_is_older(candidate_ts: str, ref_ts: str) -> bool:
+    """Return True only when *candidate_ts* is provably earlier than *ref_ts*."""
+    c_raw = (candidate_ts or "").strip()
+    r_raw = (ref_ts or "").strip()
+    c_date = c_raw[:10]
+    r_date = r_raw[:10]
+    if not c_date or not r_date:
+        return False
+    c_dt = _parse_iso_dt_for_order(c_raw)
+    r_dt = _parse_iso_dt_for_order(r_raw)
+    if c_dt is not None and r_dt is not None:
+        if (c_dt.tzinfo is None) == (r_dt.tzinfo is None):
+            return c_dt < r_dt
+        return c_date < r_date
+    if c_dt is not None and c_dt.tzinfo is not None and len(r_raw) == 10:
+        c_utc_date = c_dt.astimezone(timezone.utc).strftime("%Y-%m-%d")
+        return max(c_date, c_utc_date) < r_date
+    if r_dt is not None and r_dt.tzinfo is not None and len(c_raw) == 10:
+        r_utc_date = r_dt.astimezone(timezone.utc).strftime("%Y-%m-%d")
+        return c_date < min(r_date, r_utc_date)
+    return c_date < r_date
+
+
 def _dedup_nodes_by_identity(nodes: Sequence[ClinicalNode]) -> List[ClinicalNode]:
     """Deduplicate clinical nodes by normalized ingredient/code/label, preferring newest and cited."""
     ordered = sorted(
         nodes,
-        key=lambda n: (n.date_str or "", 1 if n.citation_idx is not None else 0),
+        key=lambda n: (
+            _ts_sort_key(str(n.metadata.get("raw_timestamp") or n.date_str or "")),
+            1 if n.citation_idx is not None else 0,
+        ),
         reverse=True,
     )
     out: List[ClinicalNode] = []
@@ -933,6 +981,11 @@ class ClinicalEntityGraph:
                         **(
                             {"raw_timestamp": str(item.metadata.get("raw_timestamp") or "")}
                             if item.metadata.get("raw_timestamp")
+                            else {}
+                        ),
+                        **(
+                            {"end_raw_timestamp": str(item.metadata.get("end_raw_timestamp") or "")}
+                            if item.metadata.get("end_raw_timestamp")
                             else {}
                         ),
                         **(
@@ -1531,53 +1584,26 @@ class ClinicalEntityGraph:
                     )
                     seen_rationale_counts[rationale] = seen_rationale_counts.get(rationale, 0) + 1
 
-        def _note_is_older(candidate_ts: str, ref_ts: str) -> bool:
-            if len(candidate_ts or "") > 10 and len(ref_ts or "") > 10:
-                try:
-                    c_dt = datetime.fromisoformat(candidate_ts.replace("Z", "+00:00"))
-                    r_dt = datetime.fromisoformat(ref_ts.replace("Z", "+00:00"))
-                    if (c_dt.tzinfo is None) == (r_dt.tzinfo is None):
-                        return c_dt < r_dt
-                except ValueError:
-                    pass
-            c_date = (candidate_ts or "")[:10]
-            r_date = (ref_ts or "")[:10]
-            if not c_date or not r_date:
-                return False
-            return c_date < r_date
-
-        def _note_sort_key(ts: str) -> str:
-            raw = ts or ""
-            if len(raw) > 10:
-                try:
-                    dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-                    if dt.tzinfo is not None:
-                        return dt.astimezone(timezone.utc).isoformat(timespec="microseconds")
-                except ValueError:
-                    pass
-            return raw
-
-        def _note_ts(node: ClinicalNode) -> str:
+        def _node_ts(node: ClinicalNode) -> str:
             return str(node.metadata.get("raw_timestamp") or node.date_str or "")
 
         # 5. ClinicalNote -> Medication hold/discontinue/reconcile & resume reconciliation edges
-        notes_sorted = sorted(notes, key=lambda n: _note_sort_key(_note_ts(n)), reverse=True)
+        notes_sorted = sorted(notes, key=lambda n: _ts_sort_key(_node_ts(n)), reverse=True)
         all_chart_med_probes = {p for m in meds for p in _med_name_probes(m)}
         for m in scoped_meds:
             probes = _med_name_probes(m)
             if not probes:
                 continue
             other_probes = all_chart_med_probes - probes
-            m_date = (m.date_str or "")[:10]
+            m_ts = _node_ts(m)
             latest_resume_ts = ""
             for n in notes_sorted:
                 raw_note = n.raw_line or ""
                 note_body = raw_note or n.value_summary or ""
-                n_ts = _note_ts(n)
-                n_date = n_ts[:10]
-                if m_date and n_date and n_date < m_date:
+                n_ts = _node_ts(n)
+                if m_ts and n_ts and _ts_is_older(n_ts, m_ts):
                     continue
-                if latest_resume_ts and _note_is_older(n_ts, latest_resume_ts):
+                if latest_resume_ts and _ts_is_older(n_ts, latest_resume_ts):
                     continue
                 n_low = note_body.lower()
                 if not n_low:
@@ -1594,7 +1620,7 @@ class ClinicalEntityGraph:
                     other_med_probes=other_probes,
                 )
                 if res_pos is not None and (hold_pos is None or res_pos > hold_pos):
-                    if not latest_resume_ts or _note_is_older(latest_resume_ts, n_ts):
+                    if not latest_resume_ts or _ts_is_older(latest_resume_ts, n_ts):
                         latest_resume_ts = n_ts
                     continue
                 if hold_pos is not None and hold_sent:
@@ -1628,17 +1654,22 @@ class ClinicalEntityGraph:
             if not probes or (probes & active_med_probes):
                 continue
             other_probes = all_chart_med_probes - probes
-            m_date = (m.date_str or "")[:10]
+            m_start_ts = _node_ts(m)
+            m_end_ts = str(m.metadata.get("end_raw_timestamp") or "")
+            m_ts = (
+                m_end_ts
+                if (m_end_ts and (not m_start_ts or _ts_is_older(m_start_ts, m_end_ts)))
+                else m_start_ts
+            )
             latest_hold_ts = ""
             for n in notes_sorted:
                 raw_note = n.raw_line or ""
                 if not raw_note:
                     continue
-                n_ts = _note_ts(n)
-                n_date = n_ts[:10]
-                if m_date and n_date and n_date < m_date:
+                n_ts = _node_ts(n)
+                if m_ts and n_ts and _ts_is_older(n_ts, m_ts):
                     continue
-                if latest_hold_ts and _note_is_older(n_ts, latest_hold_ts):
+                if latest_hold_ts and _ts_is_older(n_ts, latest_hold_ts):
                     continue
                 n_low = raw_note.lower()
                 n_toks = set(re.findall(r"[a-z][a-z0-9-]{3,}", n_low))
