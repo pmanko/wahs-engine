@@ -17,6 +17,7 @@ Strict Layer Boundaries:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 import re
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
@@ -419,6 +420,28 @@ _TRAILING_WRAPPER_SPLIT_RE = re.compile(
 def _slugify(value: str) -> str:
     s = re.sub(r"[^a-zA-Z0-9]+", "_", (value or "").strip().lower()).strip("_")
     return s[:48] or "item"
+
+
+@lru_cache(maxsize=512)
+def _compile_clinical_term_pattern(term: str) -> Optional[re.Pattern[str]]:
+    """Compile a term-boundary regex so short/root clinical keywords avoid substring false positives."""
+    parts = re.findall(r"[a-z0-9]+", (term or "").strip().lower())
+    if not parts:
+        return None
+    body = r"[^a-z0-9]+".join(re.escape(p) for p in parts)
+    last = parts[-1]
+    suffix = "" if (len(last) <= 4 or last == "sulfa") else r"(?:s|es|ed|ing)?"
+    return re.compile(rf"(?<![a-z0-9]){body}{suffix}(?![a-z0-9])", flags=re.IGNORECASE)
+
+
+def _contains_clinical_term(haystack: str, term: str) -> bool:
+    """Return True when ``term`` appears as a bounded word/phrase (or inflected stem) in ``haystack``."""
+    if not haystack or not term:
+        return False
+    pat = _compile_clinical_term_pattern(term)
+    if pat is None:
+        return False
+    return bool(pat.search(haystack))
 
 
 def _query_terms(question: str) -> Set[str]:
@@ -971,11 +994,11 @@ class ClinicalEntityGraph:
                     str(t).lower()
                     for t in (rule.get("med_tokens") or rule.get("medication_terms") or ())
                 ]
-                if not any(t in al_low for t in al_terms):
+                if not any(_contains_clinical_term(al_low, t) for t in al_terms):
                     continue
                 for m in scoped_meds:
                     m_low = f"{m.label} {m.metadata.get('ingredient_key', '')}".lower()
-                    if any(mt in m_low for mt in med_terms):
+                    if any(_contains_clinical_term(m_low, mt) for mt in med_terms):
                         self.add_edge(
                             ClinicalEdge(
                                 source_id=al.node_id,
@@ -1013,11 +1036,11 @@ class ClinicalEntityGraph:
             has_num = isinstance(val, (int, float))
             unit_compact = re.sub(r"\s+", "", str(tgt.metadata.get("unit") or "").strip().lower())
 
-            if "egfr" in t_low or "glomerular filtration" in t_low:
+            if _contains_clinical_term(t_low, "egfr") or _contains_clinical_term(t_low, "glomerular filtration"):
                 if has_num and (not unit_compact or "ml/min" in unit_compact):
                     return float(val) < 60
                 return is_abn and is_low
-            if "creatinine" in t_low:
+            if _contains_clinical_term(t_low, "creatinine"):
                 if has_num:
                     if unit_compact in {"", "mg/dl", "mg/100ml", "mg%"}:
                         return float(val) >= 1.5
@@ -1028,15 +1051,17 @@ class ClinicalEntityGraph:
                     if unit_compact == "mmol/l":
                         return ((float(val) * 1000.0) / 88.42) >= 1.5
                 return is_abn and is_high
-            if "potassium" in t_low:
+            if _contains_clinical_term(t_low, "potassium"):
                 if has_num and unit_compact in {"", "meq/l", "mmol/l", "meq/liter", "mmol/liter"}:
                     return float(val) >= 5.0 or float(val) <= 3.4
                 return is_abn and (is_high or is_low or not interp)
-            if "inr" in t_low:
+            if _contains_clinical_term(t_low, "inr"):
                 if has_num and unit_compact in {"", "{inr}", "inr", "ratio", "1", "none"}:
                     return float(val) >= 3.5
                 return is_abn and is_high
-            if "hemoglobin" in t_low and "a1c" not in t_low:
+            if _contains_clinical_term(t_low, "hemoglobin") and not (
+                _contains_clinical_term(t_low, "a1c") or _contains_clinical_term(t_low, "hba1c")
+            ):
                 if has_num:
                     if unit_compact in {"", "g/dl", "gm/dl", "g/100ml", "g%"}:
                         return float(val) < 11.5
@@ -1045,7 +1070,7 @@ class ClinicalEntityGraph:
                     if unit_compact == "mmol/l":
                         return (float(val) * 1.6114) < 11.5
                 return is_abn and is_low
-            if "glucose" in t_low:
+            if _contains_clinical_term(t_low, "glucose"):
                 if has_num:
                     if unit_compact in {"", "mg/dl", "mg/100ml", "mg%"}:
                         return float(val) < 70
@@ -1063,10 +1088,10 @@ class ClinicalEntityGraph:
                 cond_kws = tuple(str(t).lower() for t in (rule.get("target_tokens") or ()))
                 rationale = str(rule.get("rationale") or "")
                 kb_src = str(rule.get("kb_source") or "")
-                if any(dk in m_low for dk in drug_kws):
+                if any(_contains_clinical_term(m_low, dk) for dk in drug_kws):
                     for c in scoped_conds:
                         c_low = f"{c.label} {c.raw_line}".lower()
-                        if any(ck in c_low for ck in cond_kws):
+                        if any(_contains_clinical_term(c_low, ck) for ck in cond_kws):
                             self.add_edge(
                                 ClinicalEdge(
                                     source_id=m.node_id,
@@ -1086,7 +1111,7 @@ class ClinicalEntityGraph:
                 risk_kws = tuple(str(t).lower() for t in (rule.get("target_tokens") or ()))
                 rationale = str(rule.get("rationale") or "")
                 kb_src = str(rule.get("kb_source") or "")
-                if not any(dk in m_low for dk in drug_kws):
+                if not any(_contains_clinical_term(m_low, dk) for dk in drug_kws):
                     continue
                 matched_tgts: List[ClinicalNode] = []
                 for tgt in scoped_conds + obs + scoped_meds:
@@ -1096,7 +1121,11 @@ class ClinicalEntityGraph:
                         continue
                     t_low = f"{tgt.label} {tgt.value_summary} {tgt.raw_line}".lower()
                     if not any(
-                        rk in t_low and not (rk == "hemoglobin" and "a1c" in t_low)
+                        _contains_clinical_term(t_low, rk)
+                        and not (
+                            rk == "hemoglobin"
+                            and (_contains_clinical_term(t_low, "a1c") or _contains_clinical_term(t_low, "hba1c"))
+                        )
                         for rk in risk_kws
                     ):
                         continue
@@ -1141,12 +1170,12 @@ class ClinicalEntityGraph:
                 ent_kws = tuple(str(t).lower() for t in (rule.get("trigger_tokens") or ()))
                 lab_kws = tuple(str(t).lower() for t in (rule.get("obs_tokens") or ()))
                 rationale = str(rule.get("rationale") or "")
-                if not any(ek in e_low for ek in ent_kws):
+                if not any(_contains_clinical_term(e_low, ek) for ek in ent_kws):
                     continue
                 matched_obs = [
                     ob
                     for ob in obs
-                    if any(lk in f"{ob.label} {ob.value_summary}".lower() for lk in lab_kws)
+                    if any(_contains_clinical_term(f"{ob.label} {ob.value_summary}".lower(), lk) for lk in lab_kws)
                 ]
                 matched_obs.sort(
                     key=lambda o: (1 if o.metadata.get("is_abnormal") else 0, o.date_str or ""),

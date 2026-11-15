@@ -450,3 +450,124 @@ def test_abnormal_labs_in_non_risky_direction_do_not_trigger_safety_warnings() -
         extract_bundle(_bundle("Metformin 500 MG", "33914-3", "Glomerular filtration rate (eGFR)", 28.0, "mL/min/1.73m2", "L"))
     )
     assert any(e.edge_type == "CONTRAINDICATED_OR_DOSE_ADJUST_IN" for e in g_egfr_lo.edges)
+
+
+def test_clinical_rule_keywords_match_term_boundaries_without_substring_false_positives() -> None:
+    from wahs_core import ClinicalEntityGraph, extract_bundle
+
+    # Active Ibuprofen + Adrenal insufficiency + Furosemide + Bunion + Sulfa allergy + Ferrous sulfate
+    # must NOT emit false CONTRAINDICATED_OR_DOSE_ADJUST_IN or CROSS_REACTS_WITH edges from substrings ("renal", "bun", "sulfa").
+    false_pos_bundle = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "p-bnd-1", "birthDate": "1960-01-01"}},
+            {
+                "resource": {
+                    "resourceType": "Condition",
+                    "id": "cond-adrenal",
+                    "clinicalStatus": {"coding": [{"code": "active"}]},
+                    "code": {"text": "Adrenal insufficiency"},
+                    "onsetDateTime": "2024-01-01",
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Condition",
+                    "id": "cond-bunion",
+                    "clinicalStatus": {"coding": [{"code": "active"}]},
+                    "code": {"text": "Bunion"},
+                    "onsetDateTime": "2024-02-01",
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "AllergyIntolerance",
+                    "id": "al-sulfa",
+                    "clinicalStatus": {"coding": [{"code": "active"}]},
+                    "verificationStatus": {"coding": [{"code": "confirmed"}]},
+                    "code": {"text": "Sulfa drug allergy"},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "MedicationRequest",
+                    "id": "med-ibuprofen",
+                    "status": "active",
+                    "authoredOn": "2026-09-01",
+                    "medicationCodeableConcept": {"text": "Ibuprofen 400 MG Oral Tablet"},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "MedicationRequest",
+                    "id": "med-furosemide",
+                    "status": "active",
+                    "authoredOn": "2026-09-01",
+                    "medicationCodeableConcept": {"text": "Furosemide 20 MG Oral Tablet"},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "MedicationRequest",
+                    "id": "med-ferrous",
+                    "status": "active",
+                    "authoredOn": "2026-09-01",
+                    "medicationCodeableConcept": {"text": "Ferrous sulfate 325 MG Oral Tablet"},
+                }
+            },
+        ],
+    }
+    g_fp = ClinicalEntityGraph.from_extracted_chart(extract_bundle(false_pos_bundle))
+    assert not any(e.edge_type == "CONTRAINDICATED_OR_DOSE_ADJUST_IN" for e in g_fp.edges)
+    assert not any(e.edge_type == "CROSS_REACTS_WITH" for e in g_fp.edges)
+
+    # Genuine whole-term & inflected matches ("bleeding" <- "bleed", "Platelets" <- "platelet") still emit edges.
+    true_pos_bundle = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "p-bnd-2", "birthDate": "1960-01-01"}},
+            {
+                "resource": {
+                    "resourceType": "Condition",
+                    "id": "cond-gibleed",
+                    "clinicalStatus": {"coding": [{"code": "active"}]},
+                    "code": {"text": "Gastrointestinal bleeding"},
+                    "onsetDateTime": "2026-08-01",
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "MedicationRequest",
+                    "id": "med-ibu-2",
+                    "status": "active",
+                    "authoredOn": "2026-09-01",
+                    "medicationCodeableConcept": {"text": "Ibuprofen 400 MG Oral Tablet"},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "MedicationRequest",
+                    "id": "med-warf-2",
+                    "status": "active",
+                    "authoredOn": "2026-09-01",
+                    "medicationCodeableConcept": {"text": "Warfarin 5 MG Oral Tablet"},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Observation",
+                    "id": "obs-plt-2",
+                    "status": "final",
+                    "category": [{"coding": [{"code": "laboratory"}]}],
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "777-3", "display": "Platelets"}], "text": "Platelets"},
+                    "effectiveDateTime": "2026-10-01",
+                    "valueQuantity": {"value": 210.0, "unit": "10*3/uL"},
+                }
+            },
+        ],
+    }
+    g_tp = ClinicalEntityGraph.from_extracted_chart(extract_bundle(true_pos_bundle))
+    assert any(e.edge_type == "CONTRAINDICATED_OR_DOSE_ADJUST_IN" for e in g_tp.edges)
+    assert any(e.edge_type == "MONITORED_BY" and "Platelets" in g_tp.nodes[e.target_id].label for e in g_tp.edges)
