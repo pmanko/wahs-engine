@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import subprocess
 import sys
@@ -571,3 +572,211 @@ def test_clinical_rule_keywords_match_term_boundaries_without_substring_false_po
     g_tp = ClinicalEntityGraph.from_extracted_chart(extract_bundle(true_pos_bundle))
     assert any(e.edge_type == "CONTRAINDICATED_OR_DOSE_ADJUST_IN" for e in g_tp.edges)
     assert any(e.edge_type == "MONITORED_BY" and "Platelets" in g_tp.nodes[e.target_id].label for e in g_tp.edges)
+
+
+def test_refuted_and_entered_in_error_conditions_excluded_from_safety_rules() -> None:
+    """PRRT_kwDOVrPAic63kpAh: active Condition with refuted/entered-in-error verificationStatus must not fire safety rules."""
+    for verif_code in ("refuted", "entered-in-error"):
+        bundle = {
+            "resourceType": "Bundle",
+            "type": "collection",
+            "entry": [
+                {"resource": {"resourceType": "Patient", "id": "p-cond-verif", "birthDate": "1965-01-01"}},
+                {
+                    "resource": {
+                        "resourceType": "Condition",
+                        "id": f"cond-renal-{verif_code}",
+                        "clinicalStatus": {"coding": [{"code": "active"}]},
+                        "verificationStatus": {"coding": [{"code": verif_code}]},
+                        "code": {"text": "Chronic kidney disease stage 4"},
+                        "onsetDateTime": "2024-01-01",
+                    }
+                },
+                {
+                    "resource": {
+                        "resourceType": "MedicationRequest",
+                        "id": "med-ibu-verif",
+                        "status": "active",
+                        "authoredOn": "2026-09-01",
+                        "medicationCodeableConcept": {"text": "Ibuprofen 400 MG Oral Tablet"},
+                    }
+                },
+            ],
+        }
+        ext = extract_bundle(bundle)
+        cond_item = next(it for it in ext.items if it.resource_type == "Condition")
+        assert cond_item.section == "condition_resolved"
+        assert cond_item.metadata.get("verification_status") == verif_code
+        graph = ClinicalEntityGraph.from_extracted_chart(ext)
+        assert not any(e.edge_type == "CONTRAINDICATED_OR_DOSE_ADJUST_IN" for e in graph.edges)
+
+
+def test_comparator_based_low_egfr_observation_preserves_risk_metadata() -> None:
+    """PRRT_kwDOVrPAic63kpAl: Observation with valueQuantity.comparator preserves risk metadata and triggers safety edges."""
+    bundle_with_interp = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "p-cmp-1", "birthDate": "1962-03-03"}},
+            {
+                "resource": {
+                    "resourceType": "Observation",
+                    "id": "obs-egfr-lt30",
+                    "status": "final",
+                    "category": [{"coding": [{"code": "laboratory"}]}],
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "33914-3", "display": "eGFR"}], "text": "eGFR"},
+                    "effectiveDateTime": "2026-10-01",
+                    "valueQuantity": {"value": 30, "comparator": "<", "unit": "mL/min/1.73m2"},
+                    "interpretation": [{"coding": [{"code": "L", "display": "Low"}]}],
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "MedicationRequest",
+                    "id": "med-met-cmp",
+                    "status": "active",
+                    "authoredOn": "2026-09-01",
+                    "medicationCodeableConcept": {"text": "Metformin 500 MG Oral Tablet"},
+                }
+            },
+        ],
+    }
+    ext = extract_bundle(bundle_with_interp)
+    assert ext.numeric_points == []
+    graph = ClinicalEntityGraph.from_extracted_chart(ext)
+    obs_node = next(n for n in graph.nodes.values() if n.category == "Observation" and "egfr" in n.label.lower())
+    assert obs_node.metadata.get("is_abnormal") is True
+    assert obs_node.metadata.get("interpretation") == "L"
+    assert obs_node.metadata.get("unit") == "mL/min/1.73m2"
+    assert obs_node.metadata.get("value") == "<30 mL/min/1.73m2"
+    assert any(e.edge_type == "CONTRAINDICATED_OR_DOSE_ADJUST_IN" for e in graph.edges)
+
+    # Also verify comparator threshold <30 without explicit interpretation tag
+    bundle_cmp_only = json.loads(json.dumps(bundle_with_interp))
+    del bundle_cmp_only["entry"][1]["resource"]["interpretation"]
+    graph_no_interp = ClinicalEntityGraph.from_extracted_chart(extract_bundle(bundle_cmp_only))
+    assert any(e.edge_type == "CONTRAINDICATED_OR_DOSE_ADJUST_IN" for e in graph_no_interp.edges)
+
+    # Normal comparator >60 mL/min/1.73m2 must NOT trigger contraindication
+    bundle_gt60 = json.loads(json.dumps(bundle_cmp_only))
+    bundle_gt60["entry"][1]["resource"]["valueQuantity"] = {"value": 60, "comparator": ">", "unit": "mL/min/1.73m2"}
+    graph_gt60 = ClinicalEntityGraph.from_extracted_chart(extract_bundle(bundle_gt60))
+    assert not any(e.edge_type == "CONTRAINDICATED_OR_DOSE_ADJUST_IN" for e in graph_gt60.edges)
+
+
+def _note_doc(note_id: str, date_str: str, note_text: str) -> dict:
+    return {
+        "resource": {
+            "resourceType": "DocumentReference",
+            "id": note_id,
+            "status": "current",
+            "date": date_str,
+            "type": {"text": "Progress Note"},
+            "content": [
+                {
+                    "attachment": {
+                        "contentType": "text/plain",
+                        "data": base64.b64encode(note_text.encode("utf-8")).decode("ascii"),
+                    }
+                }
+            ],
+        }
+    }
+
+
+def test_negated_hold_and_resume_directives_do_not_emit_false_note_conflicts() -> None:
+    """PRRT_kwDOVrPAic63kpAo & PRRT_kwDOVrPAic63kpAs: negated hold/resume phrases must not invert medication reconciliation."""
+    # 1. Active metformin + active lisinopril with negated hold on lisinopril/metformin vs affirmative hold on metformin
+    active_neg_hold = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "p-neg-1", "birthDate": "1968-01-01"}},
+            {
+                "resource": {
+                    "resourceType": "MedicationRequest",
+                    "id": "med-met-act",
+                    "status": "active",
+                    "authoredOn": "2026-01-01",
+                    "medicationCodeableConcept": {"text": "Metformin 500 MG Oral Tablet"},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "MedicationRequest",
+                    "id": "med-lis-act",
+                    "status": "active",
+                    "authoredOn": "2026-01-01",
+                    "medicationCodeableConcept": {"text": "Lisinopril 10 MG Oral Tablet"},
+                }
+            },
+            _note_doc(
+                "doc-neg-hold",
+                "2026-10-05",
+                "Plan: Do not stop metformin. Please do not hold lisinopril before follow-up.",
+            ),
+        ],
+    }
+    g_neg = ClinicalEntityGraph.from_extracted_chart(extract_bundle(active_neg_hold))
+    assert not any(e.edge_type == "CONTRADICTED_OR_MODIFIED_BY_NOTE" for e in g_neg.edges)
+
+    # Contrast: mixed clause "Do not stop lisinopril, but hold metformin." -> flags ONLY metformin
+    mixed_bundle = json.loads(json.dumps(active_neg_hold))
+    mixed_bundle["entry"][3] = _note_doc(
+        "doc-mixed-hold",
+        "2026-10-05",
+        "Plan: Do not stop lisinopril, but hold metformin until renal repeat.",
+    )
+    g_mixed = ClinicalEntityGraph.from_extracted_chart(extract_bundle(mixed_bundle))
+    mixed_edges = [e for e in g_mixed.edges if e.edge_type == "CONTRADICTED_OR_MODIFIED_BY_NOTE"]
+    assert len(mixed_edges) == 1
+    assert "metformin" in g_mixed.nodes[mixed_edges[0].source_id].label.lower()
+
+    # Non-adherence phrase "not taking" still triggers hold/modification reconciliation
+    nonadhere_bundle = json.loads(json.dumps(active_neg_hold))
+    nonadhere_bundle["entry"][3] = _note_doc(
+        "doc-nonadhere",
+        "2026-10-05",
+        "Patient reports not taking metformin due to GI upset.",
+    )
+    g_nonadhere = ClinicalEntityGraph.from_extracted_chart(extract_bundle(nonadhere_bundle))
+    assert any(
+        e.edge_type == "CONTRADICTED_OR_MODIFIED_BY_NOTE"
+        and "metformin" in g_nonadhere.nodes[e.source_id].label.lower()
+        for e in g_nonadhere.edges
+    )
+
+    # 2. Historical/stopped metformin + negated resume directives -> NO resume conflict edge
+    stopped_neg_resume = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "p-neg-2", "birthDate": "1968-01-01"}},
+            {
+                "resource": {
+                    "resourceType": "MedicationRequest",
+                    "id": "med-met-stop",
+                    "status": "stopped",
+                    "authoredOn": "2026-01-01",
+                    "medicationCodeableConcept": {"text": "Metformin 500 MG Oral Tablet"},
+                }
+            },
+            _note_doc(
+                "doc-neg-resume",
+                "2026-10-06",
+                "Plan: Do not resume metformin. Patient cannot restart metformin.",
+            ),
+        ],
+    }
+    g_stop_neg = ClinicalEntityGraph.from_extracted_chart(extract_bundle(stopped_neg_resume))
+    assert not any(e.edge_type == "CONTRADICTED_OR_MODIFIED_BY_NOTE" for e in g_stop_neg.edges)
+
+    # Positive resume on stopped metformin STILL fires
+    stopped_pos_resume = json.loads(json.dumps(stopped_neg_resume))
+    stopped_pos_resume["entry"][2] = _note_doc(
+        "doc-pos-resume",
+        "2026-10-06",
+        "Plan: Restart metformin 500 mg daily now that eGFR stabilized.",
+    )
+    g_stop_pos = ClinicalEntityGraph.from_extracted_chart(extract_bundle(stopped_pos_resume))
+    assert any(e.edge_type == "CONTRADICTED_OR_MODIFIED_BY_NOTE" for e in g_stop_pos.edges)

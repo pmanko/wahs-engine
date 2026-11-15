@@ -405,6 +405,27 @@ def _extract_obs_interpretation_and_range(
         elif high_bound is not None and num_val > high_bound:
             interp_label = "H"
             is_abnormal = True
+    elif interp_label is None:
+        vq = obs.get("valueQuantity")
+        if isinstance(vq, Mapping) and vq.get("value") is not None:
+            cmp_op = str(vq.get("comparator") or "").strip()
+            try:
+                cmp_val = float(vq["value"])
+            except (TypeError, ValueError):
+                cmp_val = None
+            if cmp_val is not None:
+                if low_bound is not None and (
+                    (cmp_op == "<" and cmp_val <= low_bound)
+                    or (cmp_op == "<=" and cmp_val < low_bound)
+                ):
+                    interp_label = "L"
+                    is_abnormal = True
+                elif high_bound is not None and (
+                    (cmp_op == ">" and cmp_val >= high_bound)
+                    or (cmp_op == ">=" and cmp_val > high_bound)
+                ):
+                    interp_label = "H"
+                    is_abnormal = True
 
     return interp_label, range_str, is_abnormal
 
@@ -791,11 +812,20 @@ def extract_bundle(
             }
         )
 
+    _non_actionable_cond_verif = {"refuted", "entered-in-error"}
     active_cond_dicts = [
-        c for c in raw_conditions if c["status"] in {"active", "recurrence", "relapse"}
+        c
+        for c in raw_conditions
+        if c["status"] in {"active", "recurrence", "relapse"}
+        and c["verification"] not in _non_actionable_cond_verif
     ]
     resolved_cond_dicts = [
-        c for c in raw_conditions if c["status"] not in {"active", "recurrence", "relapse"}
+        c
+        for c in raw_conditions
+        if not (
+            c["status"] in {"active", "recurrence", "relapse"}
+            and c["verification"] not in _non_actionable_cond_verif
+        )
     ]
     condition_conflicts = (
         detect_condition_conflicts(active_cond_dicts, resolved_cond_dicts)
@@ -805,11 +835,16 @@ def extract_bundle(
 
     for c in raw_conditions:
         rid = c["resourceUuid"]
-        is_active = c["status"] in {"active", "recurrence", "relapse"}
+        is_active = (
+            c["status"] in {"active", "recurrence", "relapse"}
+            and c["verification"] not in _non_actionable_cond_verif
+        )
         conflict = condition_conflicts.get(rid)
         sens = c["sensitivity"]
         event_date = c["onset"] if is_active else (c["abatement"] or c["onset"])
         details = [f"status: {c['status']}"]
+        if c["verification"]:
+            details.append(f"verification: {c['verification']}")
         if c["onset"]:
             details.append(f"onset: {c['onset']}")
         if c["abatement"]:
@@ -824,6 +859,8 @@ def extract_bundle(
             "abatement": c["abatement"],
             "kb_resolution": cond_kb,
         }
+        if c["verification"]:
+            cond_meta["verification_status"] = c["verification"]
         if c["sensitivity_source"]:
             cond_meta["sensitivity_source"] = c["sensitivity_source"]
         items.append(

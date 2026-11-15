@@ -102,6 +102,51 @@ _HIGH_PRIORITY_EDGE_TYPES: Set[str] = {
     "CONTRADICTED_OR_MODIFIED_BY_NOTE",
 }
 
+_NEGATED_RESUME_RE = re.compile(
+    r"\b(?:do\s+not|don't|does\s+not|doesn't|did\s+not|didn't|"
+    r"should\s+not|shouldn't|must\s+not|mustn't|cannot|can't|"
+    r"never|avoid|not\s+to|no\s+plan\s+to)\s+(?:to\s+)?(?:be\s+)?"
+    r"(?:continuing|continued|continue|resuming|resumed|resume|restarting|restarted|restart)\b"
+    r"|\bnot\s+(?:continued|resumed|restarted)\b"
+)
+
+_NEGATED_HOLD_RE = re.compile(
+    r"\b(?:do\s+not|don't|does\s+not|doesn't|did\s+not|didn't|"
+    r"should\s+not|shouldn't|must\s+not|mustn't|cannot|can't|"
+    r"never|not\s+to|no\s+need\s+to|without)\s+(?:to\s+)?(?:be\s+)?"
+    r"(?:stopping|stopped|stop|holding|held|hold|"
+    r"discontinuing|discontinued|discontinue|reducing|reduced|reduce|"
+    r"switching|switched|switch|avoiding|avoid)\b"
+    r"|\bnot\s+(?:stopped|held|discontinued|reduced|switched)\b"
+)
+
+
+def _clause_has_affirmative_directive(
+    clause_low: str,
+    probes: Set[str],
+    cues: Sequence[str],
+    neg_re: re.Pattern[str],
+) -> bool:
+    """Return True if *clause_low* affirms *cues* for *probes* without negation."""
+    if not clause_low:
+        return False
+    sub_clauses = (
+        [
+            sc.strip()
+            for sc in re.split(r"\b(?:but|however|though|although|whereas)\b|[,;]", clause_low)
+            if sc.strip()
+        ]
+        if neg_re.search(clause_low)
+        else [clause_low]
+    )
+    for sub in sub_clauses:
+        cleaned = neg_re.sub(" ", sub)
+        if any(cue in cleaned for cue in cues):
+            toks = set(re.findall(r"[a-z][a-z0-9-]{3,}", cleaned))
+            if probes & toks:
+                return True
+    return False
+
 _SECTION_OVERFLOW_PRIORITY: Dict[str, int] = {
     "allergy": 0,
     "condition_active": 1,
@@ -764,6 +809,8 @@ class ClinicalEntityGraph:
                     or ""
                 ).strip()
                 summary = item.source_org or ""
+            elif cat == "Observation":
+                summary = str(item.metadata.get("value") or item.status or "")
             elif cat in {"Medication", "Condition", "AllergyIntolerance", "CarePlan"}:
                 summary = item.status or ""
             elif cat == "Immunization":
@@ -788,6 +835,19 @@ class ClinicalEntityGraph:
                         "dosage": list(item.metadata.get("dosage") or []),
                         "therapeutic_class": str(item.metadata.get("therapeutic_class") or ""),
                         "verification_status": str(item.metadata.get("verification_status") or "").lower(),
+                        **(
+                            {
+                                "is_abnormal": bool(item.metadata.get("is_abnormal")),
+                                "interpretation": str(item.metadata.get("interpretation") or ""),
+                                "reference_range": str(item.metadata.get("reference_range") or ""),
+                                "latest_value": item.metadata.get("numeric"),
+                                "numeric": item.metadata.get("numeric"),
+                                "unit": str(item.metadata.get("unit") or ""),
+                                "value": str(item.metadata.get("value") or ""),
+                            }
+                            if cat == "Observation"
+                            else {}
+                        ),
                     },
                 )
             )
@@ -957,11 +1017,24 @@ class ClinicalEntityGraph:
             and not is_non_medical_admin_code(m.code)
         ]
         scoped_meds = _dedup_nodes_by_identity(active_med_nodes)
+        def _is_actionable_condition(c_node: ClinicalNode) -> bool:
+            c_st = (c_node.status or "").strip().lower()
+            if c_st in {"inactive", "resolved", "remission", "entered-in-error"}:
+                return False
+            v_st = str(c_node.metadata.get("verification_status") or "").strip().lower()
+            if v_st in {"refuted", "entered-in-error"}:
+                return False
+            c_raw = f"{c_node.label} {c_node.raw_line}".lower()
+            if "verification: refuted" in c_raw or "verification: entered-in-error" in c_raw:
+                return False
+            return True
+
         active_cond_nodes = [
             c
             for c in conds
             if c.metadata.get("section") == "condition_active"
             and not is_non_medical_admin_code(c.code)
+            and _is_actionable_condition(c)
         ]
         scoped_conds = _dedup_nodes_by_identity(active_cond_nodes)
 
@@ -1033,49 +1106,100 @@ class ClinicalEntityGraph:
             is_high = interp in {"h", "hh", "high", "above high normal", "critical high", ">"}
             is_low = interp in {"l", "ll", "low", "below low normal", "critical low", "<"}
             val = tgt.metadata.get("latest_value")
+            if val is None:
+                val = tgt.metadata.get("numeric")
             has_num = isinstance(val, (int, float))
+            raw_val_str = str(tgt.metadata.get("value") or tgt.value_summary or "").strip()
+            cmp_match = re.match(r"^\s*(<=|>=|<|>)\s*([0-9]+(?:\.[0-9]+)?)\b", raw_val_str)
+            cmp_op = cmp_match.group(1) if cmp_match else ""
+            cmp_num = float(cmp_match.group(2)) if cmp_match else None
             unit_compact = re.sub(r"\s+", "", str(tgt.metadata.get("unit") or "").strip().lower())
 
+            def _eval_low(threshold: float, scale: Callable[[float], float]) -> Optional[bool]:
+                if has_num:
+                    return scale(float(val)) < threshold
+                if cmp_num is not None:
+                    scaled = scale(cmp_num)
+                    if cmp_op == "<":
+                        return scaled <= threshold
+                    if cmp_op == "<=":
+                        return scaled < threshold
+                    if cmp_op in {">", ">="} and scaled >= threshold:
+                        return False
+                return None
+
+            def _eval_high(threshold: float, scale: Callable[[float], float]) -> Optional[bool]:
+                if has_num:
+                    return scale(float(val)) >= threshold
+                if cmp_num is not None:
+                    scaled = scale(cmp_num)
+                    if cmp_op in {">", ">="}:
+                        return scaled >= threshold
+                    if cmp_op in {"<", "<="} and scaled <= threshold:
+                        return False
+                return None
+
             if _contains_clinical_term(t_low, "egfr") or _contains_clinical_term(t_low, "glomerular filtration"):
-                if has_num and (not unit_compact or "ml/min" in unit_compact):
-                    return float(val) < 60
+                if not unit_compact or "ml/min" in unit_compact:
+                    res = _eval_low(60.0, lambda x: x)
+                    if res is not None:
+                        return res
                 return is_abn and is_low
             if _contains_clinical_term(t_low, "creatinine"):
-                if has_num:
-                    if unit_compact in {"", "mg/dl", "mg/100ml", "mg%"}:
-                        return float(val) >= 1.5
-                    if unit_compact == "mg/l":
-                        return (float(val) / 10.0) >= 1.5
-                    if unit_compact in {"umol/l", "µmol/l", "μmol/l", "mcmol/l", "micromol/l", "mmol/m3"}:
-                        return (float(val) / 88.42) >= 1.5
-                    if unit_compact == "mmol/l":
-                        return ((float(val) * 1000.0) / 88.42) >= 1.5
+                cr_scale: Optional[Callable[[float], float]] = None
+                if unit_compact in {"", "mg/dl", "mg/100ml", "mg%"}:
+                    cr_scale = lambda x: x
+                elif unit_compact == "mg/l":
+                    cr_scale = lambda x: x / 10.0
+                elif unit_compact in {"umol/l", "µmol/l", "μmol/l", "mcmol/l", "micromol/l", "mmol/m3"}:
+                    cr_scale = lambda x: x / 88.42
+                elif unit_compact == "mmol/l":
+                    cr_scale = lambda x: (x * 1000.0) / 88.42
+                if cr_scale is not None:
+                    res = _eval_high(1.5, cr_scale)
+                    if res is not None:
+                        return res
                 return is_abn and is_high
             if _contains_clinical_term(t_low, "potassium"):
-                if has_num and unit_compact in {"", "meq/l", "mmol/l", "meq/liter", "mmol/liter"}:
-                    return float(val) >= 5.0 or float(val) <= 3.4
+                if unit_compact in {"", "meq/l", "mmol/l", "meq/liter", "mmol/liter"}:
+                    if has_num:
+                        return float(val) >= 5.0 or float(val) <= 3.4
+                    if cmp_num is not None:
+                        if cmp_op in {">", ">="} and cmp_num >= 5.0:
+                            return True
+                        if cmp_op in {"<", "<="} and cmp_num <= 3.4:
+                            return True
                 return is_abn and (is_high or is_low or not interp)
             if _contains_clinical_term(t_low, "inr"):
-                if has_num and unit_compact in {"", "{inr}", "inr", "ratio", "1", "none"}:
-                    return float(val) >= 3.5
+                if unit_compact in {"", "{inr}", "inr", "ratio", "1", "none"}:
+                    res = _eval_high(3.5, lambda x: x)
+                    if res is not None:
+                        return res
                 return is_abn and is_high
             if _contains_clinical_term(t_low, "hemoglobin") and not (
                 _contains_clinical_term(t_low, "a1c") or _contains_clinical_term(t_low, "hba1c")
             ):
-                if has_num:
-                    if unit_compact in {"", "g/dl", "gm/dl", "g/100ml", "g%"}:
-                        return float(val) < 11.5
-                    if unit_compact in {"g/l", "gm/l", "mg/ml"}:
-                        return (float(val) / 10.0) < 11.5
-                    if unit_compact == "mmol/l":
-                        return (float(val) * 1.6114) < 11.5
+                hb_scale: Optional[Callable[[float], float]] = None
+                if unit_compact in {"", "g/dl", "gm/dl", "g/100ml", "g%"}:
+                    hb_scale = lambda x: x
+                elif unit_compact in {"g/l", "gm/l", "mg/ml"}:
+                    hb_scale = lambda x: x / 10.0
+                elif unit_compact == "mmol/l":
+                    hb_scale = lambda x: x * 1.6114
+                if hb_scale is not None:
+                    res = _eval_low(11.5, hb_scale)
+                    if res is not None:
+                        return res
                 return is_abn and is_low
             if _contains_clinical_term(t_low, "glucose"):
-                if has_num:
-                    if unit_compact in {"", "mg/dl", "mg/100ml", "mg%"}:
-                        return float(val) < 70
-                    if unit_compact == "mmol/l":
-                        return float(val) < 3.9
+                if unit_compact in {"", "mg/dl", "mg/100ml", "mg%"}:
+                    res = _eval_low(70.0, lambda x: x)
+                    if res is not None:
+                        return res
+                elif unit_compact == "mmol/l":
+                    res = _eval_low(3.9, lambda x: x)
+                    if res is not None:
+                        return res
                 return is_abn and is_low
             return is_abn
 
@@ -1222,14 +1346,7 @@ class ClinicalEntityGraph:
                 if n_low and any(rc in n_low for rc in resume_cues):
                     for r_sent in re.split(r"(?<=[.!?;])\s+|\n+", note_body):
                         rs_low = r_sent.lower()
-                        if (
-                            any(rc in rs_low for rc in resume_cues)
-                            and not re.search(
-                                r"\b(?:do\s+not|don't|never|avoid|cannot)\s+(?:continue|resume|restart)\b",
-                                rs_low,
-                            )
-                            and (probes & set(re.findall(r"[a-z][a-z0-9-]{3,}", rs_low)))
-                        ):
+                        if _clause_has_affirmative_directive(rs_low, probes, resume_cues, _NEGATED_RESUME_RE):
                             if n_date > latest_resume_date:
                                 latest_resume_date = n_date
                             break
@@ -1249,8 +1366,7 @@ class ClinicalEntityGraph:
                         s_low,
                         maxsplit=1,
                     )[0]
-                    directive_toks = set(re.findall(r"[a-z][a-z0-9-]{3,}", directive_clause))
-                    if probes & directive_toks:
+                    if _clause_has_affirmative_directive(directive_clause, probes, hold_cues, _NEGATED_HOLD_RE):
                         snippet = sent.strip()
                         if len(snippet) > 160:
                             snippet = snippet[:157].rstrip() + "..."
@@ -1298,8 +1414,7 @@ class ClinicalEntityGraph:
                 matched_note = False
                 for sent in re.split(r"(?<=[.!?;])\s+|\n+", raw_note):
                     s_low = sent.lower()
-                    s_toks = set(re.findall(r"[a-z][a-z0-9-]{3,}", s_low))
-                    if (probes & s_toks) and any(cue in s_low for cue in resume_cues):
+                    if _clause_has_affirmative_directive(s_low, probes, resume_cues, _NEGATED_RESUME_RE):
                         snippet = sent.strip()
                         if len(snippet) > 160:
                             snippet = snippet[:157].rstrip() + "..."
