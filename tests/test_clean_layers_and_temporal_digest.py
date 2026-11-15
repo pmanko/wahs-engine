@@ -1509,3 +1509,136 @@ async def test_note_rag_and_digest_respect_tight_context_window_without_422() ->
             assert resp_rag.status_code == 200
             sent_tokens = count_chat_messages_tokens(captured[-1]["messages"], tokenizer_family="gemma4")
             assert sent_tokens + 512 <= tight_window
+
+
+def test_graph_trajectory_indeterminate_boundary_is_uuid_invariant() -> None:
+    """PRRT_kwDOVrPAic63lAd8: ambiguous same-day or mixed-tz graph trajectory boundaries must stay indeterminate."""
+    from wahs_core import ClinicalEntityGraph, extract_bundle
+
+    # 1. Same-day date-only eGFR (28 vs 72 on 2026-10-15) with swapped UUIDs + active Metformin
+    def _same_day_egfr_bundle(id_low: str, id_norm: str) -> Dict[str, Any]:
+        return {
+            "resourceType": "Bundle",
+            "type": "collection",
+            "entry": [
+                {"resource": {"resourceType": "Patient", "id": "pat-egfr-ambig", "birthDate": "1958-04-12"}},
+                {
+                    "resource": {
+                        "resourceType": "MedicationRequest",
+                        "id": "med-met-ambig",
+                        "status": "active",
+                        "authoredOn": "2026-01-01",
+                        "medicationCodeableConcept": {"text": "Metformin 500 MG Oral Tablet"},
+                    }
+                },
+                {
+                    "resource": {
+                        "resourceType": "Observation",
+                        "id": id_low,
+                        "status": "final",
+                        "category": [{"coding": [{"code": "laboratory"}]}],
+                        "code": {"coding": [{"code": "33914-3", "display": "eGFR"}]},
+                        "effectiveDateTime": "2026-10-15",
+                        "valueQuantity": {"value": 28, "unit": "mL/min/1.73m2"},
+                        "interpretation": [{"coding": [{"code": "L"}]}],
+                    }
+                },
+                {
+                    "resource": {
+                        "resourceType": "Observation",
+                        "id": id_norm,
+                        "status": "final",
+                        "category": [{"coding": [{"code": "laboratory"}]}],
+                        "code": {"coding": [{"code": "33914-3", "display": "eGFR"}]},
+                        "effectiveDateTime": "2026-10-15",
+                        "valueQuantity": {"value": 72, "unit": "mL/min/1.73m2"},
+                    }
+                },
+            ],
+        }
+
+    g1 = ClinicalEntityGraph.from_extracted_chart(extract_bundle(_same_day_egfr_bundle("obs-aaa", "obs-zzz")))
+    g2 = ClinicalEntityGraph.from_extracted_chart(extract_bundle(_same_day_egfr_bundle("obs-zzz", "obs-aaa")))
+    for g in (g1, g2):
+        egfr_node = next(n for n in g.nodes.values() if n.category == "Observation" and "egfr" in n.label.lower())
+        assert egfr_node.metadata.get("latest_value") is None
+        assert egfr_node.metadata.get("latest_indeterminate") is True
+        assert not any(e.edge_type == "CONTRAINDICATED_OR_DOSE_ADJUST_IN" for e in g.edges)
+    assert g1.to_dict() == g2.to_dict()
+
+    # 2. Same-day mixed aware (2026-10-15T10:00:00Z) + naive (2026-10-15T09:00:00) Creatinine
+    def _mixed_tz_cr_bundle(id_a: str, id_b: str) -> Dict[str, Any]:
+        return {
+            "resourceType": "Bundle",
+            "type": "collection",
+            "entry": [
+                {"resource": {"resourceType": "Patient", "id": "pat-cr-mix", "birthDate": "1958-04-12"}},
+                {
+                    "resource": {
+                        "resourceType": "Observation",
+                        "id": id_a,
+                        "status": "final",
+                        "category": [{"coding": [{"code": "laboratory"}]}],
+                        "code": {"coding": [{"code": "2160-0", "display": "Creatinine"}]},
+                        "effectiveDateTime": "2026-10-15T10:00:00Z",
+                        "valueQuantity": {"value": 1.9, "unit": "mg/dL"},
+                        "interpretation": [{"coding": [{"code": "H"}]}],
+                    }
+                },
+                {
+                    "resource": {
+                        "resourceType": "Observation",
+                        "id": id_b,
+                        "status": "final",
+                        "category": [{"coding": [{"code": "laboratory"}]}],
+                        "code": {"coding": [{"code": "2160-0", "display": "Creatinine"}]},
+                        "effectiveDateTime": "2026-10-15T09:00:00",
+                        "valueQuantity": {"value": 0.9, "unit": "mg/dL"},
+                    }
+                },
+            ],
+        }
+
+    gm1 = ClinicalEntityGraph.from_extracted_chart(extract_bundle(_mixed_tz_cr_bundle("obs-aaa", "obs-zzz")))
+    gm2 = ClinicalEntityGraph.from_extracted_chart(extract_bundle(_mixed_tz_cr_bundle("obs-zzz", "obs-aaa")))
+    for gm in (gm1, gm2):
+        cr_node = next(n for n in gm.nodes.values() if n.category == "Observation" and "creatinine" in n.label.lower())
+        assert cr_node.metadata.get("latest_value") is None
+        assert cr_node.metadata.get("latest_indeterminate") is True
+    assert gm1.to_dict() == gm2.to_dict()
+
+    # 3. Multi-year separated date-only (2024-01-10) + aware (2026-10-15T10:00:00Z) resolves unambiguously
+    separated_bundle = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "pat-cr-sep", "birthDate": "1958-04-12"}},
+            {
+                "resource": {
+                    "resourceType": "Observation",
+                    "id": "obs-cr-old",
+                    "status": "final",
+                    "category": [{"coding": [{"code": "laboratory"}]}],
+                    "code": {"coding": [{"code": "2160-0", "display": "Creatinine"}]},
+                    "effectiveDateTime": "2024-01-10",
+                    "valueQuantity": {"value": 0.9, "unit": "mg/dL"},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Observation",
+                    "id": "obs-cr-new",
+                    "status": "final",
+                    "category": [{"coding": [{"code": "laboratory"}]}],
+                    "code": {"coding": [{"code": "2160-0", "display": "Creatinine"}]},
+                    "effectiveDateTime": "2026-10-15T10:00:00Z",
+                    "valueQuantity": {"value": 1.9, "unit": "mg/dL"},
+                    "interpretation": [{"coding": [{"code": "H"}]}],
+                }
+            },
+        ],
+    }
+    g_sep = ClinicalEntityGraph.from_extracted_chart(extract_bundle(separated_bundle))
+    cr_sep = next(n for n in g_sep.nodes.values() if n.category == "Observation" and "creatinine" in n.label.lower())
+    assert cr_sep.metadata.get("latest_value") == 1.9
+    assert cr_sep.metadata.get("latest_indeterminate") is None

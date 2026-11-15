@@ -17,7 +17,7 @@ Strict Layer Boundaries:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 import re
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
@@ -1030,44 +1030,120 @@ class ClinicalEntityGraph:
             key = f"{pt.code or ''}:{pt.concept}".strip(":")
             series_by_key.setdefault(key, []).append(pt)
 
-        for code_key, points in series_by_key.items():
+        def _day_of_pt(pt: NumericPoint) -> str:
+            return (pt.date or "")[:10]
+
+        def _utc_day_bounds(pt: NumericPoint) -> Tuple[str, str]:
+            ts = pt.timestamp or ""
+            if ts.startswith("Z:") and len(ts) >= 12:
+                zd = ts[2:12]
+                return zd, zd
+            d = _day_of_pt(pt)
+            if re.match(r"^\d{4}-\d{2}-\d{2}$", d):
+                try:
+                    d_obj = date.fromisoformat(d)
+                    return (
+                        (d_obj - timedelta(days=1)).isoformat(),
+                        (d_obj + timedelta(days=1)).isoformat(),
+                    )
+                except ValueError:
+                    pass
+            return "0000-00-00", "9999-99-99"
+
+        def _resolve_latest_trajectory_group(
+            points: Sequence[NumericPoint],
+        ) -> Tuple[bool, List[NumericPoint], str]:
             all_utc = bool(points) and all((p.timestamp or "").startswith("Z:") for p in points)
             all_naive = bool(points) and all((p.timestamp or "").startswith("N:") for p in points)
             if all_utc or all_naive:
-                points_sorted = sorted(
-                    points,
-                    key=lambda p: (p.timestamp or "", (p.date or "")[:10], p.resource_uuid or ""),
+                max_ts = max(p.timestamp for p in points)
+                group = [p for p in points if p.timestamp == max_ts]
+                d_str = (
+                    group[0].timestamp[2:12]
+                    if group[0].timestamp.startswith("Z:")
+                    else (_day_of_pt(group[0]) or "")
                 )
-            else:
-                points_sorted = sorted(
-                    points,
-                    key=lambda p: ((p.date or "")[:10], p.timestamp or "", p.resource_uuid or ""),
-                )
-            latest = points_sorted[-1]
-            abn_tag = f" [{latest.interpretation}]" if latest.interpretation and latest.is_abnormal else ""
-            date_tag = f" on {latest.date[:10]}" if latest.date else " (date unknown)"
-            val_summary = f"latest {latest.value:g} {latest.unit}{abn_tag}{date_tag}".strip()
+                return len({p.value for p in group}) == 1, group, d_str
+
+            if not any((p.timestamp or "").startswith("Z:") for p in points):
+                max_day = max(_day_of_pt(p) for p in points)
+                day_pts = [p for p in points if _day_of_pt(p) == max_day]
+                if day_pts and all((p.timestamp or "").startswith("N:") for p in day_pts):
+                    max_n = max(p.timestamp for p in day_pts)
+                    group = [p for p in day_pts if p.timestamp == max_n]
+                else:
+                    group = day_pts
+                return len({p.value for p in group}) == 1, group, max_day
+
+            bounds = [_utc_day_bounds(p) for p in points]
+            max_lo = max(lo for lo, _ in bounds)
+            contenders = [p for p, (_, hi) in zip(points, bounds) if hi >= max_lo]
+            if contenders and all((p.timestamp or "").startswith("Z:") for p in contenders):
+                max_ts = max(p.timestamp for p in contenders)
+                group = [p for p in contenders if p.timestamp == max_ts]
+                return len({p.value for p in group}) == 1, group, group[0].timestamp[2:12]
+            group = contenders or list(points)
+            d_str = max(_day_of_pt(p) for p in group)
+            return len({p.value for p in group}) == 1, group, d_str
+
+        for code_key, points in series_by_key.items():
+            ok, group, d_str = _resolve_latest_trajectory_group(points)
+            min_v = min(p.value for p in points)
+            max_v = max(p.value for p in points)
+            unit = sorted({p.unit for p in group if p.unit} or {p.unit for p in points if p.unit} or {""})[0]
             obs_id = f"obs:{_slugify(code_key)}"
+            cit_idx = min(
+                (cit_map[p.resource_uuid] for p in group if p.resource_uuid and p.resource_uuid in cit_map),
+                default=None,
+            )
+            if ok:
+                val = group[0].value
+                label = sorted({p.concept for p in group if p.concept} or {p.concept for p in points if p.concept} or {code_key})[0]
+                code = sorted({p.code for p in group if p.code} or {p.code for p in points if p.code} or {""})[0]
+                is_abn = any(p.is_abnormal for p in group)
+                interps = sorted({str(p.interpretation).strip() for p in group if p.is_abnormal and p.interpretation})
+                interp = interps[0] if len(interps) == 1 else ("ABNORMAL" if is_abn and interps else "")
+                r_uuid = group[0].resource_uuid if len(group) == 1 else ""
+                abn_tag = f" [{interp}]" if interp and is_abn else ""
+                date_tag = f" on {d_str[:10]}" if d_str else " (date unknown)"
+                val_summary = f"latest {val:g} {unit}{abn_tag}{date_tag}".strip()
+                obs_meta: Dict[str, Any] = {
+                    "latest_value": val,
+                    "unit": unit,
+                    "count": len(points),
+                    "is_abnormal": is_abn,
+                    "interpretation": interp or None,
+                    "min_value": min_v,
+                    "max_value": max_v,
+                }
+            else:
+                label = sorted({p.concept for p in points if p.concept} or {code_key})[0]
+                code = sorted({p.code for p in points if p.code} or {""})[0]
+                r_uuid = ""
+                date_tag = f" on {d_str[:10]}" if d_str else ""
+                val_summary = f"range {min_v:g}-{max_v:g} {unit} (latest indeterminate{date_tag})".strip()
+                obs_meta = {
+                    "latest_value": None,
+                    "latest_indeterminate": True,
+                    "unit": unit,
+                    "count": len(points),
+                    "is_abnormal": False,
+                    "interpretation": "",
+                    "min_value": min_v,
+                    "max_value": max_v,
+                }
             graph.add_node(
                 ClinicalNode(
                     node_id=obs_id,
                     category="Observation",
-                    label=latest.concept or code_key,
-                    code=latest.code,
-                    citation_idx=cit_map.get(latest.resource_uuid),
-                    resource_uuid=latest.resource_uuid,
-                    date_str=latest.date,
+                    label=label,
+                    code=code,
+                    citation_idx=cit_idx,
+                    resource_uuid=r_uuid,
+                    date_str=d_str,
                     status="final",
                     value_summary=val_summary,
-                    metadata={
-                        "latest_value": latest.value,
-                        "unit": latest.unit,
-                        "count": len(points_sorted),
-                        "is_abnormal": latest.is_abnormal,
-                        "interpretation": latest.interpretation,
-                        "min_value": min(p.value for p in points_sorted),
-                        "max_value": max(p.value for p in points_sorted),
-                    },
+                    metadata=obs_meta,
                 )
             )
 
