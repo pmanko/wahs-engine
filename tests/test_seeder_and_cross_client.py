@@ -699,7 +699,10 @@ async def test_bundle_star_graph_partitioning_batching_and_keycloak_sync(tmp_pat
                             "resourceType": "Provenance",
                             "id": "prov-1",
                             "recorded": "2026-01-01T00:00:00Z",
-                            "target": [{"reference": "urn:uuid:obs-1"}],
+                            "target": [
+                                {"reference": "urn:uuid:pat-elena"},
+                                {"reference": "urn:uuid:obs-1"},
+                            ],
                         },
                     },
                     {
@@ -720,7 +723,8 @@ async def test_bundle_star_graph_partitioning_batching_and_keycloak_sync(tmp_pat
     assert len(plan["shared_resources"]) == 2  # Organization + Provenance
     prov = next(r for r in plan["shared_resources"] if r["resourceType"] == "Provenance")
     assert "subject" not in prov and "patient" not in prov
-    assert prov["target"][0]["reference"].startswith("Observation/w-elena-")
+    assert prov["target"][0]["reference"] == "Patient/w-elena-ds-1"
+    assert prov["target"][1]["reference"].startswith("Observation/w-elena-")
 
     assert [ds["source_name"] for ds in plan["datasets"]] == [
         "UW Medicine Heart Institute",

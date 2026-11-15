@@ -1100,17 +1100,24 @@ def build_bundle_star_graph_datasets(
             src_name = _infer_resource_source_name(orig_res, enc_source_map, primary_source)
             grouped_raw.setdefault(src_name, []).append(orig_res)
 
-    shared_entries: List[Dict[str, Any]] = []
-    for raw_res in shared_raw:
-        rewritten = _rewrite_references(raw_res, global_ref_map, strip_conditional_refs=True)
-        shared_entries.append(rewritten)
-
-    datasets: List[Dict[str, Any]] = []
     # Keep primary_source first, then largest clinical sources
     ordered_sources = sorted(
         grouped_raw.items(),
         key=lambda kv: (0 if kv[0] == primary_source else 1, -len(kv[1]), kv[0]),
     )
+    primary_ds_pat_ref = (
+        f"Patient/w-{slug[:10]}-ds-1" if ordered_sources else f"Patient/wahs-master-{slug}"
+    )
+    shared_ref_map = dict(global_ref_map)
+    for pref in orig_patient_refs:
+        shared_ref_map[pref] = primary_ds_pat_ref
+
+    shared_entries: List[Dict[str, Any]] = []
+    for raw_res in shared_raw:
+        rewritten = _rewrite_references(raw_res, shared_ref_map, strip_conditional_refs=True)
+        shared_entries.append(rewritten)
+
+    datasets: List[Dict[str, Any]] = []
     for src_idx, (src_name, res_list) in enumerate(ordered_sources, start=1):
         ds_pat_id = f"w-{slug[:10]}-ds-{src_idx}"
         ds_pat_ref = f"Patient/{ds_pat_id}"
@@ -1238,14 +1245,18 @@ async def seed_bundle_account_to_hapi(
         total_seeded = 0
 
         if plan["shared_resources"]:
-            total_seeded += await _post_put_batches(
-                client,
-                base,
-                headers,
-                plan["shared_resources"],
-                keycloak_sub=sub,
-                batch_size=batch_size,
-            )
+            non_prov_shared = [
+                r for r in plan["shared_resources"] if r.get("resourceType") != "Provenance"
+            ]
+            if non_prov_shared:
+                total_seeded += await _post_put_batches(
+                    client,
+                    base,
+                    headers,
+                    non_prov_shared,
+                    keycloak_sub=sub,
+                    batch_size=batch_size,
+                )
 
         dataset_refs: List[str] = []
         for ds in plan["datasets"]:
@@ -1279,6 +1290,19 @@ async def seed_bundle_account_to_hapi(
             )
             total_seeded += max(0, seeded_here - 1)
             dataset_refs.append(f"Patient/{ds_pat_id}")
+
+        prov_shared = [
+            r for r in (plan["shared_resources"] or []) if r.get("resourceType") == "Provenance"
+        ]
+        if prov_shared:
+            total_seeded += await _post_put_batches(
+                client,
+                base,
+                headers,
+                prov_shared,
+                keycloak_sub=sub,
+                batch_size=batch_size,
+            )
 
         master_id = (
             str(existing_master.get("id") or "")
