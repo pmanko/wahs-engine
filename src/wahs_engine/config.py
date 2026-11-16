@@ -2,10 +2,115 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 import os
+import re
 from typing import Any, Dict, Optional, Tuple
+
+
+_BUDGET_SUFFIX_RE = re.compile(r"^(?P<base>.+?)@(?P<num>\d+)(?P<k>[kK])?$")
+
+_HARNESS_ARM_PREFIXES: Tuple[Tuple[str, str], ...] = (
+    ("wahs-engine-rag:", "note_rag"),
+    ("wahs-engine-kb:", "condensation_kb"),
+    ("wahs-engine-tools:", "dynamic_fhir_tools"),
+    ("wahs-engine-chart:", "chart_only"),
+    ("wahs-engine:", "condensation_kb"),
+)
+
+_COMPACT_PROFILE_SUFFIXES: Tuple[Tuple[str, str, str], ...] = (
+    ("-note-rag", "note_rag", "-kb"),
+    ("-rag", "note_rag", "-kb"),
+    ("-tools", "dynamic_fhir_tools", "-kb"),
+    ("-chart", "chart_only", "-kb"),
+    ("-raw", "chart_only", "-kb"),
+    ("-kb", "condensation_kb", "-kb"),
+)
+
+_CROSS_PROVIDER_STEM_TO_PROFILE_KEY: Dict[str, str] = {
+    "gemma-26b": "wahs-26b-kb",
+    "gemma4:26b": "wahs-26b-kb",
+    "ollama/gemma4:26b": "wahs-26b-kb",
+    "gemma-4-12b": "wahs-12b-kb",
+    "gemma-4-12b-q4": "wahs-12b-kb",
+    "gemma4:12b": "wahs-12b-kb",
+    "ollama/gemma4:12b": "wahs-12b-kb",
+    "gemma-e4b": "wahs-e4b-kb",
+    "gemma-4-e4b": "wahs-e4b-kb",
+    "gemma-e4b-q8": "wahs-e4b-kb",
+    "gemma4:e4b": "wahs-e4b-kb",
+    "ollama/gemma4:e4b": "wahs-e4b-kb",
+    "qwen3-14b": "wahs-qwen3-14b-kb",
+    "qwen3:14b": "wahs-qwen3-14b-kb",
+    "ollama/qwen3:14b": "wahs-qwen3-14b-kb",
+    "qwen3.5-9b": "wahs-qwen3-8b-kb",
+    "qwen3-8b": "wahs-qwen3-8b-kb",
+    "qwen3:8b": "wahs-qwen3-8b-kb",
+    "ollama/qwen3:8b": "wahs-qwen3-8b-kb",
+}
+
+
+@dataclass(frozen=True)
+class ParsedProfileSpec:
+    """Normalized strategy, model lookup key, and optional `@<budget>` extracted from a model ID."""
+
+    raw_model: str
+    clean_model: str
+    lookup_key: str
+    inferred_strategy: Optional[str] = None
+    explicit_budget_tokens: Optional[int] = None
+    had_arm_prefix: bool = False
+
+
+def parse_wahs_profile_spec(requested_model: Optional[str]) -> ParsedProfileSpec:
+    """Parse harness eval arm IDs (`wahs-engine-rag:<m>@16k`) or compact UI profiles (`wahs-26b-rag@32k`)."""
+    raw = str(requested_model or "").strip()
+    clean = raw
+    explicit_budget: Optional[int] = None
+
+    m_budget = _BUDGET_SUFFIX_RE.match(raw)
+    if m_budget:
+        clean = m_budget.group("base").strip()
+        num_val = int(m_budget.group("num"))
+        if m_budget.group("k"):
+            num_val *= 1024
+        explicit_budget = max(512, num_val)
+
+    low_clean = clean.lower()
+    for pfx, strat in _HARNESS_ARM_PREFIXES:
+        if low_clean.startswith(pfx):
+            rest = clean[len(pfx) :].strip()
+            return ParsedProfileSpec(
+                raw_model=raw,
+                clean_model=clean,
+                lookup_key=rest or clean,
+                inferred_strategy=strat,
+                explicit_budget_tokens=explicit_budget,
+                had_arm_prefix=True,
+            )
+
+    if low_clean.startswith("wahs-") and not low_clean.startswith("wahs-engine"):
+        for sfx, strat, target_sfx in _COMPACT_PROFILE_SUFFIXES:
+            if low_clean.endswith(sfx) and len(clean) > len(sfx):
+                stem = clean[: len(clean) - len(sfx)]
+                return ParsedProfileSpec(
+                    raw_model=raw,
+                    clean_model=clean,
+                    lookup_key=f"{stem}{target_sfx}",
+                    inferred_strategy=strat,
+                    explicit_budget_tokens=explicit_budget,
+                    had_arm_prefix=False,
+                )
+
+    return ParsedProfileSpec(
+        raw_model=raw,
+        clean_model=clean,
+        lookup_key=clean,
+        inferred_strategy=None,
+        explicit_budget_tokens=explicit_budget,
+        had_arm_prefix=False,
+    )
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -51,9 +156,18 @@ class WahsEngineSettings:
     llm_api_key: str = ""
     default_model: str = "gemma4:12b"
     available_models: Tuple[str, ...] = (
+        "wahs-26b-rag",
+        "wahs-12b-rag",
+        "wahs-e4b-rag",
         "wahs-12b-kb",
         "wahs-e4b-kb",
         "wahs-26b-kb",
+        "wahs-26b-tools",
+        "wahs-12b-tools",
+        "wahs-e4b-tools",
+        "wahs-26b-chart",
+        "wahs-12b-chart",
+        "wahs-e4b-chart",
         "gemma4:12b",
         "gemma4:e4b",
     )
@@ -88,24 +202,53 @@ class WahsEngineSettings:
 
     def resolve_upstream_model(self, requested_model: Optional[str]) -> str:
         model = (requested_model or self.default_model).strip() or self.default_model
-        return self.model_map.get(model, model)
+        parsed = parse_wahs_profile_spec(model)
+        for key in (model, parsed.clean_model, parsed.lookup_key):
+            if key and key in self.model_map:
+                return self.model_map[key]
+        cross_key = _CROSS_PROVIDER_STEM_TO_PROFILE_KEY.get(parsed.lookup_key.lower())
+        if cross_key and cross_key in self.model_map:
+            return self.model_map[cross_key]
+        if parsed.had_arm_prefix and parsed.lookup_key:
+            return parsed.lookup_key
+        return parsed.clean_model or model
 
     def resolve_model_spec(self, requested_model: Optional[str]) -> ModelSpec:
         model = (requested_model or self.default_model).strip() or self.default_model
-        if model in self.model_specs:
-            return self.model_specs[model]
+        parsed = parse_wahs_profile_spec(model)
         upstream = self.resolve_upstream_model(model)
-        if upstream in self.model_specs:
-            return self.model_specs[upstream]
-        return ModelSpec(
-            upstream_model=upstream,
-            context_window=self.default_context_window,
-            chart_budget_ceiling=self.default_chart_budget_ceiling,
-            default_max_output_tokens=1024,
-            tokenizer_family=_infer_tokenizer_family(model, upstream),
-            provider_flavor=_infer_provider_flavor(upstream, self.default_provider_flavor),
-            disable_thinking=True,
-        )
+
+        base_spec: Optional[ModelSpec] = None
+        for key in (model, parsed.clean_model, parsed.lookup_key, upstream):
+            if key and key in self.model_specs:
+                base_spec = self.model_specs[key]
+                break
+
+        if base_spec is None:
+            base_spec = ModelSpec(
+                upstream_model=upstream,
+                context_window=self.default_context_window,
+                chart_budget_ceiling=self.default_chart_budget_ceiling,
+                default_max_output_tokens=1024,
+                tokenizer_family=_infer_tokenizer_family(parsed.lookup_key or model, upstream),
+                provider_flavor=_infer_provider_flavor(upstream, self.default_provider_flavor),
+                disable_thinking=True,
+            )
+
+        if parsed.explicit_budget_tokens is not None:
+            req_b = int(parsed.explicit_budget_tokens)
+            eff_ctx = max(int(base_spec.context_window), req_b * 2)
+            eff_ceiling = (
+                max(int(base_spec.chart_budget_ceiling), req_b)
+                if base_spec.chart_budget_ceiling is not None
+                else None
+            )
+            return replace(
+                base_spec,
+                context_window=eff_ctx,
+                chart_budget_ceiling=eff_ceiling,
+            )
+        return base_spec
 
     @property
     def upstream_chat_completions_url(self) -> str:
@@ -149,9 +292,18 @@ class WahsEngineSettings:
             avail = tuple(m.strip() for m in raw_models.split(",") if m.strip())
         else:
             avail = (
+                "wahs-26b-rag",
+                "wahs-12b-rag",
+                "wahs-e4b-rag",
                 "wahs-12b-kb",
                 "wahs-e4b-kb",
                 "wahs-26b-kb",
+                "wahs-26b-tools",
+                "wahs-12b-tools",
+                "wahs-e4b-tools",
+                "wahs-26b-chart",
+                "wahs-12b-chart",
+                "wahs-e4b-chart",
                 default_model,
             )
             avail = tuple(dict.fromkeys(avail))
@@ -171,7 +323,13 @@ class WahsEngineSettings:
             default_ceil = None
         else:
             default_ceil = int(raw_ceil)
-        default_flavor = (os.environ.get("WAHS_PROVIDER_FLAVOR") or "litellm").strip().lower() or "litellm"
+        raw_flavor = (os.environ.get("WAHS_PROVIDER_FLAVOR") or "").strip().lower()
+        if raw_flavor:
+            default_flavor = raw_flavor
+        elif ":8077" in llm_url:
+            default_flavor = "llamacpp"
+        else:
+            default_flavor = "litellm"
 
         raw_specs = os.environ.get("WAHS_MODEL_SPECS_JSON", "").strip()
         parsed_specs: Dict[str, ModelSpec] = {}

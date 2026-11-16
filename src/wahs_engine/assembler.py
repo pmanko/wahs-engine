@@ -567,6 +567,10 @@ class WAHSBundleAssembler:
         self._prefix_cache: _BoundedLRUCache[Tuple[str, str, str], AssembledWahsContext] = (
             _BoundedLRUCache(settings.prefix_cache_max_entries, ttl_seconds=settings.cache_ttl_seconds)
         )
+        self._inflight_datasets: Dict[
+            Tuple[str, str, str],
+            asyncio.Task[Tuple[List[Dict[str, Any]], bool, Optional[str]]],
+        ] = {}
 
     def _validate_overlay_budget(self, overlay_resources: Sequence[Mapping[str, Any]]) -> None:
         if not overlay_resources:
@@ -887,6 +891,28 @@ class WAHSBundleAssembler:
             allowed_refs: Set[str] = {master_id, *(d.dataset_id for d in deduped_descriptors)}
             fetch_sem = asyncio.Semaphore(max(1, int(self.settings.everything_concurrency)))
 
+            async def _run_dataset_fetch(
+                desc: DatasetDescriptor,
+                ds_cache_key: Tuple[str, str, str],
+            ) -> Tuple[List[Dict[str, Any]], bool, Optional[str]]:
+                try:
+                    async with fetch_sem:
+                        raw_ds_resources, is_partial, partial_reason = (
+                            await self._fetch_paginated_everything(
+                                client, base, desc.dataset_id, identity.raw_token
+                            )
+                        )
+                    ds_resources = [
+                        _stamp_resource_source_tag(r, desc)
+                        for r in raw_ds_resources
+                        if not (r.get("resourceType") == "Patient" and r.get("id") in allowed_refs)
+                    ]
+                    if not is_partial and desc.has_version_stamp:
+                        self._dataset_cache.put(ds_cache_key, ds_resources)
+                    return ds_resources, is_partial, partial_reason
+                finally:
+                    self._inflight_datasets.pop(ds_cache_key, None)
+
             async def _fetch_dataset(
                 desc: DatasetDescriptor,
             ) -> Tuple[DatasetDescriptor, List[Dict[str, Any]], bool, Optional[str], int, int]:
@@ -895,6 +921,16 @@ class WAHSBundleAssembler:
                     cached_resources = self._dataset_cache.get(ds_cache_key)
                     if cached_resources is not None:
                         return desc, cached_resources, False, None, 1, 0
+
+                    existing_task = self._inflight_datasets.get(ds_cache_key)
+                    if existing_task is not None:
+                        ds_resources, is_partial, partial_reason = await asyncio.shield(existing_task)
+                        return desc, ds_resources, is_partial, partial_reason, 1, 0
+
+                    task = asyncio.create_task(_run_dataset_fetch(desc, ds_cache_key))
+                    self._inflight_datasets[ds_cache_key] = task
+                    ds_resources, is_partial, partial_reason = await asyncio.shield(task)
+                    return desc, ds_resources, is_partial, partial_reason, 0, 1
 
                 async with fetch_sem:
                     raw_ds_resources, is_partial, partial_reason = await self._fetch_paginated_everything(
@@ -905,8 +941,6 @@ class WAHSBundleAssembler:
                     for r in raw_ds_resources
                     if not (r.get("resourceType") == "Patient" and r.get("id") in allowed_refs)
                 ]
-                if not is_partial and desc.has_version_stamp:
-                    self._dataset_cache.put(ds_cache_key, ds_resources)
                 return desc, ds_resources, is_partial, partial_reason, 0, 1
 
             ds_results = await asyncio.gather(*(_fetch_dataset(desc) for desc in included_descriptors))

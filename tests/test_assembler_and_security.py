@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -464,3 +465,44 @@ async def test_chart_scope_ips_bundle_and_overlay_cap() -> None:
                 identity=alice_id,
             )
         assert exc_413.value.status_code == 413
+
+
+@pytest.mark.asyncio
+async def test_concurrent_cold_assemble_coalesces_inflight_everything_fetches() -> None:
+    """Two concurrent cold requests (e.g. sign-in pre-warm + first chat turn) share one $everything fetch per dataset."""
+    mock_server = MockFhirAuthServer()
+    base_transport = httpx.MockTransport(mock_server.handler)
+
+    class SlowEverythingTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            if "$everything" in request.url.path:
+                await asyncio.sleep(0.05)
+            return await base_transport.handle_async_request(request)
+
+    async with httpx.AsyncClient(transport=SlowEverythingTransport()) as client:
+        settings = WahsEngineSettings(
+            fhir_auth_base_url="http://fhir-auth:8080/fhir",
+            jwt_hs256_secret=TEST_SECRET,
+        )
+        assembler = WAHSBundleAssembler(settings, http_client=client)
+        alice_id = decode_and_bind_jwt(mock_server.valid_tokens["user-alice"], hs256_secret=TEST_SECRET)
+
+        ctx_preview, ctx_chat = await asyncio.gather(
+            assembler.assemble(options=WahsRequestOptions(), identity=alice_id, requested_model="wahs-26b-kb"),
+            assembler.assemble(
+                options=WahsRequestOptions(target_budget_tokens=4096),
+                identity=alice_id,
+                requested_model="wahs-26b-rag",
+            ),
+        )
+
+        everything_calls = [line for line in mock_server.request_log if "$everything" in line]
+        assert len(everything_calls) == 2
+        assert len([line for line in everything_calls if "ds-uw-new" in line]) == 1
+        assert len([line for line in everything_calls if "ds-story" in line]) == 1
+        assert ctx_preview.cache_hit is False
+        assert ctx_chat.cache_hit is False
+        assert (ctx_preview.dataset_fetches, ctx_preview.dataset_cache_hits) == (2, 0)
+        assert (ctx_chat.dataset_fetches, ctx_chat.dataset_cache_hits) == (0, 2)
+        assert "Lisinopril" in ctx_preview.condensed.chart_text
+        assert "Lisinopril" in ctx_chat.condensed.chart_text
