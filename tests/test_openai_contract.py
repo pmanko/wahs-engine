@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any, AsyncIterator, Dict, List
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 import httpx
 import pytest
@@ -486,31 +486,69 @@ async def test_streaming_yields_incremental_chunks_live_before_upstream_finishes
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(llm_handler)) as llm_client:
         app = create_app(settings, llm_http_client=llm_client)
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://wahs-engine"
-        ) as api:
-            async def _consume() -> None:
-                async with api.stream(
-                    "POST",
-                    "/v1/chat/completions",
-                    json={
-                        "model": "wahs-test",
-                        "stream": True,
-                        "messages": [{"role": "user", "content": "What medicines am I taking right now?"}],
-                        "wahs": {
-                            "fhir_bundle": {"resourceType": "Bundle", "type": "collection", "entry": entries},
-                            "target_budget_tokens": 512,
-                            "enable_overflow_tools": True,
-                        },
-                    },
-                ) as resp:
-                    assert resp.status_code == 200
-                    async for raw_line in resp.aiter_lines():
+        # Exercise the full FastAPI route + StreamingResponse directly because httpx.ASGITransport
+        # buffers all `http.response.body` events until the ASGI task exits.
+        req_bytes = json.dumps(
+            {
+                "model": "wahs-test",
+                "stream": True,
+                "messages": [{"role": "user", "content": "What medicines am I taking right now?"}],
+                "wahs": {
+                    "fhir_bundle": {"resourceType": "Bundle", "type": "collection", "entry": entries},
+                    "target_budget_tokens": 512,
+                    "enable_overflow_tools": True,
+                },
+            }
+        ).encode("utf-8")
+        body_sent = False
+        disconnect_event = asyncio.Event()
+        chunk_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
+
+        async def _receive() -> Dict[str, Any]:
+            nonlocal body_sent
+            if not body_sent:
+                body_sent = True
+                return {"type": "http.request", "body": req_bytes, "more_body": False}
+            await disconnect_event.wait()
+            return {"type": "http.disconnect"}
+
+        async def _send(message: Dict[str, Any]) -> None:
+            if message["type"] == "http.response.start":
+                assert message["status"] == 200
+            elif message["type"] == "http.response.body":
+                if message.get("body"):
+                    await chunk_queue.put(message["body"])
+                if not message.get("more_body", False):
+                    await chunk_queue.put(None)
+                    disconnect_event.set()
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/v1/chat/completions",
+            "raw_path": b"/v1/chat/completions",
+            "query_string": b"",
+            "headers": [(b"content-type", b"application/json")],
+            "client": ("127.0.0.1", 12345),
+            "server": ("wahs-engine", 80),
+        }
+
+        async def _consume() -> None:
+            server_task = asyncio.create_task(app(scope, _receive, _send))
+            try:
+                while True:
+                    chunk = await asyncio.wait_for(chunk_queue.get(), timeout=3.0)
+                    if chunk is None:
+                        break
+                    for raw_line in chunk.decode("utf-8").splitlines():
                         if not raw_line.startswith("data:"):
                             continue
                         payload_str = raw_line[5:].strip()
                         if payload_str == "[DONE]":
-                            break
+                            continue
                         obj = json.loads(payload_str)
                         xws = obj.get("x_wahs_stream") or {}
                         if xws.get("event"):
@@ -520,8 +558,13 @@ async def test_streaming_yields_incremental_chunks_live_before_upstream_finishes
                             seen_contents.append(piece)
                             if "medications" in piece:
                                 release_tail.set()
+                await server_task
+            finally:
+                disconnect_event.set()
+                if not server_task.done():
+                    server_task.cancel()
 
-            await asyncio.wait_for(_consume(), timeout=5.0)
+        await asyncio.wait_for(_consume(), timeout=5.0)
 
     assert release_tail.is_set()
     assert "context_ready" in seen_stream_events
