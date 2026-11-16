@@ -669,3 +669,173 @@ async def test_streaming_late_tool_call_after_multiline_draft_emits_reset_event(
     assert tool_events[0]["reset_content"] is True
     assert tool_events[0]["tools"] == ["search_chart_entries"]
     assert "FINAL_ANSWER" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_eval_arm_and_compact_profile_resolution_all_four_pathways_and_32k_budget() -> None:
+    import base64
+    from wahs_engine.config import parse_wahs_profile_spec
+    from wahs_engine.schemas import OpenAIChatCompletionRequest
+
+    # 1. Pure parsing checks (harness prefixes + compact suffixes + budgets + overrides)
+    p_rag = parse_wahs_profile_spec("wahs-engine-rag:ollama/gemma4:26b@16k")
+    assert (p_rag.inferred_strategy, p_rag.lookup_key, p_rag.explicit_budget_tokens, p_rag.had_arm_prefix) == (
+        "note_rag",
+        "ollama/gemma4:26b",
+        16384,
+        True,
+    )
+    p_compact_32k = parse_wahs_profile_spec("wahs-26b-rag@32k")
+    assert (
+        p_compact_32k.inferred_strategy,
+        p_compact_32k.lookup_key,
+        p_compact_32k.explicit_budget_tokens,
+        p_compact_32k.had_arm_prefix,
+    ) == ("note_rag", "wahs-26b-kb", 32768, False)
+
+    req_override = OpenAIChatCompletionRequest(
+        model="wahs-26b-raw@4k",
+        messages=[{"role": "user", "content": "check notes"}],
+        wahs={"retrieval_strategy": "note_rag", "enable_kb": True},
+    )
+    resolved_ovr = req_override.resolved_wahs_options()
+    assert resolved_ovr.retrieval_strategy == "note_rag"
+    assert resolved_ovr.enable_kb is True
+    assert resolved_ovr.target_budget_tokens == 4096
+
+    # 2. Full ASGI HTTP tests for note_rag (@16k & @32k), tools, and chart_only
+    captured_payloads: List[Dict[str, Any]] = []
+
+    def llm_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"object": "list", "data": []})
+        body = json.loads(request.content.decode("utf-8"))
+        captured_payloads.append(body)
+        return httpx.Response(
+            200,
+            json={
+                "id": "cmpl-arm-1",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "Hold lisinopril due to potassium [1]."},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 500, "completion_tokens": 12},
+            },
+        )
+
+    settings = WahsEngineSettings(
+        allow_local_bundle_mode=True,
+        llm_base_url="http://mock-llm/v1",
+        default_model="wahs-26b-kb",
+        default_context_window=32768,
+        default_chart_budget_ceiling=16384,
+        default_provider_flavor="litellm",
+        model_map={"wahs-26b-kb": "ollama/gemma4:26b"},
+    )
+    entries = [
+        {"resource": {"resourceType": "Patient", "id": "p-arm", "birthDate": "1960-01-01"}},
+        {
+            "resource": {
+                "resourceType": "DocumentReference",
+                "id": "doc-discharge-1",
+                "status": "current",
+                "type": {"text": "BIDMC Discharge Summary"},
+                "subject": {"reference": "Patient/p-arm"},
+                "date": "2026-01-26T15:00:00Z",
+                "description": "BIDMC Discharge Summary",
+                "content": [
+                    {
+                        "attachment": {
+                            "contentType": "text/plain; charset=utf-8",
+                            "data": base64.b64encode(
+                                b"Hold lisinopril immediately due to hyperkalemia potassium 5.6 mmol/L."
+                            ).decode("ascii"),
+                        }
+                    }
+                ],
+            }
+        },
+    ]
+    bundle = {"resourceType": "Bundle", "type": "collection", "entry": entries}
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(llm_handler)) as llm_client:
+        app = create_app(settings, llm_http_client=llm_client)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://wahs-engine"
+        ) as api:
+            r_models = await api.get("/v1/models")
+            mids = [m["id"] for m in r_models.json()["data"]]
+            assert "wahs-26b-rag" in mids
+            assert "wahs-26b-tools" in mids
+            assert "wahs-26b-chart" in mids
+
+            # A. Note-RAG via compact profile + @32k unclamping
+            r_rag32 = await api.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "wahs-26b-rag@32k",
+                    "stream": False,
+                    "messages": [{"role": "user", "content": "Why hold lisinopril potassium?"}],
+                    "wahs": {"fhir_bundle": bundle},
+                },
+            )
+            assert r_rag32.status_code == 200
+            xw_rag32 = r_rag32.json()["x_wahs"]
+            assert xw_rag32["retrieval_strategy"] == "note_rag"
+            assert xw_rag32["ai_provenance"]["recorded_model"] == "ollama/gemma4:26b"
+            assert xw_rag32["condensation"]["context_window"] == 65536
+            assert xw_rag32["condensation"]["budget_tokens"] == 32768
+            assert xw_rag32["note_rag"]["passages_retrieved"] >= 1
+            assert captured_payloads[-1]["model"] == "ollama/gemma4:26b"
+            assert captured_payloads[-1]["num_ctx"] == 65536
+
+            # B. Verbatim harness eval arm ID (`wahs-engine-rag:gemma-26b@16k` cross-provider mapped)
+            r_harness = await api.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "wahs-engine-rag:gemma-26b@16k",
+                    "stream": False,
+                    "messages": [{"role": "user", "content": "Potassium discharge instructions?"}],
+                    "wahs": {"fhir_bundle": bundle},
+                },
+            )
+            assert r_harness.status_code == 200
+            xw_har = r_harness.json()["x_wahs"]
+            assert xw_har["retrieval_strategy"] == "note_rag"
+            assert xw_har["condensation"]["budget_tokens"] == 16384
+            assert captured_payloads[-1]["model"] == "ollama/gemma4:26b"
+
+            # C. Un-suffixed model + huge caller target_budget_tokens STILL clamps to 16384
+            r_clamped = await api.post(
+                "/v1/wahs/context/preview",
+                json={
+                    "model": "wahs-26b-kb",
+                    "wahs": {"fhir_bundle": bundle, "target_budget_tokens": 32768},
+                },
+            )
+            assert r_clamped.status_code == 200
+            assert r_clamped.json()["x_wahs"]["condensation"]["clamp_reason"] == "clamped_to_chart_budget_ceiling"
+            assert r_clamped.json()["x_wahs"]["condensation"]["budget_effective"] == 16384
+
+            # D. Dynamic FHIR Tools
+            r_tools = await api.post(
+                "/v1/wahs/context/preview",
+                json={"model": "wahs-26b-tools", "wahs": {"fhir_bundle": bundle}},
+            )
+            assert r_tools.status_code == 200
+            assert r_tools.json()["x_wahs"]["retrieval_strategy"] == "dynamic_fhir_tools"
+            assert r_tools.json()["x_wahs"]["condensation"]["budget_effective"] == 2048
+
+            # E. Chart Only (`-raw` and `-chart`) disables KB cleanly
+            for chart_model in ("wahs-26b-raw", "wahs-26b-chart"):
+                r_raw = await api.post(
+                    "/v1/wahs/context/preview",
+                    json={"model": chart_model, "wahs": {"fhir_bundle": bundle}},
+                )
+                assert r_raw.status_code == 200
+                xw_raw = r_raw.json()["x_wahs"]
+                assert xw_raw["retrieval_strategy"] == "chart_only"
+                assert xw_raw["ai_provenance"]["kb_enabled"] is False
