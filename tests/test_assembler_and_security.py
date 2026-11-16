@@ -489,14 +489,20 @@ async def test_concurrent_cold_assemble_coalesces_inflight_everything_fetches() 
 
         ctx_preview, ctx_chat = await asyncio.gather(
             assembler.assemble(options=WahsRequestOptions(), identity=alice_id, requested_model="wahs-26b-kb"),
-            assembler.assemble(options=WahsRequestOptions(), identity=alice_id, requested_model="wahs-26b-rag"),
+            assembler.assemble(
+                options=WahsRequestOptions(target_budget_tokens=4096),
+                identity=alice_id,
+                requested_model="wahs-26b-rag",
+            ),
         )
 
         everything_calls = [line for line in mock_server.request_log if "$everything" in line]
         assert len(everything_calls) == 2
         assert len([line for line in everything_calls if "ds-uw-new" in line]) == 1
         assert len([line for line in everything_calls if "ds-story" in line]) == 1
-        assert (ctx_preview.dataset_fetches + ctx_chat.dataset_fetches) == 2
-        assert (ctx_preview.dataset_cache_hits + ctx_chat.dataset_cache_hits) == 2
+        assert ctx_preview.cache_hit is False
+        assert ctx_chat.cache_hit is False
+        assert (ctx_preview.dataset_fetches, ctx_preview.dataset_cache_hits) == (2, 0)
+        assert (ctx_chat.dataset_fetches, ctx_chat.dataset_cache_hits) == (0, 2)
         assert "Lisinopril" in ctx_preview.condensed.chart_text
         assert "Lisinopril" in ctx_chat.condensed.chart_text
