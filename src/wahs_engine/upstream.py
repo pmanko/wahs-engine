@@ -81,6 +81,9 @@ _OVERFLOW_TOOLS_SPEC: List[Dict[str, Any]] = [
 ]
 
 
+PRE_TOOL_LOOKAHEAD_CHARS: int = 96
+
+
 class _StreamingThinkStripper:
     """Stateful filter stripping `<think>...</think>` and `<|channel>thought...<channel|>` across SSE chunks."""
 
@@ -1297,6 +1300,11 @@ class SouthboundOpenAIClient:
             "created": created,
             "model": requested_model,
             "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
+            "x_wahs_stream": {
+                "event": "context_ready",
+                "prefix_cache_key_hash": ctx.prefix_cache_key_hash,
+                "citation_map": ctx.citation_map,
+            },
         }
         yield f"data: {json.dumps(role_chunk)}\n\n"
 
@@ -1333,8 +1341,11 @@ class SouthboundOpenAIClient:
                 stripper = _StreamingThinkStripper()
                 tool_calls_by_idx: Dict[int, Dict[str, Any]] = {}
                 round_raw_parts: List[str] = []
-                can_stream_live = current_tools is None
+                # Buffer only a short initial preamble while tools are enabled so zero-tool answers stream live.
+                streaming_live = current_tools is None
                 buffered_pieces: List[str] = []
+                buffered_chars = 0
+                emitted_in_round = False
 
                 def _content_sse(text_piece: str) -> str:
                     out_chunk = {
@@ -1384,20 +1395,32 @@ class SouthboundOpenAIClient:
                         tc_deltas = delta.get("tool_calls") if isinstance(delta, Mapping) else None
                         if isinstance(tc_deltas, list):
                             _accumulate_stream_tool_calls(tool_calls_by_idx, tc_deltas)
+                            if tool_calls_by_idx:
+                                streaming_live = False
                         raw_content = str(delta.get("content") or "") if isinstance(delta, Mapping) else ""
                         if raw_content:
                             round_raw_parts.append(raw_content)
                         piece = stripper.feed(raw_content)
-                        if piece:
-                            if can_stream_live:
+                        if piece and not tool_calls_by_idx:
+                            if streaming_live:
                                 yield _content_sse(piece)
+                                emitted_in_round = True
                             else:
                                 buffered_pieces.append(piece)
+                                buffered_chars += len(piece)
+                                if buffered_chars >= PRE_TOOL_LOOKAHEAD_CHARS or "\n" in piece:
+                                    streaming_live = True
+                                    for bp in buffered_pieces:
+                                        yield _content_sse(bp)
+                                    buffered_pieces.clear()
+                                    buffered_chars = 0
+                                    emitted_in_round = True
 
                 tail = stripper.flush()
-                if tail:
-                    if can_stream_live:
+                if tail and not tool_calls_by_idx:
+                    if streaming_live:
                         yield _content_sse(tail)
+                        emitted_in_round = True
                     else:
                         buffered_pieces.append(tail)
 
@@ -1422,6 +1445,25 @@ class SouthboundOpenAIClient:
                     )
                     overflow_recovered += rec_delta
                     followup_msgs.extend(tool_msgs)
+                    tool_names = [
+                        str((tc.get("function") or {}).get("name") or "chart_lookup")
+                        for tc in assembled_calls
+                    ]
+                    tool_event_chunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": requested_model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
+                        "x_wahs_stream": {
+                            "event": "tool_round",
+                            "round": round_idx + 1,
+                            "tools": tool_names,
+                            "reset_content": bool(emitted_in_round),
+                            "citation_map": ctx.citation_map,
+                        },
+                    }
+                    yield f"data: {json.dumps(tool_event_chunk)}\n\n"
                     continue
                 for buffered_piece in buffered_pieces:
                     yield _content_sse(buffered_piece)

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
-from typing import Any, Dict, List
+from typing import Any, AsyncIterator, Dict, List
 
 import httpx
 import pytest
@@ -419,3 +420,209 @@ async def test_tool_call_batch_over_four_returns_paired_tool_messages_for_skippe
             assert [m["tool_call_id"] for m in sync_tools] == [f"call_sync_{i}" for i in range(6)]
             assert "tool_call_limit_exceeded" in sync_tools[4]["content"]
             assert "tool_call_limit_exceeded" in sync_tools[5]["content"]
+
+
+@pytest.mark.asyncio
+async def test_streaming_yields_incremental_chunks_live_before_upstream_finishes_with_tools_enabled() -> None:
+    from wahs_engine.config import ModelSpec
+
+    release_tail = asyncio.Event()
+    seen_contents: List[str] = []
+    seen_stream_events: List[str] = []
+
+    class _GatedUpstreamStream(httpx.AsyncByteStream):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            yield (
+                b'data: {"id":"live-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Your current active medications:\\n"},"finish_reason":null}]}\n\n'
+            )
+            await asyncio.wait_for(release_tail.wait(), timeout=3.0)
+            yield (
+                b'data: {"id":"live-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"- Entresto 49/51 mg"},"finish_reason":"stop"}],"usage":{"prompt_tokens":150,"completion_tokens":12,"total_tokens":162}}\n\n'
+            )
+            yield b"data: [DONE]\n\n"
+
+        async def aclose(self) -> None:
+            pass
+
+    async def llm_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"object": "list", "data": [{"id": "gemma-e4b"}]})
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=_GatedUpstreamStream(),
+        )
+
+    settings = WahsEngineSettings(
+        allow_local_bundle_mode=True,
+        llm_base_url="http://mock-llm/v1",
+        default_model="wahs-test",
+        model_specs={
+            "wahs-test": ModelSpec(
+                upstream_model="gemma-e4b",
+                context_window=32768,
+                chart_budget_ceiling=2048,
+                tokenizer_family="gemma4",
+                provider_flavor="llamacpp",
+                disable_thinking=True,
+            )
+        },
+    )
+    entries = [{"resource": {"resourceType": "Patient", "id": "p-live", "birthDate": "1954-04-12"}}]
+    for idx in range(45):
+        entries.append(
+            {
+                "resource": {
+                    "resourceType": "Observation",
+                    "id": f"obs-live-{idx}",
+                    "status": "final",
+                    "category": [{"coding": [{"code": "laboratory"}]}],
+                    "code": {"coding": [{"system": "http://loinc.org", "code": f"777-{idx}", "display": f"Filler Lab Panel {idx} Long Descriptive Name"}]},
+                    "effectiveDateTime": "2026-01-01",
+                    "valueQuantity": {"value": float(idx), "unit": "mg/dL"},
+                }
+            }
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(llm_handler)) as llm_client:
+        app = create_app(settings, llm_http_client=llm_client)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://wahs-engine"
+        ) as api:
+            async def _consume() -> None:
+                async with api.stream(
+                    "POST",
+                    "/v1/chat/completions",
+                    json={
+                        "model": "wahs-test",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "What medicines am I taking right now?"}],
+                        "wahs": {
+                            "fhir_bundle": {"resourceType": "Bundle", "type": "collection", "entry": entries},
+                            "target_budget_tokens": 512,
+                            "enable_overflow_tools": True,
+                        },
+                    },
+                ) as resp:
+                    assert resp.status_code == 200
+                    async for raw_line in resp.aiter_lines():
+                        if not raw_line.startswith("data:"):
+                            continue
+                        payload_str = raw_line[5:].strip()
+                        if payload_str == "[DONE]":
+                            break
+                        obj = json.loads(payload_str)
+                        xws = obj.get("x_wahs_stream") or {}
+                        if xws.get("event"):
+                            seen_stream_events.append(str(xws["event"]))
+                        piece = ((obj.get("choices") or [{}])[0].get("delta") or {}).get("content") or ""
+                        if piece:
+                            seen_contents.append(piece)
+                            if "medications" in piece:
+                                release_tail.set()
+
+            await asyncio.wait_for(_consume(), timeout=5.0)
+
+    assert release_tail.is_set()
+    assert "context_ready" in seen_stream_events
+    full_text = "".join(seen_contents)
+    assert "Your current active medications:\n" in full_text
+    assert "- Entresto 49/51 mg" in full_text
+
+
+@pytest.mark.asyncio
+async def test_streaming_late_tool_call_after_multiline_draft_emits_reset_event() -> None:
+    from wahs_engine.config import ModelSpec
+
+    round_counter = {"n": 0}
+
+    def llm_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"object": "list", "data": [{"id": "gemma-e4b"}]})
+        round_counter["n"] += 1
+        if round_counter["n"] == 1:
+            sse_lines = [
+                'data: {"id":"r1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Checking your chart now.\\nLet me verify older notes."},"finish_reason":null}]}',
+                'data: {"id":"r1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_late_1","type":"function","function":{"name":"search_chart_entries","arguments":"{\\"query\\":\\"creatinine\\"}"}}]},"finish_reason":null}]}',
+                'data: {"id":"r1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}',
+                "data: [DONE]",
+            ]
+        else:
+            sse_lines = [
+                'data: {"id":"r2","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"FINAL_ANSWER"},"finish_reason":null}]}',
+                'data: {"id":"r2","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+                "data: [DONE]",
+            ]
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=("\n\n".join(sse_lines) + "\n\n").encode("utf-8"),
+        )
+
+    settings = WahsEngineSettings(
+        allow_local_bundle_mode=True,
+        llm_base_url="http://mock-llm/v1",
+        default_model="wahs-test",
+        model_specs={
+            "wahs-test": ModelSpec(
+                upstream_model="gemma-e4b",
+                context_window=32768,
+                chart_budget_ceiling=2048,
+                tokenizer_family="gemma4",
+                provider_flavor="llamacpp",
+                disable_thinking=True,
+            )
+        },
+    )
+    entries = [{"resource": {"resourceType": "Patient", "id": "p-reset", "birthDate": "1960-01-01"}}]
+    for idx in range(45):
+        entries.append(
+            {
+                "resource": {
+                    "resourceType": "Observation",
+                    "id": f"obs-reset-{idx}",
+                    "status": "final",
+                    "category": [{"coding": [{"code": "laboratory"}]}],
+                    "code": {"coding": [{"system": "http://loinc.org", "code": f"666-{idx}", "display": f"Filler Lab Panel Result {idx} Long Descriptive Text"}]},
+                    "effectiveDateTime": "2026-01-01",
+                    "valueQuantity": {"value": float(idx), "unit": "mg/dL"},
+                }
+            }
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(llm_handler)) as llm_client:
+        app = create_app(settings, llm_http_client=llm_client)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://wahs-engine"
+        ) as api:
+            resp = await api.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "wahs-test",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "Check labs"}],
+                    "wahs": {
+                        "fhir_bundle": {"resourceType": "Bundle", "type": "collection", "entry": entries},
+                        "target_budget_tokens": 512,
+                        "enable_overflow_tools": True,
+                    },
+                },
+            )
+            assert resp.status_code == 200
+            stream_events: List[Dict[str, Any]] = []
+            for raw_line in resp.text.splitlines():
+                if not raw_line.startswith("data:"):
+                    continue
+                payload_str = raw_line[5:].strip()
+                if payload_str == "[DONE]":
+                    break
+                obj = json.loads(payload_str)
+                if "x_wahs_stream" in obj:
+                    stream_events.append(obj["x_wahs_stream"])
+
+    assert round_counter["n"] == 2
+    tool_events = [e for e in stream_events if e.get("event") == "tool_round"]
+    assert len(tool_events) == 1
+    assert tool_events[0]["reset_content"] is True
+    assert tool_events[0]["tools"] == ["search_chart_entries"]
+    assert "FINAL_ANSWER" in resp.text

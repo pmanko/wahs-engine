@@ -549,6 +549,10 @@ def test_wahs_engine_settings_from_env_matrix_and_fhir_internal_guard(
     assert sp_fallback.chart_budget_ceiling is None
     assert sp_fallback.provider_flavor == "llamacpp"
 
+    monkeypatch.delenv("WAHS_PROVIDER_FLAVOR", raising=False)
+    monkeypatch.setenv("LLM_BASE_URL", "http://host.docker.internal:8077/v1")
+    assert WahsEngineSettings.from_env().default_provider_flavor == "llamacpp"
+
     monkeypatch.setenv("WAHS_FHIR_AUTH_BASE_URL", "http://fhir-internal:8080/fhir")
     with pytest.raises(ValueError):
         WahsEngineSettings.from_env()

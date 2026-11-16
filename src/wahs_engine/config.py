@@ -171,7 +171,13 @@ class WahsEngineSettings:
             default_ceil = None
         else:
             default_ceil = int(raw_ceil)
-        default_flavor = (os.environ.get("WAHS_PROVIDER_FLAVOR") or "litellm").strip().lower() or "litellm"
+        raw_flavor = (os.environ.get("WAHS_PROVIDER_FLAVOR") or "").strip().lower()
+        if raw_flavor:
+            default_flavor = raw_flavor
+        elif ":8077" in llm_url:
+            default_flavor = "llamacpp"
+        else:
+            default_flavor = "litellm"
 
         raw_specs = os.environ.get("WAHS_MODEL_SPECS_JSON", "").strip()
         parsed_specs: Dict[str, ModelSpec] = {}
