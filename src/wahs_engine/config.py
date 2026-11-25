@@ -9,6 +9,7 @@ import re
 from typing import Any, Dict, Optional, Tuple
 
 
+MAX_EXPLICIT_BUDGET_TOKENS = 262_144
 _BUDGET_SUFFIX_RE = re.compile(r"^(?P<base>.+?)@(?P<num>\d+)(?P<k>[kK])?$")
 
 _HARNESS_ARM_PREFIXES: Tuple[Tuple[str, str], ...] = (
@@ -75,7 +76,7 @@ def parse_wahs_profile_spec(requested_model: Optional[str]) -> ParsedProfileSpec
         num_val = int(m_budget.group("num"))
         if m_budget.group("k"):
             num_val *= 1024
-        explicit_budget = max(512, num_val)
+        explicit_budget = min(max(512, num_val), MAX_EXPLICIT_BUDGET_TOKENS)
 
     low_clean = clean.lower()
     for pfx, strat in _HARNESS_ARM_PREFIXES:
@@ -122,6 +123,11 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 def _infer_tokenizer_family(requested_model: str, upstream_model: str) -> str:
     combined = f"{requested_model} {upstream_model}".lower()
+    if any(
+        tok in combined
+        for tok in ("qwen", "llama", "mistral", "deepseek", "gpt-", "claude", "o1", "o3", "o4")
+    ):
+        return "o200k_base"
     if any(tok in combined for tok in ("gemma", "medgemma", "wahs-")):
         return "gemma4"
     return "o200k_base"
@@ -174,6 +180,7 @@ class WahsEngineSettings:
     model_map: Dict[str, str] = field(default_factory=dict)
     model_specs: Dict[str, ModelSpec] = field(default_factory=dict)
     default_context_window: int = 32768
+    max_context_window: int = 131072
     default_chart_budget_ceiling: Optional[int] = 16384
     default_provider_flavor: str = "litellm"
     allow_local_bundle_mode: bool = False
@@ -218,8 +225,9 @@ class WahsEngineSettings:
         parsed = parse_wahs_profile_spec(model)
         upstream = self.resolve_upstream_model(model)
 
+        cross_key = _CROSS_PROVIDER_STEM_TO_PROFILE_KEY.get(parsed.lookup_key.lower())
         base_spec: Optional[ModelSpec] = None
-        for key in (model, parsed.clean_model, parsed.lookup_key, upstream):
+        for key in (model, parsed.clean_model, parsed.lookup_key, cross_key, upstream):
             if key and key in self.model_specs:
                 base_spec = self.model_specs[key]
                 break
@@ -236,8 +244,9 @@ class WahsEngineSettings:
             )
 
         if parsed.explicit_budget_tokens is not None:
-            req_b = int(parsed.explicit_budget_tokens)
-            eff_ctx = max(int(base_spec.context_window), req_b * 2)
+            max_win = max(int(base_spec.context_window), int(self.max_context_window))
+            req_b = min(int(parsed.explicit_budget_tokens), max(512, max_win // 2))
+            eff_ctx = min(max_win, max(int(base_spec.context_window), req_b * 2))
             eff_ceiling = (
                 max(int(base_spec.chart_budget_ceiling), req_b)
                 if base_spec.chart_budget_ceiling is not None
@@ -316,6 +325,7 @@ class WahsEngineSettings:
                 parsed_map = {str(k): str(v) for k, v in loaded.items()}
 
         default_ctx = int(os.environ.get("WAHS_CONTEXT_WINDOW", "32768"))
+        max_ctx = max(default_ctx, int(os.environ.get("WAHS_MAX_CONTEXT_WINDOW", "131072")))
         raw_ceil = os.environ.get("WAHS_CHART_BUDGET_CEILING")
         if raw_ceil is None:
             default_ceil: Optional[int] = 16384
@@ -371,6 +381,7 @@ class WahsEngineSettings:
             model_map=parsed_map,
             model_specs=parsed_specs,
             default_context_window=default_ctx,
+            max_context_window=max_ctx,
             default_chart_budget_ceiling=default_ceil,
             default_provider_flavor=default_flavor,
             allow_local_bundle_mode=_env_bool("WAHS_ALLOW_LOCAL_BUNDLE_MODE", False),

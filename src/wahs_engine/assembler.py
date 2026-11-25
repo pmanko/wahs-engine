@@ -561,6 +561,7 @@ class WAHSBundleAssembler:
     ) -> None:
         self.settings = settings
         self._external_client = http_client
+        self._shared_client: Optional[httpx.AsyncClient] = None
         self._dataset_cache: _BoundedLRUCache[Tuple[str, str, str], List[Dict[str, Any]]] = (
             _BoundedLRUCache(settings.dataset_cache_max_entries, ttl_seconds=settings.cache_ttl_seconds)
         )
@@ -571,6 +572,18 @@ class WAHSBundleAssembler:
             Tuple[str, str, str],
             asyncio.Task[Tuple[List[Dict[str, Any]], bool, Optional[str]]],
         ] = {}
+
+    def _get_http_client(self) -> httpx.AsyncClient:
+        if self._external_client is not None:
+            return self._external_client
+        if self._shared_client is None or self._shared_client.is_closed:
+            self._shared_client = httpx.AsyncClient(timeout=self.settings.fhir_timeout_seconds)
+        return self._shared_client
+
+    async def aclose(self) -> None:
+        if self._shared_client is not None and not self._shared_client.is_closed:
+            await self._shared_client.aclose()
+        self._shared_client = None
 
     def _validate_overlay_budget(self, overlay_resources: Sequence[Mapping[str, Any]]) -> None:
         if not overlay_resources:
@@ -734,8 +747,7 @@ class WAHSBundleAssembler:
             )
 
         base = self.settings.fhir_auth_base_url.rstrip("/")
-        owns_client = self._external_client is None
-        client = self._external_client or httpx.AsyncClient(timeout=self.settings.fhir_timeout_seconds)
+        client = self._get_http_client()
 
         async def _run_live_assembly() -> AssembledWahsContext:
             # 1. Live MasterPatient fetch through `fhir-auth` (cryptographically verifies JWT + security label!)
@@ -941,6 +953,8 @@ class WAHSBundleAssembler:
                     for r in raw_ds_resources
                     if not (r.get("resourceType") == "Patient" and r.get("id") in allowed_refs)
                 ]
+                if not is_partial and desc.has_version_stamp:
+                    self._dataset_cache.put(ds_cache_key, ds_resources)
                 return desc, ds_resources, is_partial, partial_reason, 0, 1
 
             ds_results = await asyncio.gather(*(_fetch_dataset(desc) for desc in included_descriptors))
@@ -1030,9 +1044,6 @@ class WAHSBundleAssembler:
                     f"{self.settings.assembly_timeout_seconds:.1f}s."
                 ),
             ) from exc
-        finally:
-            if owns_client:
-                await client.aclose()
 
     def _scope_and_condense_bundle(
         self,

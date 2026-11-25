@@ -125,8 +125,8 @@ class OpenAIChatCompletionRequest(BaseModel):
     user: Optional[str] = None
     wahs: Optional[WahsRequestOptions] = None
 
-    def resolved_wahs_options(self) -> WahsRequestOptions:
-        return _resolve_wahs_options(self.wahs, self.model_extra, self.model)
+    def resolved_wahs_options(self, default_model: Optional[str] = None) -> WahsRequestOptions:
+        return _resolve_wahs_options(self.wahs, self.model_extra, self.model or default_model)
 
 
 class WahsContextPreviewRequest(BaseModel):
@@ -138,5 +138,5 @@ class WahsContextPreviewRequest(BaseModel):
     messages: List[ChatMessage] = Field(default_factory=list)
     wahs: Optional[WahsRequestOptions] = None
 
-    def resolved_wahs_options(self) -> WahsRequestOptions:
-        return _resolve_wahs_options(self.wahs, self.model_extra, self.model)
+    def resolved_wahs_options(self, default_model: Optional[str] = None) -> WahsRequestOptions:
+        return _resolve_wahs_options(self.wahs, self.model_extra, self.model or default_model)
