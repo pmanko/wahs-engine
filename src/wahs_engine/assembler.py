@@ -372,7 +372,7 @@ def _extract_ips_referenced_keys(ips_bundle: Mapping[str, Any]) -> Set[str]:
     return keys
 
 
-def _clone_context(ctx: AssembledWahsContext, *, cache_hit: bool, budget_requested: Any = _SENTINEL, budget_effective: Any = _SENTINEL, clamp_reason: Any = _SENTINEL) -> AssembledWahsContext:
+def _clone_context(ctx: AssembledWahsContext, *, cache_hit: bool, budget_requested: Any = _SENTINEL, budget_effective: Any = _SENTINEL, clamp_reason: Any = _SENTINEL, dataset_cache_hits: Any = _SENTINEL, dataset_fetches: Any = _SENTINEL) -> AssembledWahsContext:
     cloned = copy.copy(ctx)
     cloned.citation_map = copy.deepcopy(ctx.citation_map)
     cloned.notices, cloned.partial_datasets, cloned.cache_hit = list(ctx.notices), [dict(d) for d in ctx.partial_datasets], cache_hit
@@ -382,6 +382,10 @@ def _clone_context(ctx: AssembledWahsContext, *, cache_hit: bool, budget_request
         cloned.budget_effective = budget_effective
     if clamp_reason is not _SENTINEL:
         cloned.clamp_reason = clamp_reason
+    if dataset_cache_hits is not _SENTINEL:
+        cloned.dataset_cache_hits = dataset_cache_hits
+    if dataset_fetches is not _SENTINEL:
+        cloned.dataset_fetches = dataset_fetches
     return cloned
 
 
@@ -758,10 +762,10 @@ class WAHSBundleAssembler:
         if cacheable and not force_refresh and not partial_fetch:
             cached_t0 = self._prefix_cache.get(t0_key)
             if cached_t0 is not None and cached_t0.condensed.actual_tokens <= budget_effective:
-                return _clone_context(cached_t0, cache_hit=True, budget_requested=options.target_budget_tokens, budget_effective=budget_effective, clamp_reason=clamp_reason)
+                return _clone_context(cached_t0, cache_hit=True, budget_requested=options.target_budget_tokens, budget_effective=budget_effective, clamp_reason=clamp_reason, dataset_cache_hits=len(datasets_included), dataset_fetches=0)
             cached_exact = self._prefix_cache.get(b_key)
             if cached_exact is not None:
-                return _clone_context(cached_exact, cache_hit=True, budget_requested=options.target_budget_tokens, budget_effective=budget_effective, clamp_reason=clamp_reason)
+                return _clone_context(cached_exact, cache_hit=True, budget_requested=options.target_budget_tokens, budget_effective=budget_effective, clamp_reason=clamp_reason, dataset_cache_hits=len(datasets_included), dataset_fetches=0)
 
         chart_target = max(1, budget_effective - ((counter(partial_warn) + 4) if partial_fetch else 0))
         try:
