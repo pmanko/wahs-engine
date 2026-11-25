@@ -21,8 +21,13 @@ from wahs_engine.assembler import (
 )
 from wahs_engine.config import WahsEngineSettings
 from wahs_engine.seeder import (
+    DEMO_ACCOUNTS,
+    DEMO_ACCOUNTS_BY_SLUG,
     OBSERVATION_CATEGORY_SYSTEM,
     SEED_DATASET_IDENTIFIER_SYSTEM,
+    build_bundle_star_graph_datasets,
+    ensure_keycloak_demo_users,
+    seed_bundle_account_to_hapi,
     seed_persona_to_hapi,
 )
 
@@ -605,3 +610,232 @@ async def test_seeder_preserves_intra_bundle_references_and_is_idempotent_across
         )
         assert leo_seed["dataset_references"][0] == leo_stub_ref
         assert len(leo_seed["dataset_references"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_bundle_star_graph_partitioning_batching_and_keycloak_sync(tmp_path: Any) -> None:
+    """Verify 12-account manifest, multi-source bundle partitioning, PUT batching, and Keycloak sync."""
+    assert len(DEMO_ACCOUNTS) == 12
+    assert set(DEMO_ACCOUNTS_BY_SLUG) == {
+        "alex",
+        "leo",
+        "arthur",
+        "byron",
+        "elena",
+        "lamar",
+        "julian",
+        "clara",
+        "marcus",
+        "margaret",
+        "maurice",
+        "sofia",
+    }
+
+    bundle_path = tmp_path / "Elena_Test.json"
+    bundle_path.write_text(
+        json.dumps(
+            {
+                "resourceType": "Bundle",
+                "type": "collection",
+                "entry": [
+                    {
+                        "fullUrl": "urn:uuid:pat-elena",
+                        "resource": {
+                            "resourceType": "Patient",
+                            "id": "pat-elena",
+                            "name": [{"given": ["Elena"], "family": "Rostova"}],
+                        },
+                    },
+                    {
+                        "fullUrl": "urn:uuid:org-1",
+                        "resource": {
+                            "resourceType": "Organization",
+                            "id": "org-1",
+                            "name": "UW Medicine Heart Institute",
+                        },
+                    },
+                    {
+                        "fullUrl": "urn:uuid:enc-1",
+                        "resource": {
+                            "resourceType": "Encounter",
+                            "id": "enc-1",
+                            "status": "finished",
+                            "subject": {"reference": "urn:uuid:pat-elena"},
+                            "serviceProvider": {
+                                "reference": "Organization?identifier=https://github.com/synthetichealth/synthea|abc",
+                                "display": "UW Medicine Heart Institute",
+                            },
+                        },
+                    },
+                    {
+                        "fullUrl": "urn:uuid:obs-1",
+                        "resource": {
+                            "resourceType": "Observation",
+                            "id": "obs-1",
+                            "status": "final",
+                            "code": {"text": "Potassium"},
+                            "subject": {"reference": "urn:uuid:pat-elena"},
+                            "encounter": {"reference": "urn:uuid:enc-1"},
+                        },
+                    },
+                    {
+                        "fullUrl": "urn:uuid:med-1",
+                        "resource": {
+                            "resourceType": "MedicationRequest",
+                            "id": "med-1",
+                            "status": "active",
+                            "intent": "order",
+                            "subject": {"reference": "urn:uuid:pat-elena"},
+                            "medicationCodeableConcept": {"text": "Spironolactone 25 mg"},
+                            "performer": [{"actor": {"display": "Northwest Kidney Centers"}}],
+                            "requester": {
+                                "reference": "Practitioner?identifier=http://hl7.org/fhir/sid/us-npi|9999",
+                            },
+                        },
+                    },
+                    {
+                        "fullUrl": "urn:uuid:prov-1",
+                        "resource": {
+                            "resourceType": "Provenance",
+                            "id": "prov-1",
+                            "recorded": "2026-01-01T00:00:00Z",
+                            "target": [
+                                {"reference": "urn:uuid:pat-elena"},
+                                {"reference": "urn:uuid:obs-1"},
+                            ],
+                        },
+                    },
+                    {
+                        "fullUrl": "urn:uuid:dev-1",
+                        "resource": {
+                            "resourceType": "Device",
+                            "id": "dev-1",
+                            "patient": {"reference": "urn:uuid:pat-elena"},
+                        },
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    plan = build_bundle_star_graph_datasets(bundle_path, DEMO_ACCOUNTS_BY_SLUG["elena"])
+    assert len(plan["shared_resources"]) == 2  # Organization + Provenance
+    prov = next(r for r in plan["shared_resources"] if r["resourceType"] == "Provenance")
+    assert "subject" not in prov and "patient" not in prov
+    assert prov["target"][0]["reference"] == "Patient/w-elena-ds-1"
+    assert prov["target"][1]["reference"].startswith("Observation/w-elena-")
+
+    assert [ds["source_name"] for ds in plan["datasets"]] == [
+        "UW Medicine Heart Institute",
+        "Northwest Kidney Centers",
+    ]
+    med = plan["datasets"][1]["resources"][0]
+    assert "?" not in json.dumps(med["requester"])
+    assert med["requester"]["display"] == "Practitioner"
+    dev = next(r for r in plan["datasets"][0]["resources"] if r["resourceType"] == "Device")
+    assert "subject" not in dev and dev["patient"]["reference"].startswith("Patient/w-elena-ds-")
+
+    # Verify batched PUT seeding + idempotent skip on rerun
+    hapi_store: Dict[str, Dict[str, Any]] = {}
+    tx_calls: List[int] = []
+    mock_app = FastAPI()
+
+    @mock_app.get("/fhir/Patient")
+    async def _search(identifier: str) -> Dict[str, Any]:
+        sys_u, val = identifier.split("|", 1)
+        matches = [
+            {"resource": copy.deepcopy(r)}
+            for r in hapi_store.values()
+            if r["resourceType"] == "Patient"
+            and any(i.get("system") == sys_u and i.get("value") == val for i in r.get("identifier") or [])
+        ]
+        return {"resourceType": "Bundle", "type": "searchset", "total": len(matches), "entry": matches}
+
+    @mock_app.put("/fhir/{rt}/{rid}")
+    async def _put_res(rt: str, rid: str, request: Request) -> Dict[str, Any]:
+        body = await request.json()
+        body["id"] = rid
+        hapi_store[f"{rt}/{rid}"] = body
+        return body
+
+    @mock_app.post("/fhir")
+    async def _tx(request: Request) -> Dict[str, Any]:
+        body = await request.json()
+        tx_calls.append(len(body.get("entry") or []))
+        resp_entries = []
+        for ent in body.get("entry") or []:
+            res = ent["resource"]
+            rt = res["resourceType"]
+            rid = res["id"]
+            hapi_store[f"{rt}/{rid}"] = res
+            resp_entries.append({"response": {"status": "200 OK", "location": f"{rt}/{rid}/_history/1"}})
+        return {"resourceType": "Bundle", "type": "transaction-response", "entry": resp_entries}
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=mock_app), base_url="http://hapi:8080"
+    ) as client:
+        res1 = await seed_bundle_account_to_hapi(
+            fhir_base_url="http://hapi:8080/fhir",
+            account_meta=DEMO_ACCOUNTS_BY_SLUG["elena"],
+            bundle_path=bundle_path,
+            keycloak_sub="real-kc-elena-uuid",
+            http_client=client,
+            batch_size=2,
+        )
+        assert res1["skipped"] is False
+        assert len(tx_calls) >= 4
+        assert all(n <= 2 for n in tx_calls)
+        assert len(res1["dataset_references"]) == 2
+        assert "Patient/wahs-master-elena" in hapi_store
+
+        calls_before = len(tx_calls)
+        res2 = await seed_bundle_account_to_hapi(
+            fhir_base_url="http://hapi:8080/fhir",
+            account_meta=DEMO_ACCOUNTS_BY_SLUG["elena"],
+            bundle_path=bundle_path,
+            keycloak_sub="real-kc-elena-uuid",
+            http_client=client,
+            batch_size=2,
+        )
+        assert res2["skipped"] is True
+        assert len(tx_calls) == calls_before
+
+    # Verify ensure_keycloak_demo_users resolves existing + creates missing users
+    kc_users = {
+        "alex.johnson@wahs.local": {"id": "kc-existing-alex", "username": "alex.johnson@wahs.local"}
+    }
+    kc_app = FastAPI()
+
+    @kc_app.post("/realms/master/protocol/openid-connect/token")
+    async def _kc_tok() -> Dict[str, Any]:
+        return {"access_token": "admin-tok"}
+
+    @kc_app.get("/admin/realms/wahs/users")
+    async def _kc_find(username: str) -> List[Dict[str, Any]]:
+        u = kc_users.get(username)
+        return [u] if u else []
+
+    @kc_app.post("/admin/realms/wahs/users", status_code=201)
+    async def _kc_create(request: Request) -> Dict[str, Any]:
+        body = await request.json()
+        attrs = body.get("attributes") or {}
+        assert body.get("requiredActions") == []
+        assert attrs.get("gender", [""])[0] in {"Female", "Male", "Non-Binary", "Decline to State"}
+        assert int(attrs.get("terms_and_conditions", ["0"])[0]) >= 1759276800
+        assert attrs.get("birthday", [""])[0]
+        kc_users[body["username"]] = {"id": f"kc-new-{body['username']}", "username": body["username"]}
+        return {}
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=kc_app), base_url="http://keycloak:8080"
+    ) as kc_client:
+        subs = await ensure_keycloak_demo_users(
+            keycloak_base_url="http://keycloak:8080",
+            accounts=[DEMO_ACCOUNTS_BY_SLUG["alex"], DEMO_ACCOUNTS_BY_SLUG["elena"]],
+            http_client=kc_client,
+        )
+        assert subs == {
+            "alex": "kc-existing-alex",
+            "elena": "kc-new-elena.rostova@wahs.local",
+        }

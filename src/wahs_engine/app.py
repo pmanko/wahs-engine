@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 import os
 import time
-from typing import Any, Dict, Optional
+from typing import Any, AsyncIterator, Dict, Optional
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
@@ -59,6 +60,16 @@ def create_app(
     assembler = WAHSBundleAssembler(cfg, http_client=fhir_http_client)
     southbound = SouthboundOpenAIClient(cfg, http_client=llm_http_client)
 
+    @asynccontextmanager
+    async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            await assembler.aclose()
+            aclose_sb = getattr(southbound, "aclose", None)
+            if callable(aclose_sb):
+                await aclose_sb()
+
     application = FastAPI(
         title="WAHS Engine",
         version=cfg.engine_version,
@@ -66,6 +77,7 @@ def create_app(
             "Zero-privilege OpenAI-compatible clinical FHIR R4 condensation, "
             "fhir-auth multi-dataset assembly, and [N] provenance middleware."
         ),
+        lifespan=_lifespan,
     )
     application.state.settings = cfg
     application.state.assembler = assembler
@@ -93,7 +105,7 @@ def create_app(
         req: WahsContextPreviewRequest,
         request: Request,
     ) -> Dict[str, Any]:
-        options = req.resolved_wahs_options()
+        options = req.resolved_wahs_options(default_model=cfg.default_model)
         identity = _resolve_caller_identity(request, options, cfg)
         requested_model = (req.model or cfg.default_model).strip()
         spec = cfg.resolve_model_spec(requested_model)
@@ -153,7 +165,7 @@ def create_app(
         response: Response,
     ) -> Any:
         t0 = time.perf_counter()
-        options = req.resolved_wahs_options()
+        options = req.resolved_wahs_options(default_model=cfg.default_model)
         identity = _resolve_caller_identity(request, options, cfg)
         requested_model = (req.model or cfg.default_model).strip()
         force_refresh = "no-cache" in request.headers.get("cache-control", "").lower()
