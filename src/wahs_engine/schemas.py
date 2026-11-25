@@ -50,6 +50,7 @@ class WahsRequestOptions(BaseModel):
     enable_overflow_tools: bool = True
     refresh: bool = False
     allow_partial_external_share: bool = False
+    emit_stream_events: bool = True
     retrieval_strategy: Literal[
         "condensation_kb",
         "note_rag",
@@ -119,10 +120,13 @@ class OpenAIChatCompletionRequest(BaseModel):
     stream: bool = False
     temperature: float = Field(default=0.1, ge=0.0, le=2.0)
     max_tokens: Optional[int] = Field(default=None, ge=1, le=16384)
-    top_p: Optional[float] = None
+    top_p: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    presence_penalty: Optional[float] = Field(default=None, ge=-2.0, le=2.0)
+    frequency_penalty: Optional[float] = Field(default=None, ge=-2.0, le=2.0)
     seed: Optional[int] = None
     stop: Optional[Any] = None
     user: Optional[str] = None
+    stream_options: Optional[Dict[str, Any]] = None
     wahs: Optional[WahsRequestOptions] = None
 
     def resolved_wahs_options(self, default_model: Optional[str] = None) -> WahsRequestOptions:

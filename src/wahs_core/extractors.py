@@ -192,18 +192,36 @@ def _sort_timestamp_key(val: Optional[str]) -> str:
     return f"N:{dt.strftime('%Y-%m-%dT%H:%M:%S')}.{dt.microsecond:06d}"
 
 
+_PREFERRED_CODING_SYSTEM_FRAGMENTS: Tuple[str, ...] = (
+    "nlm.nih.gov/research/umls/rxnorm",
+    "snomed.info/sct",
+    "loinc.org",
+    "hl7.org/fhir/sid/cvx",
+)
+
+
 def _coding_pair(codeable: Optional[Mapping[str, Any]]) -> Tuple[str, str]:
     if not isinstance(codeable, Mapping):
         return "", ""
-    codings = codeable.get("coding") or []
+    codings = [c for c in (codeable.get("coding") or []) if isinstance(c, Mapping)]
     code = ""
     display = str(codeable.get("text") or "").strip()
-    for c in codings:
-        if isinstance(c, Mapping):
-            if not code and c.get("code") is not None:
+    # Prefer canonical clinical terminologies (RxNorm, SNOMED CT, LOINC, CVX) over billing/local codes at coding[0].
+    for pref in _PREFERRED_CODING_SYSTEM_FRAGMENTS:
+        for c in codings:
+            sys_low = str(c.get("system") or "").strip().lower()
+            if pref in sys_low and c.get("code") is not None:
                 code = str(c.get("code")).strip()
-            if not display and c.get("display"):
-                display = str(c.get("display")).strip()
+                if not display and c.get("display"):
+                    display = str(c.get("display")).strip()
+                break
+        if code:
+            break
+    for c in codings:
+        if not code and c.get("code") is not None:
+            code = str(c.get("code")).strip()
+        if not display and c.get("display"):
+            display = str(c.get("display")).strip()
     return code, display
 
 
@@ -317,6 +335,18 @@ def _format_structured_dosage(d_inst: Mapping[str, Any]) -> str:
             if low.get("value") is not None and high.get("value") is not None:
                 u = str(high.get("unit") or low.get("unit") or "").strip()
                 struct_parts.append(f"{_format_num(low['value'])}-{_format_num(high['value'])} {u}".strip())
+    admin_dose = d_inst.get("dose")
+    if isinstance(admin_dose, Mapping) and admin_dose.get("value") is not None:
+        adv = _format_num(
+            float(admin_dose["value"]) if isinstance(admin_dose["value"], (int, float)) else admin_dose["value"]
+        )
+        adu = str(admin_dose.get("unit") or admin_dose.get("code") or "").strip()
+        struct_parts.append(f"{adv} {adu}".strip())
+    rate_q = d_inst.get("rateQuantity")
+    if isinstance(rate_q, Mapping) and rate_q.get("value") is not None:
+        rv = _format_num(float(rate_q["value"]) if isinstance(rate_q["value"], (int, float)) else rate_q["value"])
+        ru = str(rate_q.get("unit") or rate_q.get("code") or "").strip()
+        struct_parts.append(f"rate {rv} {ru}".strip())
     _, route_disp = _coding_pair(d_inst.get("route"))
     if route_disp:
         struct_parts.append(route_disp)
@@ -819,7 +849,7 @@ def extract_bundle(
             )
         )
 
-    # 2. Extract AllergyIntolerance (100% Mandatory IPS Safety Core)
+    # 2. Extract AllergyIntolerance (Active/Confirmed Mandatory IPS Safety Core; exclude entered-in-error)
     for res in resources:
         if res.get("resourceType") != "AllergyIntolerance":
             continue
@@ -827,6 +857,11 @@ def extract_bundle(
         code, disp = _coding_pair(res.get("code"))
         c_status = _codeable_status(res.get("clinicalStatus")) or "active"
         v_status = _codeable_status(res.get("verificationStatus"))
+        if c_status == "entered-in-error" or v_status == "entered-in-error":
+            excluded_counts["AllergyIntolerance(entered-in-error)"] = (
+                excluded_counts.get("AllergyIntolerance(entered-in-error)", 0) + 1
+            )
+            continue
         crit = str(res.get("criticality") or "").strip()
         cats = [str(c) for c in (res.get("category") or []) if c]
         reactions: List[str] = []
@@ -838,7 +873,13 @@ def extract_bundle(
                     if m_disp:
                         reactions.append(f"{m_disp} ({sev})" if sev else m_disp)
         rec_date = _iso_date(res.get("recordedDate") or res.get("onsetDateTime"))
-        sens, sens_source = _classify_res_sensitivity(res, code, disp, cats)
+        src_org = resolve_source_org(res)
+        sens, sens_source = _classify_res_sensitivity(
+            res, code, f"{disp} {' '.join(reactions)} {src_org or ''}".strip(), cats
+        )
+        is_actionable_allergy = (
+            c_status not in {"inactive", "resolved"} and v_status != "refuted"
+        )
         qualifiers = [f"status: {c_status}"]
         if v_status:
             qualifiers.append(f"verification: {v_status}")
@@ -858,15 +899,15 @@ def extract_bundle(
                 resource_type="AllergyIntolerance",
                 resource_uuid=rid,
                 date=rec_date,
-                clinical_date=rec_date,
-                date_kind="clinical_event" if rec_date else "unknown",
+                clinical_date=rec_date if v_status != "refuted" else None,
+                date_kind="clinical_event" if (rec_date and v_status != "refuted") else "unknown",
                 section="allergy",
                 code=code or disp,
                 display=disp or code or "Unspecified allergy",
                 text=f"Allergy: {disp or code} ({', '.join(qualifiers)})",
-                mandatory=True,
+                mandatory=is_actionable_allergy,
                 status=c_status,
-                source_org=resolve_source_org(res),
+                source_org=src_org,
                 sensitivity=sens,
                 metadata=allergy_meta,
             )
@@ -1001,31 +1042,46 @@ def extract_bundle(
             else:
                 disp = str(res["medicationReference"].get("display") or "")
         status = str(res.get("status") or "unknown").strip().lower()
+        if status == "entered-in-error":
+            excluded_counts[f"{rtype}(entered-in-error)"] = (
+                excluded_counts.get(f"{rtype}(entered-in-error)", 0) + 1
+            )
+            continue
         m_raw_ts = str(
             res.get("authoredOn")
             or res.get("effectiveDateTime")
             or (res.get("effectivePeriod") or {}).get("start")
             or res.get("whenHandedOver")
+            or res.get("whenPrepared")
+            or res.get("dateAsserted")
             or ""
         ).strip()
         end_raw_ts = str((res.get("effectivePeriod") or {}).get("end") or "").strip()
         m_date = _iso_date(m_raw_ts)
         end_date = _iso_date(end_raw_ts)
 
-        # Extract dosage text and/or structured dosage instructions if available
+        # Extract dosage text and/or structured dosage instructions across R4 list and object shapes
         dose_strs: List[str] = []
         for d_inst in res.get("dosageInstruction") or []:
             if isinstance(d_inst, Mapping):
                 d_txt = _format_structured_dosage(d_inst)
                 if d_txt:
                     dose_strs.append(d_txt)
-        if not dose_strs and isinstance(res.get("dosage"), Mapping):
-            d_txt = _format_structured_dosage(res["dosage"])
+        raw_dosage = res.get("dosage")
+        if not dose_strs and isinstance(raw_dosage, list):
+            for d_inst in raw_dosage:
+                if isinstance(d_inst, Mapping):
+                    d_txt = _format_structured_dosage(d_inst)
+                    if d_txt:
+                        dose_strs.append(d_txt)
+        elif not dose_strs and isinstance(raw_dosage, Mapping):
+            d_txt = _format_structured_dosage(raw_dosage)
             if d_txt:
                 dose_strs.append(d_txt)
 
         # Extract reason (reasonCode or reasonReference -> Condition)
         reasons: List[str] = []
+        med_ref_cond_ids: List[str] = []
         for rc in res.get("reasonCode") or []:
             _, r_disp = _coding_pair(rc)
             if r_disp:
@@ -1033,6 +1089,8 @@ def extract_bundle(
         for rr in res.get("reasonReference") or []:
             if isinstance(rr, Mapping):
                 c_id = _strip_urn(rr.get("reference"))
+                if c_id:
+                    med_ref_cond_ids.append(c_id)
                 r_disp = str(rr.get("display") or conds_by_id.get(c_id) or "").strip()
                 if r_disp:
                     reasons.append(r_disp)
@@ -1059,7 +1117,17 @@ def extract_bundle(
                 for entry_link in raw_link:
                     if isinstance(entry_link, Mapping) and entry_link.get("reference"):
                         linked_order_uuids.append(_strip_urn(str(entry_link.get("reference"))))
-        med_sens, med_sens_src = _classify_res_sensitivity(res, code, resolved_disp or disp)
+        med_src_org = resolve_source_org(res)
+        med_sens_text = " | ".join(
+            p for p in [resolved_disp or disp, *reasons, med_src_org or ""] if p
+        )
+        med_sens, med_sens_src = _classify_res_sensitivity(res, code, med_sens_text)
+        if med_sens != "SDOH/PRIVACY-SENSITIVE":
+            for cid in med_ref_cond_ids:
+                c_sens, c_src = cond_sens_by_id.get(cid, (None, None))
+                if c_sens == "SDOH/PRIVACY-SENSITIVE":
+                    med_sens, med_sens_src = c_sens, c_src
+                    break
         raw_meds.append(
             {
                 "resourceType": rtype,
@@ -1076,7 +1144,7 @@ def extract_bundle(
                 "reasons": reasons,
                 "setting": setting,
                 "ingredient_key": ingredient,
-                "source_org": resolve_source_org(res),
+                "source_org": med_src_org,
                 "sensitivity": med_sens,
                 "sensitivity_source": med_sens_src,
                 "linked_order_uuids": tuple(dict.fromkeys(u for u in linked_order_uuids if u)),
@@ -1151,7 +1219,15 @@ def extract_bundle(
         code, disp = _coding_pair(res.get("vaccineCode"))
         occ_date = _iso_date(res.get("occurrenceDateTime"))
         status = str(res.get("status") or "completed").strip().lower()
-        imm_sens, imm_sens_src = _classify_res_sensitivity(res, code, disp)
+        if status == "entered-in-error":
+            excluded_counts["Immunization(entered-in-error)"] = (
+                excluded_counts.get("Immunization(entered-in-error)", 0) + 1
+            )
+            continue
+        imm_src_org = resolve_source_org(res)
+        imm_sens, imm_sens_src = _classify_res_sensitivity(
+            res, code, f"{disp} {imm_src_org or ''}".strip()
+        )
         raw_imms.append(
             {
                 "resourceUuid": rid,
@@ -1159,25 +1235,27 @@ def extract_bundle(
                 "display": disp or code or "Vaccine",
                 "date": occ_date,
                 "status": status,
-                "source_org": resolve_source_org(res),
+                "source_org": imm_src_org,
                 "sensitivity": imm_sens,
                 "sensitivity_source": imm_sens_src,
                 "group": classify_vaccine_group(code, disp),
             }
         )
 
+    completed_imms = [im for im in raw_imms if im["status"] == "completed"]
     imm_anomalies = (
-        annotate_immunization_anomalies(raw_imms, birth_date)
+        annotate_immunization_anomalies(completed_imms, birth_date)
         if include_conflict_annotations
         else {}
     )
     imms_by_group: Dict[str, List[str]] = {}
-    for imm in raw_imms:
+    for imm in completed_imms:
         imms_by_group.setdefault(imm["group"], []).append(imm["resourceUuid"])
 
     for imm in raw_imms:
         rid = imm["resourceUuid"]
         anom = imm_anomalies.get(rid)
+        is_completed_imm = imm["status"] == "completed"
         quals = [f"status: {imm['status']}"]
         if imm["code"]:
             quals.append(f"CVX: {imm['code']}")
@@ -1200,8 +1278,8 @@ def extract_bundle(
                 resource_type="Immunization",
                 resource_uuid=rid,
                 date=imm["date"],
-                clinical_date=imm["date"],
-                date_kind="clinical_event" if imm["date"] else "unknown",
+                clinical_date=imm["date"] if is_completed_imm else None,
+                date_kind="clinical_event" if (imm["date"] and is_completed_imm) else "unknown",
                 section="immunization",
                 code=imm["code"] or imm["group"],
                 display=imm["display"],
@@ -1220,11 +1298,19 @@ def extract_bundle(
     # 6. Deduplicate Base64 Clinical Notes across DocumentReference & DiagnosticReport.presentedForm
     notes_by_hash: Dict[str, Dict[str, Any]] = {}
     dedup_note_count = 0
+    presented_form_dr_ids: Set[str] = set()
 
     for res in resources:
         rtype = str(res.get("resourceType") or "")
         rid = str(res.get("id") or "")
         if rtype == "DocumentReference":
+            doc_st = str(res.get("status") or "").strip().lower()
+            doc_ver_st = str(res.get("docStatus") or "").strip().lower()
+            if doc_st == "entered-in-error" or doc_ver_st == "entered-in-error":
+                excluded_counts["DocumentReference(entered-in-error)"] = (
+                    excluded_counts.get("DocumentReference(entered-in-error)", 0) + 1
+                )
+                continue
             n_raw_ts = str(res.get("date") or (res.get("context") or {}).get("period", {}).get("start") or "").strip()
             n_date = _iso_date(n_raw_ts)
             _, n_type = _coding_pair(res.get("type"))
@@ -1260,6 +1346,11 @@ def extract_bundle(
                             "meta_security": list(sec_codes),
                         }
         elif rtype == "DiagnosticReport" and (res.get("presentedForm") or []):
+            dr_pf_st = str(res.get("status") or "").strip().lower()
+            if dr_pf_st in {"entered-in-error", "cancelled"}:
+                continue
+            if rid:
+                presented_form_dr_ids.add(rid)
             n_raw_ts = str(res.get("effectiveDateTime") or res.get("issued") or "").strip()
             n_date = _iso_date(n_raw_ts)
             _, n_type = _coding_pair(res.get("code"))
@@ -1458,12 +1549,31 @@ def extract_bundle(
     for res in resources:
         if res.get("resourceType") != "DiagnosticReport":
             continue
-        result_refs = res.get("result") or []
-        if not result_refs:
-            continue
         rid = str(res.get("id") or "")
         dr_status = str(res.get("status") or "final").strip().lower()
         dr_invalid = dr_status in _INVALIDATED_OBS_STATUSES
+        result_refs = res.get("result") or []
+        dr_conclusion = str(res.get("conclusion") or "").strip()
+        cc_labels: List[str] = []
+        for cc_obj in res.get("conclusionCode") or []:
+            if isinstance(cc_obj, Mapping):
+                _, cc_disp = _coding_pair(cc_obj)
+                if cc_disp:
+                    cc_labels.append(cc_disp)
+        if dr_invalid:
+            for ref_obj in result_refs:
+                if isinstance(ref_obj, Mapping):
+                    oid = _strip_urn(ref_obj.get("reference"))
+                    if oid:
+                        claimed_obs_ids.add(oid)
+            excluded_counts[f"DiagnosticReport({dr_status})"] = (
+                excluded_counts.get(f"DiagnosticReport({dr_status})", 0) + 1
+            )
+            continue
+        if not result_refs and not dr_conclusion and not cc_labels:
+            continue
+        if not result_refs and rid in presented_form_dr_ids and not dr_conclusion and not cc_labels:
+            continue
         code, disp = _coding_pair(res.get("code"))
         p_date_raw = res.get("effectiveDateTime") or res.get("issued")
         p_date = _iso_date(p_date_raw)
@@ -1610,7 +1720,7 @@ def extract_bundle(
                                 "sensitivity": o_sens or "",
                             }
                         )
-            if val_str:
+            if val_str and not child_invalid:
                 annot_bits: List[str] = []
                 child_interp_disp = o_interp or ", ".join(
                     dict.fromkeys(
@@ -1626,7 +1736,15 @@ def extract_bundle(
                 annot_str = f" ({'; '.join(annot_bits)})" if annot_bits else ""
                 child_parts.append(f"{short_label}: {val_str}{annot_str}")
 
-        dr_sens, dr_sens_src = _classify_res_sensitivity(res, code, disp)
+        dr_src_org = resolve_source_org(res)
+        dr_conclusion_combined = " | ".join(
+            p for p in ([dr_conclusion] if dr_conclusion else []) + cc_labels if p
+        )
+        dr_sens, dr_sens_src = _classify_res_sensitivity(
+            res,
+            code,
+            " | ".join(p for p in [disp, dr_conclusion_combined, dr_src_org or ""] if p),
+        )
         if enable_privacy_classification:
             if "SDOH/PRIVACY-SENSITIVE" in child_sensitivities or dr_sens == "SDOH/PRIVACY-SENSITIVE":
                 panel_sens: Optional[str] = "SDOH/PRIVACY-SENSITIVE"
@@ -1641,13 +1759,24 @@ def extract_bundle(
         else:
             panel_sens = None
             panel_sens_src = None
-        joined_children = "; ".join(child_parts) if child_parts else "completed"
+        panel_segments: List[str] = []
+        if child_parts:
+            panel_segments.append("; ".join(child_parts))
+        if dr_conclusion:
+            panel_segments.append(f"Conclusion: {dr_conclusion}")
+        elif cc_labels:
+            panel_segments.append(f"Conclusion: {', '.join(dict.fromkeys(cc_labels))}")
+        joined_children = " | ".join(panel_segments) if panel_segments else "completed"
         panel_prefix = "Survey Panel" if is_survey else "Diagnostic Panel"
         panel_kb = resolve_lab_code(code, disp) if not is_survey else {}
         panel_meta: Dict[str, Any] = {
             "is_abnormal": panel_abn,
-            "all_children_structured": total_child_refs > 0 and structured_child_count == total_child_refs,
+            "all_children_structured": total_child_refs > 0
+            and structured_child_count == total_child_refs
+            and not dr_conclusion,
         }
+        if dr_conclusion:
+            panel_meta["conclusion"] = dr_conclusion
         if panel_interps:
             panel_meta["interpretation"] = ", ".join(dict.fromkeys(panel_interps))
         if len(panel_ranges) == 1:
@@ -1676,7 +1805,7 @@ def extract_bundle(
                 text=f"{panel_prefix} — {disp or code}: {joined_children}",
                 mandatory=False,
                 status=dr_status,
-                source_org=resolve_source_org(res),
+                source_org=dr_src_org,
                 sensitivity=panel_sens,
                 is_routine=is_survey,
                 member_uuids=tuple(dict.fromkeys(member_uuids)),
@@ -1852,10 +1981,15 @@ def extract_bundle(
             or (res.get("performedPeriod") or {}).get("start")
             or (res.get("performedPeriod") or {}).get("end")
         )
-        status = str(res.get("status") or "completed").lower()
+        status = str(res.get("status") or "completed").strip().lower()
+        if status == "entered-in-error":
+            excluded_counts["Procedure(entered-in-error)"] = (
+                excluded_counts.get("Procedure(entered-in-error)", 0) + 1
+            )
+            continue
         is_routine = bool(_ROUTINE_SCREENING_PROCEDURE_PATTERNS.search(disp or ""))
-        proc_sens, proc_sens_src = _classify_res_sensitivity(res, code, disp)
         reasons: List[str] = []
+        proc_ref_cond_ids: List[str] = []
         for rc in res.get("reasonCode") or []:
             _, r_disp = _coding_pair(rc)
             if r_disp:
@@ -1863,24 +1997,41 @@ def extract_bundle(
         for rr in res.get("reasonReference") or []:
             if isinstance(rr, Mapping):
                 c_id = _strip_urn(rr.get("reference"))
+                if c_id:
+                    proc_ref_cond_ids.append(c_id)
                 r_disp = str(rr.get("display") or conds_by_id.get(c_id) or "").strip()
                 if r_disp:
                     reasons.append(r_disp)
-        reason_str = f" (reason: {', '.join(dict.fromkeys(reasons))})" if reasons else ""
+        proc_src_org = resolve_source_org(res)
+        proc_sens_text = " | ".join(p for p in [disp, *reasons, proc_src_org or ""] if p)
+        proc_sens, proc_sens_src = _classify_res_sensitivity(res, code, proc_sens_text)
+        if proc_sens != "SDOH/PRIVACY-SENSITIVE":
+            for cid in proc_ref_cond_ids:
+                c_sens, c_src = cond_sens_by_id.get(cid, (None, None))
+                if c_sens == "SDOH/PRIVACY-SENSITIVE":
+                    proc_sens, proc_sens_src = c_sens, c_src
+                    break
+        proc_quals: List[str] = []
+        if status and status != "completed":
+            proc_quals.append(f"status: {status}")
+        if reasons:
+            proc_quals.append(f"reason: {', '.join(dict.fromkeys(reasons))}")
+        reason_str = f" ({', '.join(proc_quals)})" if proc_quals else ""
+        proc_performed = status not in {"not-done", "stopped", "preparation"}
         items.append(
             ClinicalItem(
                 resource_type="Procedure",
                 resource_uuid=rid,
                 date=p_date,
-                clinical_date=p_date,
-                date_kind="clinical_event" if p_date else "unknown",
+                clinical_date=p_date if proc_performed else None,
+                date_kind="clinical_event" if (p_date and proc_performed) else "unknown",
                 section="procedure_routine" if is_routine else "procedure_major",
                 code=code or disp,
                 display=disp or code or "Procedure",
                 text=f"Procedure: {disp or code}{reason_str}",
                 mandatory=False,
                 status=status,
-                source_org=resolve_source_org(res),
+                source_org=proc_src_org,
                 sensitivity=proc_sens,
                 is_routine=is_routine,
                 metadata={"sensitivity_source": proc_sens_src} if proc_sens_src else {},
@@ -1892,7 +2043,12 @@ def extract_bundle(
         rtype = str(res.get("resourceType") or "")
         rid = str(res.get("id") or "")
         if rtype == "CarePlan":
-            status = str(res.get("status") or "active").lower()
+            status = str(res.get("status") or "active").strip().lower()
+            if status == "entered-in-error":
+                excluded_counts["CarePlan(entered-in-error)"] = (
+                    excluded_counts.get("CarePlan(entered-in-error)", 0) + 1
+                )
+                continue
             cp_date = _iso_date(
                 (res.get("period") or {}).get("start") or res.get("created")
             )
@@ -1908,9 +2064,31 @@ def extract_bundle(
                 _, a_disp = _coding_pair(detail.get("code"))
                 if a_disp:
                     acts.append(a_disp)
-            label = ", ".join(cats) or "Care Plan"
+            cp_addr_ids: List[str] = []
+            cp_addr_texts: List[str] = []
+            for addr in res.get("addresses") or []:
+                if isinstance(addr, Mapping):
+                    cid = _strip_urn(addr.get("reference"))
+                    if cid:
+                        cp_addr_ids.append(cid)
+                    adisp = str(addr.get("display") or conds_by_id.get(cid) or "").strip()
+                    if adisp:
+                        cp_addr_texts.append(adisp)
+            cp_title = str(res.get("title") or "").strip()
+            cp_desc = str(res.get("description") or "").strip()
+            label = ", ".join(cats) or cp_title or "Care Plan"
             act_str = f" — activities: {', '.join(acts[:4])}" if acts else ""
-            cp_sens, cp_sens_src = _classify_res_sensitivity(res, "", label)
+            cp_src_org = resolve_source_org(res)
+            cp_sens_hay = " | ".join(
+                p for p in [label, cp_title, cp_desc, *acts, *cp_addr_texts, cp_src_org or ""] if p
+            )
+            cp_sens, cp_sens_src = _classify_res_sensitivity(res, "", cp_sens_hay)
+            if cp_sens != "SDOH/PRIVACY-SENSITIVE":
+                for cid in cp_addr_ids:
+                    c_sens, c_src = cond_sens_by_id.get(cid, (None, None))
+                    if c_sens == "SDOH/PRIVACY-SENSITIVE":
+                        cp_sens, cp_sens_src = c_sens, c_src
+                        break
             items.append(
                 ClinicalItem(
                     resource_type="CarePlan",
@@ -1925,13 +2103,18 @@ def extract_bundle(
                     mandatory=False,
                     status=status,
                     end_date=end_date,
-                    source_org=resolve_source_org(res),
+                    source_org=cp_src_org,
                     sensitivity=cp_sens,
                     metadata={"sensitivity_source": cp_sens_src} if cp_sens_src else {},
                 )
             )
         elif rtype == "Goal":
-            lifecycle = str(res.get("lifecycleStatus") or "active").lower()
+            lifecycle = str(res.get("lifecycleStatus") or "active").strip().lower()
+            if lifecycle == "entered-in-error":
+                excluded_counts["Goal(entered-in-error)"] = (
+                    excluded_counts.get("Goal(entered-in-error)", 0) + 1
+                )
+                continue
             g_date = _iso_date(res.get("startDate") or res.get("statusDate"))
             due_dates: List[str] = []
             for tgt in res.get("target") or []:
@@ -1950,12 +2133,31 @@ def extract_bundle(
                 for n in (res.get("note") or [])
                 if isinstance(n, Mapping) and str(n.get("text") or "").strip()
             )
+            g_addr_ids: List[str] = []
+            g_addr_texts: List[str] = []
+            for addr in res.get("addresses") or []:
+                if isinstance(addr, Mapping):
+                    cid = _strip_urn(addr.get("reference"))
+                    if cid:
+                        g_addr_ids.append(cid)
+                    adisp = str(addr.get("display") or conds_by_id.get(cid) or "").strip()
+                    if adisp:
+                        g_addr_texts.append(adisp)
             due_str = f", target due: {due_dates[0]}" if due_dates else ""
             note_str = f" — {notes_txt}" if notes_txt else ""
             is_active_goal = lifecycle in {"active", "accepted", "planned", "proposed", "on-hold"}
             src_org = resolve_source_org(res)
             src_suffix = f" [source: {src_org}]" if src_org else ""
-            g_sens, g_sens_src = _classify_res_sensitivity(res, g_code, g_label)
+            g_sens_hay = " | ".join(
+                p for p in [g_label, notes_txt, *g_addr_texts, src_org or ""] if p
+            )
+            g_sens, g_sens_src = _classify_res_sensitivity(res, g_code, g_sens_hay)
+            if g_sens != "SDOH/PRIVACY-SENSITIVE":
+                for cid in g_addr_ids:
+                    c_sens, c_src = cond_sens_by_id.get(cid, (None, None))
+                    if c_sens == "SDOH/PRIVACY-SENSITIVE":
+                        g_sens, g_sens_src = c_sens, c_src
+                        break
             items.append(
                 ClinicalItem(
                     resource_type="Goal",
@@ -2137,6 +2339,11 @@ def extract_bundle(
             appt_end = _iso_date(res.get("end"))
             appt_date = appt_start or appt_end
             appt_status = str(res.get("status") or "booked").strip().lower()
+            if appt_status == "entered-in-error":
+                excluded_counts["Appointment(entered-in-error)"] = (
+                    excluded_counts.get("Appointment(entered-in-error)", 0) + 1
+                )
+                continue
             appt_type_code, appt_type_disp = _coding_pair(res.get("appointmentType") or {})
             svc_types = res.get("serviceType") or []
             svc_code, svc_disp = _coding_pair(svc_types[0] if svc_types else {})
@@ -2180,6 +2387,7 @@ def extract_bundle(
             if appt_sens_src:
                 appt_meta["sensitivity_source"] = appt_sens_src
             is_fulfilled = appt_status == "fulfilled"
+            is_cancelled_appt = appt_status in {"cancelled", "noshow"}
             items.append(
                 ClinicalItem(
                     resource_type="Appointment",
@@ -2189,7 +2397,11 @@ def extract_bundle(
                     date_kind=(
                         "clinical_event"
                         if (is_fulfilled and appt_date)
-                        else ("planned" if appt_date else "unknown")
+                        else (
+                            "administrative"
+                            if (is_cancelled_appt and appt_date)
+                            else ("planned" if appt_date else "unknown")
+                        )
                     ),
                     section="encounter_routine",
                     code=appt_code,

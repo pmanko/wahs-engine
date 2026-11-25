@@ -678,7 +678,10 @@
     "declined",
     "intolerant",
     "switched",
-    "outside"
+    "outside hospital",
+    "outside clinic",
+    "outside urgent care",
+    "outside prescriber"
   ],
   "note_resume_or_continue_cues": [
     "continue ",

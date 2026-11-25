@@ -16,7 +16,9 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from .clinical_graph import extract_clean_user_query
 from .extractors import ClinicalItem, ExtractedChart, extract_bundle
-from .normalizers import classify_sensitivity
+from .normalizers import classify_sensitivity, validate_sharing_posture
+
+_INVALIDATED_POINT_STATUSES = {"entered-in-error", "cancelled", "noshow"}
 
 
 def _ensure_extracted(
@@ -28,10 +30,17 @@ def _ensure_extracted(
 
 
 def _is_privacy_redacted(item: ClinicalItem, sharing_posture: str) -> bool:
-    return (
-        sharing_posture == "external_share"
-        and item.sensitivity == "SDOH/PRIVACY-SENSITIVE"
+    validate_sharing_posture(sharing_posture)
+    if sharing_posture != "external_share":
+        return False
+    if item.sensitivity == "SDOH/PRIVACY-SENSITIVE":
+        return True
+    rechecked = classify_sensitivity(
+        item.code,
+        f"{item.display} {item.text} {item.source_org or ''}",
+        [item.section],
     )
+    return rechecked == "SDOH/PRIVACY-SENSITIVE"
 
 
 def search_chart_entries(
@@ -49,6 +58,7 @@ def search_chart_entries(
     Enforces `sharing_posture`: when `sharing_posture == 'external_share'`, all items
     tagged `SDOH/PRIVACY-SENSITIVE` are withheld and counted in `redacted_for_privacy_count`.
     """
+    validate_sharing_posture(sharing_posture)
     extracted = _ensure_extracted(bundle_or_extracted)
     raw_tokens = [
         tok
@@ -126,6 +136,7 @@ def get_lab_history(
     sharing_posture: str = "patient_self",
 ) -> Dict[str, Any]:
     """Retrieve longitudinal quantitative lab/vital measurements from the uncondensed chart."""
+    validate_sharing_posture(sharing_posture)
     extracted = _ensure_extracted(bundle_or_extracted)
     q_norm = (analyte_or_loinc or "").strip().lower()
     q_tokens = [t for t in re.findall(r"[a-z0-9.\-]+", q_norm) if len(t) >= 2]
@@ -140,6 +151,8 @@ def get_lab_history(
     pts = []
     redacted_count = 0
     for p in extracted.numeric_points:
+        if str(getattr(p, "status", "") or "").strip().lower() in _INVALIDATED_POINT_STATUSES:
+            continue
         if p.resource_uuid in redacted_uuids or (
             sharing_posture == "external_share"
             and classify_sensitivity(p.code, p.concept, [p.category]) == "SDOH/PRIVACY-SENSITIVE"
@@ -202,6 +215,7 @@ def read_clinical_note(
     Enforces `sharing_posture`: withholds any note tagged `SDOH/PRIVACY-SENSITIVE` when
     `sharing_posture == 'external_share'`.
     """
+    validate_sharing_posture(sharing_posture)
     extracted = _ensure_extracted(bundle_or_extracted)
     target_uuid = (resource_uuid or "").strip()
     q_norm = (query or "").strip().lower()
@@ -340,6 +354,7 @@ def retrieve_clinical_note_passages(
     entries within the single authorized patient chart while enforcing
     `sharing_posture` (`external_share` redacts `SDOH/PRIVACY-SENSITIVE` items).
     """
+    validate_sharing_posture(sharing_posture)
     extracted = _ensure_extracted(bundle_or_extracted)
     clean_query = extract_clean_user_query(query) or query
     q_tokens = _tokenize_for_bm25(clean_query)

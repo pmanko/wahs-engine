@@ -204,11 +204,17 @@ def _fold_encounters(encounters: Sequence[ClinicalItem], *, keep_latest_individu
 
     Unfulfilled future/pre-visit Appointments remain unpacked so upcoming visit details stay intact.
     """
+    _active_appt_statuses = {"booked", "planned", "pending", "proposed", "waitlist", "arrived", "checked-in"}
     unfulfilled_appts = [
-        e for e in encounters if e.resource_type == "Appointment" and (e.status or "").lower() != "fulfilled"
+        e
+        for e in encounters
+        if e.resource_type == "Appointment" and (e.status or "").lower() in _active_appt_statuses
     ]
     completed_encounters = [
-        e for e in encounters if not (e.resource_type == "Appointment" and (e.status or "").lower() != "fulfilled")
+        e
+        for e in encounters
+        if not (e.resource_type == "Appointment" and (e.status or "").lower() in _active_appt_statuses)
+        and (e.status or "").lower() not in {"entered-in-error", "cancelled", "noshow"}
     ]
     ordered_desc = sorted(completed_encounters, key=lambda x: _date_sort_key(x.date), reverse=True)
     kept = sorted(unfulfilled_appts + list(ordered_desc[:keep_latest_individual]), key=lambda x: _date_sort_key(x.date), reverse=True)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import logging
@@ -150,10 +151,14 @@ class _StreamingThinkStripper:
 
 
 def clean_model_text(content: str) -> str:
-    if "<think>" in content and "</think>" in content:
+    if "<think>" in content:
         content = re.sub(r"<think>.*?</think>\s*", "", content, flags=re.DOTALL)
-    if "<|channel>thought" in content and "<channel|>" in content:
+        if "<think>" in content:
+            content = re.sub(r"<think>.*$", "", content, flags=re.DOTALL)
+    if "<|channel>thought" in content:
         content = re.sub(r"<\|channel>thought.*?<channel\|>\s*", "", content, flags=re.DOTALL)
+        if "<|channel>thought" in content:
+            content = re.sub(r"<\|channel>thought.*$", "", content, flags=re.DOTALL)
     return content.strip()
 
 
@@ -387,34 +392,55 @@ def _annotate_tool_results_with_citations(
                     pt["citation_tag"] = f"[{c_idx}]"
 
 
+def _safe_int(
+    raw: Any,
+    default: int,
+    *,
+    minimum: Optional[int] = None,
+    maximum: Optional[int] = None,
+) -> int:
+    val = default
+    if raw is not None and not isinstance(raw, bool):
+        try:
+            val = int(raw)
+        except (TypeError, ValueError):
+            val = default
+    if minimum is not None:
+        val = max(minimum, val)
+    if maximum is not None:
+        val = min(maximum, val)
+    return val
+
+
 def _execute_local_overflow_tool(
     ctx: AssembledWahsContext,
     fn_name: str,
     fn_args: Mapping[str, Any],
     sharing_posture: str = "patient_self",
 ) -> Tuple[str, int]:
+    safe_args: Mapping[str, Any] = fn_args if isinstance(fn_args, Mapping) else {}
     if fn_name == "search_chart_entries":
         res = search_chart_entries(
             ctx.extracted,
-            query=str(fn_args.get("query") or ""),
-            section=fn_args.get("section"),
+            query=str(safe_args.get("query") or ""),
+            section=str(safe_args["section"]) if safe_args.get("section") is not None else None,
             sharing_posture=sharing_posture,
-            limit=int(fn_args.get("limit") or 10),
+            limit=_safe_int(safe_args.get("limit"), 10, minimum=1, maximum=100),
         )
         _annotate_tool_results_with_citations(ctx, res, default_resource_type="Resource")
         return json.dumps(res, default=str), len(res.get("results") or [])
     if fn_name == "get_lab_history":
         res = get_lab_history(
             ctx.extracted,
-            str(fn_args.get("analyte") or ""),
-            limit=int(fn_args.get("limit") or 20),
+            str(safe_args.get("analyte") or ""),
+            limit=_safe_int(safe_args.get("limit"), 20, minimum=1, maximum=200),
             sharing_posture=sharing_posture,
         )
         _annotate_tool_results_with_citations(ctx, res, default_resource_type="Observation")
         return json.dumps(res, default=str), len(res.get("results") or [])
     if fn_name == "read_clinical_note":
-        key = str(fn_args.get("note_id_or_query") or "")
-        offset = max(0, int(fn_args.get("offset") or 0))
+        key = str(safe_args.get("note_id_or_query") or "")
+        offset = _safe_int(safe_args.get("offset"), 0, minimum=0)
         res = read_clinical_note(
             ctx.extracted,
             resource_uuid=key,
@@ -428,9 +454,10 @@ def _execute_local_overflow_tool(
                 sharing_posture=sharing_posture,
             )
         results_list = [r for r in (res.get("results") or []) if isinstance(r, dict)]
-        raw_max_chars = fn_args.get("max_chars")
+        raw_max_chars = safe_args.get("max_chars")
         if raw_max_chars is not None:
-            max_chars = max(256, min(int(raw_max_chars), 24000))
+            default_mc = 12000 if (matched_by_uuid and len(results_list) == 1) else 3200
+            max_chars = _safe_int(raw_max_chars, default_mc, minimum=256, maximum=24000)
         else:
             max_chars = 12000 if (matched_by_uuid and len(results_list) == 1) else 3200
         # Drop duplicate full_text field and paginate via offset/max_chars when needed
@@ -844,8 +871,20 @@ def _build_southbound_payload(
         "stream": stream,
     }
     _apply_provider_southbound_params(payload, spec)
+    if req.top_p is not None:
+        payload["top_p"] = req.top_p
+    if req.stop is not None:
+        payload["stop"] = req.stop
+    if req.presence_penalty is not None:
+        payload["presence_penalty"] = req.presence_penalty
+    if req.frequency_penalty is not None:
+        payload["frequency_penalty"] = req.frequency_penalty
     if req.seed is not None:
         payload["seed"] = req.seed
+    if req.user is not None:
+        payload["user"] = req.user
+    if stream and isinstance(req.stream_options, Mapping) and req.stream_options:
+        payload["stream_options"] = dict(req.stream_options)
     if tools is not None:
         payload["tools"] = list(tools)
         payload["tool_choice"] = "auto"
@@ -929,9 +968,10 @@ def _execute_tool_call_batch(
             )
             continue
         try:
-            fn_args = json.loads(fn.get("arguments") or "{}")
+            parsed_args = json.loads(fn.get("arguments") or "{}")
         except Exception:
-            fn_args = {}
+            parsed_args = {}
+        fn_args: Dict[str, Any] = dict(parsed_args) if isinstance(parsed_args, Mapping) else {}
         tool_out, rec_count = _execute_local_overflow_tool(
             ctx, fn_name, fn_args, sharing_posture=options.sharing_posture
         )
@@ -965,6 +1005,19 @@ class SouthboundOpenAIClient:
     ) -> None:
         self.settings = settings
         self._external_client = http_client
+        self._shared_client: Optional[httpx.AsyncClient] = None
+
+    def _get_http_client(self) -> httpx.AsyncClient:
+        if self._external_client is not None:
+            return self._external_client
+        if self._shared_client is None or self._shared_client.is_closed:
+            self._shared_client = httpx.AsyncClient(timeout=self.settings.llm_timeout_seconds)
+        return self._shared_client
+
+    async def aclose(self) -> None:
+        if self._shared_client is not None and not self._shared_client.is_closed:
+            await self._shared_client.aclose()
+        self._shared_client = None
 
     def _headers(self) -> Dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -980,10 +1033,13 @@ class SouthboundOpenAIClient:
         ]
         seen = {m["id"] for m in models_out}
 
-        owns_client = self._external_client is None
-        client = self._external_client or httpx.AsyncClient(timeout=10.0)
+        client = self._get_http_client()
         try:
-            resp = await client.get(self.settings.upstream_models_url, headers=self._headers())
+            resp = await client.get(
+                self.settings.upstream_models_url,
+                headers=self._headers(),
+                timeout=10.0,
+            )
             if resp.status_code == 200:
                 data = resp.json()
                 for item in (data.get("data") or []) if isinstance(data, Mapping) else []:
@@ -992,9 +1048,6 @@ class SouthboundOpenAIClient:
                         models_out.append(dict(item))
         except Exception:
             pass
-        finally:
-            if owns_client:
-                await client.aclose()
 
         return {"object": "list", "data": models_out}
 
@@ -1028,7 +1081,8 @@ class SouthboundOpenAIClient:
             temporal_digest_meta,
             exact_prompt_tokens,
             history_trimmed_turns,
-        ) = prepare_upstream_messages(
+        ) = await asyncio.to_thread(
+            prepare_upstream_messages,
             ctx=ctx,
             req=req,
             options=options,
@@ -1067,8 +1121,7 @@ class SouthboundOpenAIClient:
                 predicted_n_total += int(t_obj.get("predicted_n") or 0)
                 cache_n_total += int(t_obj.get("cache_n") or 0)
 
-        owns_client = self._external_client is None
-        client = self._external_client or httpx.AsyncClient(timeout=self.settings.llm_timeout_seconds)
+        client = self._get_http_client()
         llm_t0 = time.perf_counter()
         try:
             resp = await client.post(
@@ -1076,60 +1129,81 @@ class SouthboundOpenAIClient:
                 headers=self._headers(),
                 json=payload,
             )
-            resp.raise_for_status()
-            body = resp.json()
-            if isinstance(body, Mapping):
-                _accumulate_timings(body)
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Southbound LLM request failed: {exc}",
+            ) from exc
+        if resp.status_code >= 400:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Southbound LLM returned HTTP {resp.status_code}.",
+            )
+        body = resp.json()
+        if isinstance(body, Mapping):
+            _accumulate_timings(body)
 
-            max_tool_rounds = 3 if options.retrieval_strategy == "dynamic_fhir_tools" else 1
-            followup_msgs = list(messages)
-            for round_idx in range(max_tool_rounds):
-                choice0 = ((body.get("choices") or [{}])[0]) if isinstance(body, Mapping) else {}
-                msg0 = choice0.get("message") if isinstance(choice0, Mapping) else {}
-                tool_calls = (msg0.get("tool_calls") or []) if isinstance(msg0, Mapping) else []
-                if not tool_calls or not allow_tools:
-                    break
-                normalized_calls = _normalize_tool_calls_with_ids(
-                    tool_calls, round_idx=round_idx
-                )
-                assistant_msg = dict(msg0)
-                assistant_msg["tool_calls"] = normalized_calls
-                followup_msgs.append(assistant_msg)
-                tool_msgs, rec_delta = _execute_tool_call_batch(
-                    ctx, options, normalized_calls, round_idx=round_idx, tool_calls_log=tool_calls_log
-                )
-                overflow_recovered += rec_delta
-                followup_msgs.extend(tool_msgs)
-                next_tools = _OVERFLOW_TOOLS_SPEC if round_idx + 1 < max_tool_rounds else None
-                _, extra_trimmed = _trim_history_to_fit(
-                    followup_msgs,
-                    tools=next_tools,
-                    tokenizer_family=spec.tokenizer_family,
-                    context_window=spec.context_window,
-                    max_output_tokens=effective_max_tokens,
-                )
-                history_trimmed_turns += extra_trimmed
-                next_payload = _build_southbound_payload(
-                    upstream_model=upstream_model,
-                    messages=followup_msgs,
-                    req=req,
-                    spec=spec,
-                    effective_max_tokens=effective_max_tokens,
-                    stream=False,
-                    tools=next_tools,
-                )
+        max_tool_rounds = 3 if options.retrieval_strategy == "dynamic_fhir_tools" else 1
+        followup_msgs = list(messages)
+        for round_idx in range(max_tool_rounds):
+            choice0 = ((body.get("choices") or [{}])[0]) if isinstance(body, Mapping) else {}
+            msg0 = choice0.get("message") if isinstance(choice0, Mapping) else {}
+            tool_calls = (msg0.get("tool_calls") or []) if isinstance(msg0, Mapping) else []
+            if not tool_calls or not allow_tools:
+                break
+            normalized_calls = _normalize_tool_calls_with_ids(
+                tool_calls, round_idx=round_idx
+            )
+            assistant_msg = dict(msg0)
+            assistant_msg["tool_calls"] = normalized_calls
+            followup_msgs.append(assistant_msg)
+            tool_msgs, rec_delta = await asyncio.to_thread(
+                _execute_tool_call_batch,
+                ctx,
+                options,
+                normalized_calls,
+                round_idx=round_idx,
+                tool_calls_log=tool_calls_log,
+            )
+            overflow_recovered += rec_delta
+            followup_msgs.extend(tool_msgs)
+            next_tools = _OVERFLOW_TOOLS_SPEC if round_idx + 1 < max_tool_rounds else None
+            _, extra_trimmed = _trim_history_to_fit(
+                followup_msgs,
+                tools=next_tools,
+                tokenizer_family=spec.tokenizer_family,
+                context_window=spec.context_window,
+                max_output_tokens=effective_max_tokens,
+            )
+            history_trimmed_turns += extra_trimmed
+            next_payload = _build_southbound_payload(
+                upstream_model=upstream_model,
+                messages=followup_msgs,
+                req=req,
+                spec=spec,
+                effective_max_tokens=effective_max_tokens,
+                stream=False,
+                tools=next_tools,
+            )
+            try:
                 resp_next = await client.post(
                     self.settings.upstream_chat_completions_url,
                     headers=self._headers(),
                     json=next_payload,
                 )
-                resp_next.raise_for_status()
-                body = resp_next.json()
-                if isinstance(body, Mapping):
-                    _accumulate_timings(body)
-        finally:
-            if owns_client:
-                await client.aclose()
+            except httpx.HTTPError as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Southbound LLM follow-up request failed: {exc}",
+                ) from exc
+            if resp_next.status_code >= 400:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Southbound LLM follow-up returned HTTP {resp_next.status_code}.",
+                )
+            body = resp_next.json()
+            if isinstance(body, Mapping):
+                _accumulate_timings(body)
 
         upstream_llm_ms = round((time.perf_counter() - llm_t0) * 1000.0, 2)
         total_latency_ms = round(engine_prep_ms + upstream_llm_ms, 2)
@@ -1205,7 +1279,7 @@ class SouthboundOpenAIClient:
             "x_wahs": x_wahs,
         }
 
-    async def stream(
+    async def start_stream(
         self,
         *,
         ctx: AssembledWahsContext,
@@ -1215,6 +1289,7 @@ class SouthboundOpenAIClient:
     ) -> AsyncIterator[str]:
         ctx = copy.copy(ctx)
         ctx.citation_map = copy.deepcopy(ctx.citation_map)
+        emit_stream_events = bool(options.emit_stream_events)
 
         allow_tools, _, _ = _should_allow_overflow_tools(ctx, options)
         if allow_tools and options.retrieval_strategy == "dynamic_fhir_tools":
@@ -1224,44 +1299,74 @@ class SouthboundOpenAIClient:
                 options=options,
                 assemble_ms=assemble_ms,
             )
-            completion_id = str(completed.get("id") or f"chatcmpl-wahs-{uuid.uuid4().hex[:12]}")
-            created = int(completed.get("created") or time.time())
-            requested_model = str(
-                completed.get("model") or (req.model or self.settings.default_model).strip()
-            )
-            choice0 = ((completed.get("choices") or [{}])[0])
-            content_text = str((choice0.get("message") or {}).get("content") or "")
-            tool_finish_reason = str(choice0.get("finish_reason") or "stop")
-            role_chunk = {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": requested_model,
-                "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
-            }
-            yield f"data: {json.dumps(role_chunk)}\n\n"
-            if content_text:
-                content_chunk = {
+
+            async def _dynamic_tools_sse() -> AsyncIterator[str]:
+                completion_id = str(completed.get("id") or f"chatcmpl-wahs-{uuid.uuid4().hex[:12]}")
+                created = int(completed.get("created") or time.time())
+                requested_model = str(
+                    completed.get("model") or (req.model or self.settings.default_model).strip()
+                )
+                choice0 = ((completed.get("choices") or [{}])[0])
+                content_text = str((choice0.get("message") or {}).get("content") or "")
+                tool_finish_reason = str(choice0.get("finish_reason") or "stop")
+                role_chunk: Dict[str, Any] = {
                     "id": completion_id,
                     "object": "chat.completion.chunk",
                     "created": created,
                     "model": requested_model,
-                    "choices": [{"index": 0, "delta": {"content": content_text}, "finish_reason": None}],
+                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
                 }
-                yield f"data: {json.dumps(content_chunk)}\n\n"
-            final_chunk: Dict[str, Any] = {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": requested_model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": tool_finish_reason}],
-                "x_wahs": completed["x_wahs"],
-            }
-            if completed.get("usage"):
-                final_chunk["usage"] = completed["usage"]
-            yield f"data: {json.dumps(final_chunk)}\n\n"
-            yield "data: [DONE]\n\n"
-            return
+                if emit_stream_events:
+                    role_chunk["x_wahs_stream"] = {
+                        "event": "context_ready",
+                        "prefix_cache_key_hash": ctx.prefix_cache_key_hash,
+                        "citation_map": ctx.citation_map,
+                    }
+                yield f"data: {json.dumps(role_chunk)}\n\n"
+                if emit_stream_events and completed["x_wahs"].get("tool_calls"):
+                    tool_names = [
+                        str(tc.get("name") or "chart_lookup")
+                        for tc in (completed["x_wahs"].get("tool_calls") or [])
+                        if isinstance(tc, Mapping)
+                    ]
+                    tool_event_chunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": requested_model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
+                        "x_wahs_stream": {
+                            "event": "tool_round",
+                            "round": 1,
+                            "tools": tool_names,
+                            "reset_content": False,
+                            "citation_map": ctx.citation_map,
+                        },
+                    }
+                    yield f"data: {json.dumps(tool_event_chunk)}\n\n"
+                if content_text:
+                    content_chunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": requested_model,
+                        "choices": [{"index": 0, "delta": {"content": content_text}, "finish_reason": None}],
+                    }
+                    yield f"data: {json.dumps(content_chunk)}\n\n"
+                final_chunk: Dict[str, Any] = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": requested_model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": tool_finish_reason}],
+                    "x_wahs": completed["x_wahs"],
+                }
+                if completed.get("usage"):
+                    final_chunk["usage"] = completed["usage"]
+                yield f"data: {json.dumps(final_chunk)}\n\n"
+                yield "data: [DONE]\n\n"
+
+            return _dynamic_tools_sse()
 
         prep_t0 = time.perf_counter()
         requested_model = (req.model or self.settings.default_model).strip()
@@ -1281,7 +1386,8 @@ class SouthboundOpenAIClient:
             temporal_digest_meta,
             exact_prompt_tokens,
             history_trimmed_turns,
-        ) = prepare_upstream_messages(
+        ) = await asyncio.to_thread(
+            prepare_upstream_messages,
             ctx=ctx,
             req=req,
             options=options,
@@ -1290,62 +1396,66 @@ class SouthboundOpenAIClient:
             tools=tools_spec,
         )
         engine_prep_ms = round(assemble_ms + (time.perf_counter() - prep_t0) * 1000.0, 2)
-        completion_id = f"chatcmpl-wahs-{uuid.uuid4().hex[:12]}"
-        created = int(time.time())
-
-        # Standard initial assistant role chunk (`@ai-sdk/openai-compatible` compatible)
-        role_chunk = {
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": requested_model,
-            "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
-            "x_wahs_stream": {
-                "event": "context_ready",
-                "prefix_cache_key_hash": ctx.prefix_cache_key_hash,
-                "citation_map": ctx.citation_map,
-            },
-        }
-        yield f"data: {json.dumps(role_chunk)}\n\n"
-
-        owns_client = self._external_client is None
-        client = self._external_client or httpx.AsyncClient(timeout=self.settings.llm_timeout_seconds)
-        llm_t0 = time.perf_counter()
-        upstream_finish_reason = "stop"
-        upstream_usage: Dict[str, Any] = {}
-        tool_calls_log: List[Dict[str, Any]] = []
-        followup_msgs = list(messages)
         max_tool_rounds = 2 if allow_tools else 0
-        llm_rounds = 0
+        current_tools0 = tools_spec if max_tool_rounds > 0 else None
+        payload0 = _build_southbound_payload(
+            upstream_model=upstream_model,
+            messages=messages,
+            req=req,
+            spec=spec,
+            effective_max_tokens=effective_max_tokens,
+            stream=True,
+            tools=current_tools0,
+        )
+
+        client = self._get_http_client()
+        llm_t0 = time.perf_counter()
+        req0 = client.build_request(
+            "POST",
+            self.settings.upstream_chat_completions_url,
+            headers=self._headers(),
+            json=payload0,
+        )
         try:
-            for round_idx in range(max_tool_rounds + 1):
-                current_tools = tools_spec if round_idx < max_tool_rounds else None
-                if round_idx > 0:
-                    _, extra_trimmed = _trim_history_to_fit(
-                        followup_msgs,
-                        tools=current_tools,
-                        tokenizer_family=spec.tokenizer_family,
-                        context_window=spec.context_window,
-                        max_output_tokens=effective_max_tokens,
-                    )
-                    history_trimmed_turns += extra_trimmed
-                payload = _build_southbound_payload(
-                    upstream_model=upstream_model,
-                    messages=followup_msgs,
-                    req=req,
-                    spec=spec,
-                    effective_max_tokens=effective_max_tokens,
-                    stream=True,
-                    tools=current_tools,
-                )
-                stripper = _StreamingThinkStripper()
-                tool_calls_by_idx: Dict[int, Dict[str, Any]] = {}
-                round_raw_parts: List[str] = []
-                # Buffer only a short initial preamble while tools are enabled so zero-tool answers stream live.
-                streaming_live = current_tools is None
-                buffered_pieces: List[str] = []
-                buffered_chars = 0
-                emitted_in_round = False
+            resp0 = await client.send(req0, stream=True)
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Southbound LLM stream request failed: {exc}",
+            ) from exc
+        if resp0.status_code >= 400:
+            await resp0.aclose()
+            raise HTTPException(
+                status_code=502,
+                detail=f"Southbound LLM stream returned HTTP {resp0.status_code}.",
+            )
+
+        async def _sse_generator() -> AsyncIterator[str]:
+            nonlocal overflow_recovered, history_trimmed_turns
+            completion_id = f"chatcmpl-wahs-{uuid.uuid4().hex[:12]}"
+            created = int(time.time())
+            upstream_finish_reason = "stop"
+            upstream_usage: Dict[str, Any] = {}
+            tool_calls_log: List[Dict[str, Any]] = []
+            followup_msgs = list(messages)
+            llm_rounds = 0
+            resp0_open = True
+
+            try:
+                role_chunk: Dict[str, Any] = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": requested_model,
+                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
+                }
+                if emit_stream_events:
+                    role_chunk["x_wahs_stream"] = {
+                        "event": "context_ready",
+                        "prefix_cache_key_hash": ctx.prefix_cache_key_hash,
+                        "citation_map": ctx.citation_map,
+                    }
+                yield f"data: {json.dumps(role_chunk)}\n\n"
 
                 def _content_sse(text_piece: str) -> str:
                     out_chunk = {
@@ -1363,153 +1473,210 @@ class SouthboundOpenAIClient:
                     }
                     return f"data: {json.dumps(out_chunk)}\n\n"
 
-                llm_rounds += 1
-                async with client.stream(
-                    "POST",
-                    self.settings.upstream_chat_completions_url,
-                    headers=self._headers(),
-                    json=payload,
-                ) as resp:
-                    resp.raise_for_status()
-                    async for raw_line in resp.aiter_lines():
-                        line = raw_line.strip()
-                        if not line or not line.startswith("data:"):
-                            continue
-                        data_str = line[5:].strip()
-                        if data_str == "[DONE]":
-                            break
-                        try:
-                            chunk_obj = json.loads(data_str)
-                        except json.JSONDecodeError:
-                            continue
-                        if isinstance(chunk_obj, Mapping) and isinstance(chunk_obj.get("usage"), Mapping):
-                            upstream_usage = dict(chunk_obj["usage"])
-                        choice = (
-                            ((chunk_obj.get("choices") or [{}])[0])
-                            if isinstance(chunk_obj, Mapping)
-                            else {}
-                        )
-                        if isinstance(choice, Mapping) and choice.get("finish_reason"):
-                            upstream_finish_reason = str(choice["finish_reason"])
-                        delta = (choice.get("delta") or {}) if isinstance(choice, Mapping) else {}
-                        tc_deltas = delta.get("tool_calls") if isinstance(delta, Mapping) else None
-                        if isinstance(tc_deltas, list):
-                            _accumulate_stream_tool_calls(tool_calls_by_idx, tc_deltas)
-                            if tool_calls_by_idx:
-                                streaming_live = False
-                        raw_content = str(delta.get("content") or "") if isinstance(delta, Mapping) else ""
-                        if raw_content:
-                            round_raw_parts.append(raw_content)
-                        piece = stripper.feed(raw_content)
-                        if piece and not tool_calls_by_idx:
-                            if streaming_live:
-                                yield _content_sse(piece)
-                                emitted_in_round = True
-                            else:
-                                buffered_pieces.append(piece)
-                                buffered_chars += len(piece)
-                                if buffered_chars >= PRE_TOOL_LOOKAHEAD_CHARS or "\n" in piece:
-                                    streaming_live = True
-                                    for bp in buffered_pieces:
-                                        yield _content_sse(bp)
-                                    buffered_pieces.clear()
-                                    buffered_chars = 0
-                                    emitted_in_round = True
+                for round_idx in range(max_tool_rounds + 1):
+                    current_tools = tools_spec if round_idx < max_tool_rounds else None
+                    stripper = _StreamingThinkStripper()
+                    tool_calls_by_idx: Dict[int, Dict[str, Any]] = {}
+                    round_raw_parts: List[str] = []
+                    streaming_live = current_tools is None
+                    buffered_pieces: List[str] = []
+                    buffered_chars = 0
+                    emitted_in_round = False
+                    llm_rounds += 1
 
-                tail = stripper.flush()
-                if tail and not tool_calls_by_idx:
-                    if streaming_live:
-                        yield _content_sse(tail)
-                        emitted_in_round = True
+                    if round_idx == 0:
+                        resp = resp0
                     else:
-                        buffered_pieces.append(tail)
+                        _, extra_trimmed = _trim_history_to_fit(
+                            followup_msgs,
+                            tools=current_tools,
+                            tokenizer_family=spec.tokenizer_family,
+                            context_window=spec.context_window,
+                            max_output_tokens=effective_max_tokens,
+                        )
+                        history_trimmed_turns += extra_trimmed
+                        payload = _build_southbound_payload(
+                            upstream_model=upstream_model,
+                            messages=followup_msgs,
+                            req=req,
+                            spec=spec,
+                            effective_max_tokens=effective_max_tokens,
+                            stream=True,
+                            tools=current_tools,
+                        )
+                        next_req = client.build_request(
+                            "POST",
+                            self.settings.upstream_chat_completions_url,
+                            headers=self._headers(),
+                            json=payload,
+                        )
+                        resp = await client.send(next_req, stream=True)
 
-                if tool_calls_by_idx and round_idx < max_tool_rounds:
-                    assembled_calls = _normalize_tool_calls_with_ids(
-                        [tool_calls_by_idx[k] for k in sorted(tool_calls_by_idx)],
-                        round_idx=round_idx,
-                    )
-                    followup_msgs.append(
-                        {
-                            "role": "assistant",
-                            "content": "".join(round_raw_parts) or None,
-                            "tool_calls": assembled_calls,
-                        }
-                    )
-                    tool_msgs, rec_delta = _execute_tool_call_batch(
-                        ctx,
-                        options,
-                        assembled_calls,
-                        round_idx=round_idx,
-                        tool_calls_log=tool_calls_log,
-                    )
-                    overflow_recovered += rec_delta
-                    followup_msgs.extend(tool_msgs)
-                    tool_names = [
-                        str((tc.get("function") or {}).get("name") or "chart_lookup")
-                        for tc in assembled_calls
-                    ]
-                    tool_event_chunk = {
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": requested_model,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
-                        "x_wahs_stream": {
-                            "event": "tool_round",
-                            "round": round_idx + 1,
-                            "tools": tool_names,
-                            "reset_content": bool(emitted_in_round),
-                            "citation_map": ctx.citation_map,
-                        },
-                    }
-                    yield f"data: {json.dumps(tool_event_chunk)}\n\n"
-                    continue
-                for buffered_piece in buffered_pieces:
-                    yield _content_sse(buffered_piece)
-                break
-        finally:
-            if owns_client:
-                await client.aclose()
+                    try:
+                        resp.raise_for_status()
+                        async for raw_line in resp.aiter_lines():
+                            line = raw_line.strip()
+                            if not line or not line.startswith("data:"):
+                                continue
+                            data_str = line[5:].strip()
+                            if data_str == "[DONE]":
+                                break
+                            try:
+                                chunk_obj = json.loads(data_str)
+                            except json.JSONDecodeError:
+                                continue
+                            if isinstance(chunk_obj, Mapping) and isinstance(chunk_obj.get("usage"), Mapping):
+                                upstream_usage = dict(chunk_obj["usage"])
+                            choice = (
+                                ((chunk_obj.get("choices") or [{}])[0])
+                                if isinstance(chunk_obj, Mapping)
+                                else {}
+                            )
+                            if isinstance(choice, Mapping) and choice.get("finish_reason"):
+                                upstream_finish_reason = str(choice["finish_reason"])
+                            delta = (choice.get("delta") or {}) if isinstance(choice, Mapping) else {}
+                            tc_deltas = delta.get("tool_calls") if isinstance(delta, Mapping) else None
+                            if isinstance(tc_deltas, list):
+                                _accumulate_stream_tool_calls(tool_calls_by_idx, tc_deltas)
+                                if tool_calls_by_idx:
+                                    streaming_live = False
+                            raw_content = str(delta.get("content") or "") if isinstance(delta, Mapping) else ""
+                            if raw_content:
+                                round_raw_parts.append(raw_content)
+                            piece = stripper.feed(raw_content)
+                            if piece and not tool_calls_by_idx:
+                                if streaming_live:
+                                    yield _content_sse(piece)
+                                    emitted_in_round = True
+                                else:
+                                    buffered_pieces.append(piece)
+                                    buffered_chars += len(piece)
+                                    if emit_stream_events and (
+                                        buffered_chars >= PRE_TOOL_LOOKAHEAD_CHARS or "\n" in piece
+                                    ):
+                                        streaming_live = True
+                                        for bp in buffered_pieces:
+                                            yield _content_sse(bp)
+                                        buffered_pieces.clear()
+                                        buffered_chars = 0
+                                        emitted_in_round = True
+                    finally:
+                        await resp.aclose()
+                        if round_idx == 0:
+                            resp0_open = False
 
-        upstream_llm_ms = round((time.perf_counter() - llm_t0) * 1000.0, 2)
-        upstream_prompt_tokens = int(upstream_usage.get("prompt_tokens") or 0)
-        suspected_truncation = _compute_suspected_truncation(
-            llm_rounds=max(1, llm_rounds),
-            upstream_prompt_tokens=upstream_prompt_tokens,
-            exact_prompt_tokens=exact_prompt_tokens,
+                    tail = stripper.flush()
+                    if tail and not tool_calls_by_idx:
+                        if streaming_live:
+                            yield _content_sse(tail)
+                            emitted_in_round = True
+                        else:
+                            buffered_pieces.append(tail)
+
+                    if tool_calls_by_idx and round_idx < max_tool_rounds:
+                        assembled_calls = _normalize_tool_calls_with_ids(
+                            [tool_calls_by_idx[k] for k in sorted(tool_calls_by_idx)],
+                            round_idx=round_idx,
+                        )
+                        followup_msgs.append(
+                            {
+                                "role": "assistant",
+                                "content": "".join(round_raw_parts) or None,
+                                "tool_calls": assembled_calls,
+                            }
+                        )
+                        tool_msgs, rec_delta = await asyncio.to_thread(
+                            _execute_tool_call_batch,
+                            ctx,
+                            options,
+                            assembled_calls,
+                            round_idx=round_idx,
+                            tool_calls_log=tool_calls_log,
+                        )
+                        overflow_recovered += rec_delta
+                        followup_msgs.extend(tool_msgs)
+                        if emit_stream_events:
+                            tool_names = [
+                                str((tc.get("function") or {}).get("name") or "chart_lookup")
+                                for tc in assembled_calls
+                            ]
+                            tool_event_chunk = {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": requested_model,
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
+                                "x_wahs_stream": {
+                                    "event": "tool_round",
+                                    "round": round_idx + 1,
+                                    "tools": tool_names,
+                                    "reset_content": bool(emitted_in_round),
+                                    "citation_map": ctx.citation_map,
+                                },
+                            }
+                            yield f"data: {json.dumps(tool_event_chunk)}\n\n"
+                        continue
+                    for buffered_piece in buffered_pieces:
+                        yield _content_sse(buffered_piece)
+                    break
+            finally:
+                if resp0_open:
+                    await resp0.aclose()
+
+            upstream_llm_ms = round((time.perf_counter() - llm_t0) * 1000.0, 2)
+            upstream_prompt_tokens = int(upstream_usage.get("prompt_tokens") or 0)
+            suspected_truncation = _compute_suspected_truncation(
+                llm_rounds=max(1, llm_rounds),
+                upstream_prompt_tokens=upstream_prompt_tokens,
+                exact_prompt_tokens=exact_prompt_tokens,
+            )
+            x_wahs = build_x_wahs_envelope(
+                ctx=ctx,
+                requested_model=requested_model,
+                upstream_model=upstream_model,
+                options=options,
+                engine_version=self.settings.engine_version,
+                overflow_recovered=overflow_recovered,
+                kb_meta=kb_meta,
+                note_rag_meta=note_rag_meta,
+                temporal_digest_meta=temporal_digest_meta,
+                tool_calls_log=tool_calls_log if (allow_tools or tool_calls_log) else None,
+                timings={
+                    "engine_prep_ms": engine_prep_ms,
+                    "upstream_llm_ms": upstream_llm_ms,
+                    "total_latency_ms": round(engine_prep_ms + upstream_llm_ms, 2),
+                    "llm_rounds": max(1, llm_rounds),
+                },
+                exact_prompt_tokens=exact_prompt_tokens,
+                upstream_prompt_tokens=upstream_prompt_tokens,
+                suspected_upstream_truncation=suspected_truncation,
+                history_trimmed_turns=history_trimmed_turns,
+            )
+            final_chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": requested_model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": upstream_finish_reason}],
+                "x_wahs": x_wahs,
+            }
+            if upstream_usage:
+                final_chunk["usage"] = upstream_usage
+            yield f"data: {json.dumps(final_chunk)}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return _sse_generator()
+
+    async def stream(
+        self,
+        *,
+        ctx: AssembledWahsContext,
+        req: OpenAIChatCompletionRequest,
+        options: WahsRequestOptions,
+        assemble_ms: float = 0.0,
+    ) -> AsyncIterator[str]:
+        sse_iter = await self.start_stream(
+            ctx=ctx, req=req, options=options, assemble_ms=assemble_ms
         )
-        x_wahs = build_x_wahs_envelope(
-            ctx=ctx,
-            requested_model=requested_model,
-            upstream_model=upstream_model,
-            options=options,
-            engine_version=self.settings.engine_version,
-            overflow_recovered=overflow_recovered,
-            kb_meta=kb_meta,
-            note_rag_meta=note_rag_meta,
-            temporal_digest_meta=temporal_digest_meta,
-            tool_calls_log=tool_calls_log if (allow_tools or tool_calls_log) else None,
-            timings={
-                "engine_prep_ms": engine_prep_ms,
-                "upstream_llm_ms": upstream_llm_ms,
-                "total_latency_ms": round(engine_prep_ms + upstream_llm_ms, 2),
-                "llm_rounds": max(1, llm_rounds),
-            },
-            exact_prompt_tokens=exact_prompt_tokens,
-            upstream_prompt_tokens=upstream_prompt_tokens,
-            suspected_upstream_truncation=suspected_truncation,
-            history_trimmed_turns=history_trimmed_turns,
-        )
-        final_chunk = {
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": requested_model,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": upstream_finish_reason}],
-            "x_wahs": x_wahs,
-        }
-        if upstream_usage:
-            final_chunk["usage"] = upstream_usage
-        yield f"data: {json.dumps(final_chunk)}\n\n"
-        yield "data: [DONE]\n\n"
+        async for chunk in sse_iter:
+            yield chunk

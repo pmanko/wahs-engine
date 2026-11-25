@@ -384,18 +384,18 @@ async def test_no_http_400_retry_mutation_and_sse_finish_reason_passthrough() ->
     )
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as llm_client:
         app = create_app(settings, llm_http_client=llm_client)
-        with pytest.raises(httpx.HTTPStatusError):
-            # Sync call returning 400 MUST NOT retry with mutated payload
-            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as api:
-                await api.post(
-                    "/v1/chat/completions",
-                    json={
-                        "model": "wahs-12b-kb",
-                        "stream": False,
-                        "messages": [{"role": "user", "content": "Latest labs?"}],
-                        "wahs": {"fhir_bundle": bundle, "target_budget_tokens": 512},
-                    },
-                )
+        # Sync call returning 400 MUST NOT retry with mutated payload and returns clean 502 Bad Gateway
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as api:
+            err_resp = await api.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "wahs-12b-kb",
+                    "stream": False,
+                    "messages": [{"role": "user", "content": "Latest labs?"}],
+                    "wahs": {"fhir_bundle": bundle, "target_budget_tokens": 512},
+                },
+            )
+        assert err_resp.status_code == 502
         assert len(calls) == 1
 
         # SSE stream passes upstream finish_reason="length" through instead of hardcoding "stop"
