@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 import os
 import time
@@ -45,6 +46,10 @@ def _resolve_caller_identity(
     return decode_and_bind_jwt(
         raw_token,
         hs256_secret=settings.jwt_hs256_secret,
+        jwks_json=settings.jwt_jwks_json,
+        jwks_url=settings.jwt_jwks_url,
+        expected_issuer=settings.jwt_issuer,
+        expected_audience=settings.jwt_audience,
         expected_user_sub=options.user_sub,
         trusted_header_sub=trusted_sub,
     )
@@ -129,14 +134,14 @@ def create_app(
         )
         temporal_summary: Dict[str, Any]
         if effective_temporal_digest:
-            temporal_summary = dict(
-                build_temporal_digest(
-                    ctx.extracted,
-                    ctx.condensed,
-                    question=extract_clean_user_query(last_q) or last_q,
-                    sharing_posture=options.sharing_posture,
-                ).summary
+            td_res = await asyncio.to_thread(
+                build_temporal_digest,
+                ctx.extracted,
+                ctx.condensed,
+                question=extract_clean_user_query(last_q) or last_q,
+                sharing_posture=options.sharing_posture,
             )
+            temporal_summary = dict(td_res.summary)
         else:
             temporal_summary = {"enabled": False}
         return {
@@ -178,8 +183,11 @@ def create_app(
         assemble_ms = round((time.perf_counter() - t0) * 1000.0, 2)
 
         if req.stream:
+            sse_iter = await southbound.start_stream(
+                ctx=ctx, req=req, options=options, assemble_ms=assemble_ms
+            )
             return StreamingResponse(
-                southbound.stream(ctx=ctx, req=req, options=options, assemble_ms=assemble_ms),
+                sse_iter,
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",

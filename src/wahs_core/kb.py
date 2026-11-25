@@ -99,6 +99,7 @@ class _Index:
             except OSError:
                 self.mtime_ns = None
         self.rows = [_fields(r) for r in _load_corpus(path)]
+        self._query_lock = threading.Lock()
         self.conn: Optional[sqlite3.Connection] = None
         try:
             conn = sqlite3.connect(":memory:", check_same_thread=False)
@@ -156,13 +157,15 @@ class _Index:
         if fts_safe_terms and self.conn is not None:
             match = " OR ".join(fts_safe_terms)
             try:
-                cur = self.conn.execute(
-                    "SELECT id,title,text,source,version,url,license, bm25(kb) AS score "
-                    "FROM kb WHERE kb MATCH ? ORDER BY score LIMIT ?",
-                    (match, fts_limit),
-                )
+                with self._query_lock:
+                    cur = self.conn.execute(
+                        "SELECT id,title,text,source,version,url,license, bm25(kb) AS score "
+                        "FROM kb WHERE kb MATCH ? ORDER BY score LIMIT ?",
+                        (match, fts_limit),
+                    )
+                    fetched_rows = cur.fetchall()
                 cols = ["id", "title", "text", "source", "version", "url", "license", "score"]
-                for row in cur.fetchall():
+                for row in fetched_rows:
                     item = dict(zip(cols, row))
                     meta = row_by_id.get(item["id"], {})
                     item["tags"] = list(meta.get("tags") or [])

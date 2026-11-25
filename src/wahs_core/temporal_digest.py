@@ -25,7 +25,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, 
 from .clinical_graph import _build_citation_lookup, _is_sensitive_item, _query_terms, extract_clean_user_query
 from .condenser import CondensedChartResult, estimate_tokens_local
 from .extractors import ClinicalItem, ExtractedChart, NumericPoint
-from .normalizers import classify_sensitivity, is_non_medical_admin_code
+from .normalizers import classify_sensitivity, is_non_medical_admin_code, validate_sharing_posture
 
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 _UPCOMING_ENCOUNTER_STATUSES: Set[str] = {"planned", "booked", "scheduled", "proposed", "pending", "waitlist"}
@@ -196,6 +196,23 @@ def _resolve_series_bounds(
     if has_utc and has_non_utc:
         min_day = min(day_of(p) for p in raw_pts)
         max_day = max(day_of(p) for p in raw_pts)
+        min_d_obj = _parse_iso_date(min_day)
+        max_d_obj = _parse_iso_date(max_day)
+        if min_d_obj is not None and max_d_obj is not None and (max_d_obj - min_d_obj).days >= 2:
+            first_window = [
+                p
+                for p in raw_pts
+                if (_parse_iso_date(day_of(p)) or max_d_obj) <= (min_d_obj + _dt.timedelta(days=1))
+            ]
+            last_window = [
+                p
+                for p in raw_pts
+                if (_parse_iso_date(day_of(p)) or min_d_obj) >= (max_d_obj - _dt.timedelta(days=1))
+            ]
+            first_ok, first_group = _day_boundary_points(first_window, pick_max=False)
+            last_ok, last_group = _day_boundary_points(last_window, pick_max=True)
+            if first_ok and last_ok:
+                return True, True, first_group, last_group, min_day, max_day
         same_val = len({p.value for p in raw_pts}) == 1
         return False, same_val, list(raw_pts), list(raw_pts), min_day, max_day
     if all_utc or all_naive:
@@ -416,6 +433,7 @@ def build_temporal_digest(
     token_counter: Optional[Callable[[str], int]] = None,
 ) -> TemporalDigestResult:
     """Build deterministic chart-derived temporal anchor, encounter horizon, and trend digest."""
+    validate_sharing_posture(sharing_posture)
     is_external = sharing_posture == "external_share"
     clean_q = extract_clean_user_query(question) or question
     q_terms = _query_terms(clean_q)
@@ -617,10 +635,13 @@ def build_temporal_digest(
         and not (it.display or it.text or "").strip().lower().startswith(("inpatient ", "naclflush"))
     ]
     active_meds: List[ClinicalItem] = []
+    on_hold_meds: List[ClinicalItem] = []
     stopped_meds: List[ClinicalItem] = []
     for m in med_items:
         st = (m.status or "").strip().lower()
-        if m.section == "med_historical" or st in _STOPPED_MED_STATUSES:
+        if st == "on-hold":
+            on_hold_meds.append(m)
+        elif m.section == "med_historical" or st in _STOPPED_MED_STATUSES:
             stopped_meds.append(m)
         else:
             active_meds.append(m)
@@ -634,15 +655,16 @@ def build_temporal_digest(
         default="",
     )
     med_horizon_line = ""
-    if active_meds or stopped_meds:
+    if active_meds or on_hold_meds or stopped_meds:
         act_note = f"{len(active_meds)} active (latest {latest_active_dt or 'undated'})"
+        hold_note = f", {len(on_hold_meds)} on-hold" if on_hold_meds else ""
         stop_note = (
             f"{len(stopped_meds)} stopped/historical (latest {latest_stopped_dt or 'undated'}; "
             "do NOT report stopped/completed orders as currently taken unless explicitly restarted later)"
             if stopped_meds
             else "0 stopped/historical"
         )
-        med_horizon_line = f"- Medication Order Horizon: {act_note}, {stop_note}."
+        med_horizon_line = f"- Medication Order Horizon: {act_note}{hold_note}, {stop_note}."
 
     # Build static header & encounter lines
     header_lines: List[str] = [

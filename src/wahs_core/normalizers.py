@@ -23,6 +23,31 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Pattern, Sequen
 
 _KB_DATA_DIR = os.path.join(os.path.dirname(__file__), "kb_data")
 
+VALID_SHARING_POSTURES: Set[str] = {"patient_self", "external_share"}
+
+
+def validate_sharing_posture(sharing_posture: str) -> str:
+    """Validate `sharing_posture` fail-closed so typos or unknown strings never bypass privacy redaction."""
+    if not isinstance(sharing_posture, str) or sharing_posture not in VALID_SHARING_POSTURES:
+        raise ValueError(
+            f"Unsupported sharing_posture: {sharing_posture!r}; expected 'patient_self' or 'external_share'"
+        )
+    return sharing_posture
+
+
+_ELECTROLYTE_SUPPLEMENT_RE = re.compile(
+    r"\b("
+    r"potassium\s+(?:chloride|citrate|bicarbonate|gluconate|phosphate|acetate|iodide)|"
+    r"sodium\s+(?:bicarbonate|chloride|citrate|phosphate|polystyrene\s+sulfonate)|"
+    r"calcium\s+(?:carbonate|citrate|gluconate|acetate|chloride|lactate)|"
+    r"magnesium\s+(?:oxide|sulfate|citrate|hydroxide|gluconate|chloride)|"
+    r"ferrous\s+(?:sulfate|gluconate|fumarate)|"
+    r"lithium\s+(?:carbonate|citrate)|"
+    r"zinc\s+(?:sulfate|gluconate)"
+    r")\b",
+    re.IGNORECASE,
+)
+
 _DOSE_NOISE = re.compile(
     r"\b(?:"
     r"\d+(?:\.\d+)?\s*(?:mg|mcg|ug|g|ml|iu|unit|units|meq|%|hr|actuat|unt)(?:/(?:ml|mg|hr|actuat|dose))?|"
@@ -174,8 +199,9 @@ def normalize_drug_ingredient(display: str) -> str:
         if re.search(rf"\b{re.escape(brand)}\b", text):
             return generic
     text = re.sub(r"\[[^\]]*\]", " ", text)
-    if re.search(r"\bpotassium\s+chloride\b", text):
-        return "potassium chloride"
+    m_elec = _ELECTROLYTE_SUPPLEMENT_RE.search(text)
+    if m_elec:
+        return re.sub(r"\s+", " ", m_elec.group(1)).strip().lower()
     text = _DOSE_NOISE.sub(" ", text)
     text = re.sub(r"[^a-z0-9/+\s-]", " ", text)
     tokens = [tok for tok in text.split() if len(tok) > 1 and not tok.isdigit()]
@@ -195,8 +221,11 @@ def detect_condition_conflicts(
     (KB-driven CKD staging, glycemic progression, HF staging) or active-vs-resolved contradictions."""
     pack = _load_kb_pack("clinical_exclusivity_and_privacy.json")
     snomed_meta = pack.get("snomed_conditions") or {}
+    group_rules = pack.get("exclusivity_group_rules") or {}
     conflicts: Dict[str, str] = {}
     ckd_by_stage: Dict[int, List[str]] = {}
+    hf_by_stage: Dict[int, List[Tuple[str, str]]] = {}
+    other_groups_by_stage: Dict[str, Dict[int, List[Tuple[str, str]]]] = {}
     prediabetes_uuids: List[str] = []
     diabetes_uuids: List[Tuple[str, str]] = []
 
@@ -222,6 +251,27 @@ def detect_condition_conflicts(
             if m:
                 ckd_by_stage.setdefault(int(m.group(1)), []).append(uuid)
 
+        if excl_group == "heart_failure_stage" and isinstance(stage_rank, int):
+            hf_by_stage.setdefault(stage_rank, []).append((uuid, display))
+        else:
+            m_nyha = re.search(
+                r"\bnyha\s*(?:class\s*)?(iv|iii|ii|i|[1-4])\b",
+                display,
+                re.IGNORECASE,
+            )
+            if m_nyha:
+                nyha_map = {"i": 1, "1": 1, "ii": 2, "2": 2, "iii": 3, "3": 3, "iv": 4, "4": 4}
+                r_val = nyha_map.get(m_nyha.group(1).lower())
+                if r_val is not None:
+                    hf_by_stage.setdefault(r_val, []).append((uuid, display))
+
+        if (
+            excl_group
+            and excl_group not in {"ckd_stage", "glycemic_progression", "heart_failure_stage"}
+            and isinstance(stage_rank, int)
+        ):
+            other_groups_by_stage.setdefault(excl_group, {}).setdefault(stage_rank, []).append((uuid, display))
+
         if (excl_group == "glycemic_progression" and stage_rank == 1) or re.search(
             r"\bprediabetes\b", display, re.IGNORECASE
         ):
@@ -242,6 +292,26 @@ def detect_condition_conflicts(
                     f"stage_conflict: CKD {stages_str} simultaneously marked ACTIVE "
                     f"(highest documented: stage {max_stage})"
                 )
+
+    if len(hf_by_stage) > 1:
+        hf_rule = group_rules.get("heart_failure_stage") if isinstance(group_rules, Mapping) else {}
+        hf_rule_id = str((hf_rule or {}).get("rule_id") or "wahs-kb-hf-staging-01")
+        stages_str = ", ".join(f"stage/class {s}" for s in sorted(hf_by_stage))
+        max_stage = max(hf_by_stage)
+        for entries_hf in hf_by_stage.values():
+            for uuid, _ in entries_hf:
+                conflicts[uuid] = (
+                    f"stage_conflict [{hf_rule_id}]: Heart failure {stages_str} simultaneously marked ACTIVE "
+                    f"(highest documented: {max_stage})"
+                )
+
+    for grp_name, by_rank in other_groups_by_stage.items():
+        if len(by_rank) > 1:
+            g_rule = group_rules.get(grp_name) if isinstance(group_rules, Mapping) else {}
+            g_title = str((g_rule or {}).get("title") or grp_name)
+            for entries_grp in by_rank.values():
+                for uuid, _ in entries_grp:
+                    conflicts.setdefault(uuid, f"stage_conflict: {g_title}")
 
     if prediabetes_uuids and diabetes_uuids:
         dm_names = ", ".join(sorted({disp for _, disp in diabetes_uuids})[:2])

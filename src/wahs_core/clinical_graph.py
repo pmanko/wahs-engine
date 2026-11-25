@@ -34,6 +34,7 @@ from .normalizers import (
     detect_medication_conflicts,
     is_non_medical_admin_code,
     normalize_drug_ingredient,
+    validate_sharing_posture,
 )
 
 NODE_CATEGORIES = (
@@ -133,6 +134,28 @@ _CONTINUATION_DIRECTIVE_RE = re.compile(
 )
 
 
+@lru_cache(maxsize=128)
+def _compile_cue_pattern(cue: str) -> Optional[re.Pattern[str]]:
+    clean = (cue or "").strip().lower()
+    if not clean:
+        return None
+    tokens = [re.escape(tok) for tok in clean.split() if tok]
+    if not tokens:
+        return None
+    body = r"\s+".join(tokens)
+    return re.compile(rf"(?<![a-z0-9]){body}(?![a-z0-9])")
+
+
+def _rfind_cue_word_boundary(haystack: str, cue: str) -> int:
+    pat = _compile_cue_pattern(cue)
+    if pat is None or not haystack:
+        return -1
+    last_pos = -1
+    for m in pat.finditer(haystack):
+        last_pos = m.start()
+    return last_pos
+
+
 def _last_affirmative_cue_offset(
     clause_low: str,
     probes: Set[str],
@@ -173,7 +196,11 @@ def _last_affirmative_cue_offset(
         else:
             applies = False
         if applies:
-            cue_offs = [cleaned.rfind(cue) for cue in cues if cue in cleaned]
+            cue_offs = [
+                pos
+                for pos in (_rfind_cue_word_boundary(cleaned, cue) for cue in cues)
+                if pos >= 0
+            ]
             if cue_offs:
                 cand = base_off + max(cue_offs)
                 if best_offset is None or cand > best_offset:
@@ -211,7 +238,7 @@ def _scan_note_med_directives(
 
     for sent_idx, sent in enumerate(re.split(r"(?<=[.!?;])\s+|\n+", text_to_scan)):
         s_low = sent.lower()
-        if any(rc in s_low for rc in resume_cues):
+        if any(_rfind_cue_word_boundary(s_low, rc) >= 0 for rc in resume_cues):
             res_off = _last_affirmative_cue_offset(
                 s_low,
                 probes,
@@ -222,7 +249,7 @@ def _scan_note_med_directives(
             if res_off is not None:
                 last_res_pos = (sent_idx, res_off)
                 last_res_sent = sent.strip()
-        if raw_note and any(hc in s_low for hc in hold_cues):
+        if raw_note and any(_rfind_cue_word_boundary(s_low, hc) >= 0 for hc in hold_cues):
             directive_clause = re.split(
                 r"\b(?:due to|secondary to|because of|despite)\b",
                 s_low,
@@ -872,6 +899,7 @@ class ClinicalEntityGraph:
         citation_by_uuid: Optional[Mapping[str, int]] = None,
         sharing_posture: str = "patient_self",
     ) -> "ClinicalEntityGraph":
+        validate_sharing_posture(sharing_posture)
         graph = cls(patient_id=extracted.patient_id, patient_name=extracted.patient_name)
         cit_map = dict(citation_by_uuid or {})
         is_external = sharing_posture == "external_share"
@@ -1027,7 +1055,8 @@ class ClinicalEntityGraph:
                 continue
             if is_external and classify_sensitivity(pt.code, pt.concept, [pt.category]) == "SDOH/PRIVACY-SENSITIVE":
                 continue
-            key = f"{pt.code or ''}:{pt.concept}".strip(":")
+            unit_part = (pt.unit or "").strip().lower()
+            key = f"{pt.code or ''}:{pt.concept}:{unit_part}".strip(":")
             series_by_key.setdefault(key, []).append(pt)
 
         def _day_of_pt(pt: NumericPoint) -> str:
@@ -1571,6 +1600,18 @@ class ClinicalEntityGraph:
                     if res is not None:
                         return res
                 return is_abn and is_low
+            if _contains_clinical_term(t_low, "a1c") or _contains_clinical_term(t_low, "hba1c"):
+                rationale_low = str(rule.get("rationale") or "").lower()
+                if "hypoglycemia" in rationale_low:
+                    if unit_compact in {"", "%"}:
+                        res = _eval_low(6.0, lambda x: x)
+                        if res is not None:
+                            return res
+                    elif unit_compact in {"mmol/mol"}:
+                        res = _eval_low(42.0, lambda x: x)
+                        if res is not None:
+                            return res
+                    return is_abn and is_low
             if _contains_clinical_term(t_low, "glucose"):
                 if unit_compact in {"", "mg/dl", "mg/100ml", "mg%"}:
                     res = _eval_low(70.0, lambda x: x)
@@ -2056,6 +2097,7 @@ def build_wahs_hub_enrichment_block(
     artificial truncation. When an integer ``max_tokens`` ceiling is supplied,
     progressively trims lower-priority items to stay strictly within ``max_tokens``.
     """
+    validate_sharing_posture(sharing_posture)
     active_question = _extract_last_user_question(messages_or_prompt)
     uuid_to_cit, represented_uuids, max_cit_before = _build_citation_lookup(
         condensed, citation_map

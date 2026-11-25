@@ -78,28 +78,65 @@ K = TypeVar("K")
 V = TypeVar("V")
 
 
+def _estimate_cache_value_bytes(value: Any) -> int:
+    if isinstance(value, AssembledWahsContext):
+        chart_bytes = len((value.system_prompt or "").encode("utf-8"))
+        cit_bytes = len(json.dumps(value.citation_map, default=str).encode("utf-8"))
+        items_bytes = sum(len((it.text or "").encode("utf-8")) + 192 for it in value.extracted.items)
+        return max(256, chart_bytes + cit_bytes + items_bytes)
+    try:
+        return max(64, len(json.dumps(value, separators=(",", ":"), default=str).encode("utf-8")))
+    except Exception:
+        return 1024
+
+
 class _BoundedLRUCache(Generic[K, V]):
-    def __init__(self, max_entries: int, ttl_seconds: float = 1800.0) -> None:
+    def __init__(
+        self,
+        max_entries: int,
+        ttl_seconds: float = 1800.0,
+        max_bytes: Optional[int] = None,
+    ) -> None:
         self._max = max(1, max_entries)
         self._ttl = max(0.0, float(ttl_seconds))
-        self._data: OrderedDict[K, Tuple[float, V]] = OrderedDict()
+        self._max_bytes = int(max_bytes) if (max_bytes is not None and int(max_bytes) > 0) else None
+        self._total_bytes = 0
+        self._data: OrderedDict[K, Tuple[float, int, V]] = OrderedDict()
 
     def get(self, key: K) -> Optional[V]:
         if key not in self._data:
             return None
-        expires_at, value = self._data[key]
+        expires_at, size_b, value = self._data[key]
         if self._ttl > 0.0 and time.monotonic() >= expires_at:
+            self._total_bytes = max(0, self._total_bytes - size_b)
             del self._data[key]
             return None
         self._data.move_to_end(key)
         return value
 
     def put(self, key: K, value: V) -> None:
+        size_b = _estimate_cache_value_bytes(value)
+        if self._max_bytes is not None and size_b > self._max_bytes:
+            if key in self._data:
+                _, old_b, _ = self._data.pop(key)
+                self._total_bytes = max(0, self._total_bytes - old_b)
+            return
+        if key in self._data:
+            _, old_b, _ = self._data.pop(key)
+            self._total_bytes = max(0, self._total_bytes - old_b)
         expires_at = (time.monotonic() + self._ttl) if self._ttl > 0.0 else float("inf")
-        self._data[key] = (expires_at, value)
+        self._data[key] = (expires_at, size_b, value)
+        self._total_bytes += size_b
         self._data.move_to_end(key)
-        while len(self._data) > self._max:
-            self._data.popitem(last=False)
+        while len(self._data) > self._max or (
+            self._max_bytes is not None and self._total_bytes > self._max_bytes and len(self._data) > 0
+        ):
+            _, (_, evicted_b, _) = self._data.popitem(last=False)
+            self._total_bytes = max(0, self._total_bytes - evicted_b)
+
+    @property
+    def total_bytes(self) -> int:
+        return self._total_bytes
 
     def __len__(self) -> int:
         return len(self._data)
@@ -563,10 +600,18 @@ class WAHSBundleAssembler:
         self._external_client = http_client
         self._shared_client: Optional[httpx.AsyncClient] = None
         self._dataset_cache: _BoundedLRUCache[Tuple[str, str, str], List[Dict[str, Any]]] = (
-            _BoundedLRUCache(settings.dataset_cache_max_entries, ttl_seconds=settings.cache_ttl_seconds)
+            _BoundedLRUCache(
+                settings.dataset_cache_max_entries,
+                ttl_seconds=settings.cache_ttl_seconds,
+                max_bytes=settings.dataset_cache_max_bytes,
+            )
         )
         self._prefix_cache: _BoundedLRUCache[Tuple[str, str, str], AssembledWahsContext] = (
-            _BoundedLRUCache(settings.prefix_cache_max_entries, ttl_seconds=settings.cache_ttl_seconds)
+            _BoundedLRUCache(
+                settings.prefix_cache_max_entries,
+                ttl_seconds=settings.cache_ttl_seconds,
+                max_bytes=settings.prefix_cache_max_bytes,
+            )
         )
         self._inflight_datasets: Dict[
             Tuple[str, str, str],
@@ -720,7 +765,8 @@ class WAHSBundleAssembler:
                         break
             pat_id = pat_id or "local-patient"
             datasets_fp = _canonical_sha256(raw_bundle)
-            return self._scope_and_condense_bundle(
+            return await asyncio.to_thread(
+                self._scope_and_condense_bundle,
                 raw_bundle=raw_bundle,
                 verified_sub=verified_sub,
                 authorized_patient_id=pat_id,
@@ -757,6 +803,24 @@ class WAHSBundleAssembler:
                 master_pat = await self._fhir_get_json(
                     client, f"{base}/Patient/{options.master_patient_id}", identity.raw_token
                 )
+                # Defense-in-depth subject ownership verification when MasterPatient carries bindings
+                bound_subs: Set[str] = set()
+                for ident_obj in master_pat.get("identifier") or []:
+                    if isinstance(ident_obj, Mapping) and str(ident_obj.get("system") or "") == IDENTIFIER_SYSTEM:
+                        val = str(ident_obj.get("value") or "").strip()
+                        if val:
+                            bound_subs.add(val)
+                meta_mp = master_pat.get("meta") if isinstance(master_pat.get("meta"), Mapping) else {}
+                for sec_obj in meta_mp.get("security") or []:
+                    if isinstance(sec_obj, Mapping) and str(sec_obj.get("system") or "") == SECURITY_SYSTEM:
+                        code_s = str(sec_obj.get("code") or "").strip()
+                        if code_s:
+                            bound_subs.add(code_s)
+                if bound_subs and identity.sub not in bound_subs:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="MasterPatient ownership mismatch for authenticated subject.",
+                    )
             else:
                 search_bundle = await self._fhir_get_json(
                     client,
@@ -1003,7 +1067,8 @@ class WAHSBundleAssembler:
                 "type": "collection",
                 "entry": pooled_entries,
             }
-            return self._scope_and_condense_bundle(
+            return await asyncio.to_thread(
+                self._scope_and_condense_bundle,
                 raw_bundle=pooled_bundle,
                 verified_sub=identity.sub,
                 authorized_patient_id=master_id,
@@ -1098,6 +1163,8 @@ class WAHSBundleAssembler:
         exc_ids = {i.strip() for i in scope.exclude_resource_ids if i.strip()}
         inc_sources = {s.strip().lower() for s in scope.include_sources if s.strip()}
         exc_sources = {s.strip().lower() for s in scope.exclude_sources if s.strip()}
+        inc_cats = {c.strip().lower() for c in scope.include_categories if c.strip()}
+        exc_cats = {c.strip().lower() for c in scope.exclude_categories if c.strip()}
 
         for entry in merged_entries:
             res = entry.get("resource") if isinstance(entry, Mapping) else None
@@ -1142,6 +1209,29 @@ class WAHSBundleAssembler:
                 if exc_sources and res_src and any(e in res_src for e in exc_sources):
                     continue
                 if inc_sources and (not res_src or not any(i in res_src for i in inc_sources)):
+                    continue
+
+            if (inc_cats or exc_cats) and rt not in _INFRASTRUCTURE_RESOURCE_TYPES:
+                res_cats: Set[str] = set()
+                meta_c = res.get("meta") if isinstance(res.get("meta"), Mapping) else {}
+                for tag in meta_c.get("tag") or []:
+                    if isinstance(tag, Mapping) and str(tag.get("system") or "") == CATEGORY_SYSTEM:
+                        tc = str(tag.get("code") or "").strip().lower()
+                        if tc:
+                            res_cats.add(tc)
+                raw_rc = res.get("category")
+                for cat_obj in (raw_rc if isinstance(raw_rc, list) else ([raw_rc] if isinstance(raw_rc, Mapping) else [])):
+                    if isinstance(cat_obj, Mapping):
+                        for cod in cat_obj.get("coding") or []:
+                            if isinstance(cod, Mapping) and cod.get("code"):
+                                res_cats.add(str(cod["code"]).strip().lower())
+                        if cat_obj.get("text"):
+                            res_cats.add(str(cat_obj["text"]).strip().lower())
+                if not res_cats:
+                    res_cats.add("provider-health-record")
+                if exc_cats and (res_cats & exc_cats):
+                    continue
+                if inc_cats and not (res_cats & inc_cats):
                     continue
 
             if (scope.date_from or scope.date_to) and rt not in _INFRASTRUCTURE_RESOURCE_TYPES:

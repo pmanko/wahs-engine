@@ -7,6 +7,7 @@ import json
 import os
 import re
 from typing import Any, Dict, Optional, Tuple
+from urllib.parse import urlsplit
 
 
 MAX_EXPLICIT_BUDGET_TOKENS = 262_144
@@ -188,6 +189,10 @@ class WahsEngineSettings:
     default_provider_flavor: str = "litellm"
     allow_local_bundle_mode: bool = False
     jwt_hs256_secret: str = ""
+    jwt_jwks_url: str = ""
+    jwt_jwks_json: str = ""
+    jwt_issuer: str = ""
+    jwt_audience: str = ""
     trusted_sub_header: str = ""
     max_overlay_bytes: int = 5120
     max_everything_pages: int = 20
@@ -196,15 +201,21 @@ class WahsEngineSettings:
     everything_concurrency: int = 4
     assembly_timeout_seconds: float = 45.0
     dataset_cache_max_entries: int = 256
+    dataset_cache_max_bytes: int = 268_435_456
     prefix_cache_max_entries: int = 128
+    prefix_cache_max_bytes: int = 134_217_728
     cache_ttl_seconds: float = 1800.0
     fhir_timeout_seconds: float = 25.0
     llm_timeout_seconds: float = 120.0
     engine_version: str = "0.1.0"
 
     def __post_init__(self) -> None:
-        lowered = (self.fhir_auth_base_url or "").lower()
-        if "fhir-internal" in lowered:
+        raw_url = (self.fhir_auth_base_url or "").strip()
+        lowered = raw_url.lower()
+        parsed_url = urlsplit(raw_url)
+        host = (parsed_url.hostname or "").lower()
+        forbidden_hosts = {"fhir-internal", "hapi-fhir-internal", "fhir-internal.local"}
+        if "fhir-internal" in lowered or host in forbidden_hosts:
             raise ValueError(
                 "Security invariant violation: wahs-engine must connect through "
                 "zero-privilege fhir-auth (jwt-proxy), never directly to fhir-internal."
@@ -389,6 +400,10 @@ class WahsEngineSettings:
             default_provider_flavor=default_flavor,
             allow_local_bundle_mode=_env_bool("WAHS_ALLOW_LOCAL_BUNDLE_MODE", False),
             jwt_hs256_secret=os.environ.get("WAHS_JWT_HS256_SECRET", "").strip(),
+            jwt_jwks_url=os.environ.get("WAHS_JWT_JWKS_URL", "").strip(),
+            jwt_jwks_json=os.environ.get("WAHS_JWT_JWKS_JSON", "").strip(),
+            jwt_issuer=os.environ.get("WAHS_JWT_ISSUER", "").strip(),
+            jwt_audience=os.environ.get("WAHS_JWT_AUDIENCE", "").strip(),
             trusted_sub_header=os.environ.get("WAHS_TRUSTED_SUB_HEADER", "").strip(),
             max_overlay_bytes=int(os.environ.get("WAHS_MAX_OVERLAY_BYTES", "5120")),
             max_everything_pages=int(os.environ.get("WAHS_MAX_EVERYTHING_PAGES", "20")),
@@ -397,7 +412,9 @@ class WahsEngineSettings:
             everything_concurrency=int(os.environ.get("WAHS_EVERYTHING_CONCURRENCY", "4")),
             assembly_timeout_seconds=float(os.environ.get("WAHS_ASSEMBLY_TIMEOUT_SECONDS", "45.0")),
             dataset_cache_max_entries=int(os.environ.get("WAHS_DATASET_CACHE_MAX", "256")),
+            dataset_cache_max_bytes=int(os.environ.get("WAHS_DATASET_CACHE_MAX_BYTES", "268435456")),
             prefix_cache_max_entries=int(os.environ.get("WAHS_PREFIX_CACHE_MAX", "128")),
+            prefix_cache_max_bytes=int(os.environ.get("WAHS_PREFIX_CACHE_MAX_BYTES", "134217728")),
             cache_ttl_seconds=float(os.environ.get("WAHS_CACHE_TTL_SECONDS", "1800.0")),
             fhir_timeout_seconds=float(os.environ.get("WAHS_FHIR_TIMEOUT_SECONDS", "25.0")),
             llm_timeout_seconds=float(os.environ.get("WAHS_LLM_TIMEOUT_SECONDS", "120.0")),
