@@ -122,14 +122,17 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def _infer_tokenizer_family(requested_model: str, upstream_model: str) -> str:
-    combined = f"{requested_model} {upstream_model}".lower()
-    if any(
-        tok in combined
-        for tok in ("qwen", "llama", "mistral", "deepseek", "gpt-", "claude", "o1", "o3", "o4")
-    ):
-        return "o200k_base"
-    if any(tok in combined for tok in ("gemma", "medgemma", "wahs-")):
-        return "gemma4"
+    for candidate in ((requested_model or "").lower(), (upstream_model or "").lower()):
+        if any(
+            tok in candidate
+            for tok in ("qwen", "llama", "mistral", "deepseek", "gpt-", "claude", "o1", "o3", "o4")
+        ):
+            return "o200k_base"
+        if any(
+            tok in candidate
+            for tok in ("gemma", "medgemma", "wahs-26b", "wahs-12b", "wahs-e4b")
+        ):
+            return "gemma4"
     return "o200k_base"
 
 
