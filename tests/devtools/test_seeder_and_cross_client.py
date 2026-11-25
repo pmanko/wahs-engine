@@ -20,7 +20,7 @@ from wahs_engine.assembler import (
     SOURCE_NAME_SYSTEM,
 )
 from wahs_engine.config import WahsEngineSettings
-from wahs_engine.seeder import (
+from wahs_devtools.seeder import (
     DEMO_ACCOUNTS,
     DEMO_ACCOUNTS_BY_SLUG,
     OBSERVATION_CATEGORY_SYSTEM,
@@ -251,7 +251,7 @@ async def test_seeder_and_cross_client_write_invalidates_only_updated_dataset_ca
                 "/v1/chat/completions",
                 headers={"Authorization": f"Bearer {alex_jwt}"},
                 json={
-                    "model": "wahs-12b-kb",
+                    "model": "wahs-12b",
                     "stream": False,
                     "messages": [{"role": "user", "content": "Review my medications and notes."}],
                 },
@@ -345,7 +345,7 @@ async def test_seeder_and_cross_client_write_invalidates_only_updated_dataset_ca
                 "/v1/chat/completions",
                 headers={"Authorization": f"Bearer {alex_jwt}"},
                 json={
-                    "model": "wahs-12b-kb",
+                    "model": "wahs-12b",
                     "stream": False,
                     "messages": [{"role": "user", "content": "What changed in my medication note?"}],
                 },
@@ -362,7 +362,7 @@ async def test_seeder_and_cross_client_write_invalidates_only_updated_dataset_ca
                 "/v1/wahs/context/preview",
                 headers={"Authorization": "Bearer local-demo-token"},
                 json={
-                    "model": "wahs-12b-kb",
+                    "model": "wahs-12b",
                     "wahs": {
                         "fhir_bundle": {
                             "resourceType": "Bundle",

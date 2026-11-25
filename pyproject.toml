@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wahs-engine"
-version = "0.1.0"
-description = "Standalone OpenAI-compatible clinical FHIR R4 condensation, provenance & fhir-auth middleware for Washington Health Summary (WAHS)"
+version = "0.2.0"
+description = "Standalone OpenAI-compatible clinical FHIR R4 verbatim-first condensation, provenance & fhir-auth middleware for Washington Health Summary (WAHS)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
@@ -29,18 +29,21 @@ dev = [
 
 [project.scripts]
 wahs-engine = "wahs_engine.app:main"
-wahs-seed-hapi = "wahs_engine.seeder:main"
+wahs-seed-hapi = "wahs_devtools.seeder:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["wahs_core*", "wahs_engine*"]
+include = ["wahs_core*", "wahs_engine*", "wahs_extensions*", "wahs_devtools*"]
 
 [tool.setuptools.package-data]
-wahs_core = ["kb_data/*.json", "kb_data/*.jsonl"]
 wahs_engine = ["tokenizer_assets/*.gz"]
+wahs_extensions = [
+  "experimental/clinical_reconciliation/sample_packs/*.json",
+  "experimental/clinical_reconciliation/sample_packs/*.jsonl",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

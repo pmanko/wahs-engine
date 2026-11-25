@@ -468,11 +468,11 @@ async def test_live_http_service_preview_sse_cache_and_partial_409_over_jwt_prox
         fhir_auth_base_url=LIVE_FHIR_AUTH_URL,
         llm_base_url="http://llm-mock:4000/v1",
         allow_local_bundle_mode=False,
-        default_model="wahs-12b-kb",
+        default_model="wahs-12b",
         everything_page_size=50,
         max_everything_pages=10,
         model_specs={
-            "wahs-12b-kb": ModelSpec(
+            "wahs-12b": ModelSpec(
                 upstream_model="ollama/gemma4:12b",
                 context_window=32768,
                 chart_budget_ceiling=16384,
@@ -494,7 +494,7 @@ async def test_live_http_service_preview_sse_cache_and_partial_409_over_jwt_prox
             bad_bundle = await api.post(
                 "/v1/wahs/context/preview",
                 headers=headers,
-                json={"model": "wahs-12b-kb", "wahs": {"fhir_bundle": {"resourceType": "Bundle", "entry": []}}},
+                json={"model": "wahs-12b", "wahs": {"fhir_bundle": {"resourceType": "Bundle", "entry": []}}},
             )
             assert bad_bundle.status_code == 403
 
@@ -502,7 +502,7 @@ async def test_live_http_service_preview_sse_cache_and_partial_409_over_jwt_prox
             prev_resp = await api.post(
                 "/v1/wahs/context/preview",
                 headers=headers,
-                json={"model": "wahs-12b-kb", "wahs": {}},
+                json={"model": "wahs-12b", "wahs": {}},
             )
             assert prev_resp.status_code == 200, prev_resp.text
             prev_data = prev_resp.json()
@@ -520,7 +520,7 @@ async def test_live_http_service_preview_sse_cache_and_partial_409_over_jwt_prox
                 "/v1/chat/completions",
                 headers=headers,
                 json={
-                    "model": "wahs-12b-kb",
+                    "model": "wahs-12b",
                     "stream": True,
                     "messages": [{"role": "user", "content": "Are my knee meds safe with warfarin?"}],
                     "wahs": {},
@@ -551,7 +551,7 @@ async def test_live_http_service_preview_sse_cache_and_partial_409_over_jwt_prox
                 "/v1/chat/completions",
                 headers=headers,
                 json={
-                    "model": "wahs-12b-kb",
+                    "model": "wahs-12b",
                     "stream": False,
                     "messages": [{"role": "user", "content": "What changed in my story?"}],
                     "wahs": {},
@@ -564,12 +564,12 @@ async def test_live_http_service_preview_sse_cache_and_partial_409_over_jwt_prox
             assert sync_cond["dataset_fetches"] == 1
             assert "Switched off NSAIDs to protect INR target" in southbound_calls[-1]["messages"][0]["content"]
 
-            # 5. Partial fetch over real HAPI + jwt-proxy returns 409 for external_share unless opted in
+            # 5. Partial fetch over real HAPI + jwt-proxy surfaces partial_fetch=True and factual warning notice
             capped_settings = WahsEngineSettings(
                 fhir_auth_base_url=LIVE_FHIR_AUTH_URL,
                 llm_base_url="http://llm-mock:4000/v1",
                 allow_local_bundle_mode=False,
-                default_model="wahs-12b-kb",
+                default_model="wahs-12b",
                 everything_page_size=50,
                 max_everything_pages=1,
             )
@@ -577,27 +577,17 @@ async def test_live_http_service_preview_sse_cache_and_partial_409_over_jwt_prox
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=capped_app), base_url="http://wahs-capped"
             ) as capped_api:
-                resp_409 = await capped_api.post(
-                    "/v1/chat/completions",
-                    headers=headers,
-                    json={
-                        "model": "wahs-12b-kb",
-                        "stream": False,
-                        "messages": [{"role": "user", "content": "External summary"}],
-                        "wahs": {"sharing_posture": "external_share"},
-                    },
-                )
-                assert resp_409.status_code == 409
-
                 resp_ok_partial = await capped_api.post(
                     "/v1/chat/completions",
                     headers=headers,
                     json={
-                        "model": "wahs-12b-kb",
+                        "model": "wahs-12b",
                         "stream": False,
-                        "messages": [{"role": "user", "content": "External summary"}],
-                        "wahs": {"sharing_posture": "external_share", "allow_partial_external_share": True},
+                        "messages": [{"role": "user", "content": "Summarize my record"}],
+                        "wahs": {},
                     },
                 )
                 assert resp_ok_partial.status_code == 200
-                assert resp_ok_partial.json()["x_wahs"]["condensation"]["partial_fetch"] is True
+                xw_part = resp_ok_partial.json()["x_wahs"]
+                assert xw_part["condensation"]["partial_fetch"] is True
+                assert any("Partial record warning" in n for n in xw_part["notices"])

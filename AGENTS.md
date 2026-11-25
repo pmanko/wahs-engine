@@ -1,40 +1,9 @@
-# Working in `wahs-engine`
+# Engineering Guidelines (`wahs-engine`)
 
-`wahs-engine` is the standalone, zero-privilege OpenAI-compatible clinical FHIR R4 condensation, symbolic clinical reconciliation, provenance, and `fhir-auth` middleware for Washington Health Summary (WAHS).
-
-## Architecture & Invariants
-
-- **Pure-Stdlib Core (`src/wahs_core/`):** `extractors.py`, `condenser.py`, `chart_serializer.py`, `clinical_graph.py`, `temporal_digest.py`, `normalizers.py`, `kb_lookup.py`, `kb.py`, `wahs_tools.py`, and KB data (`kb_data/`) **must remain zero third-party dependencies** (verified in CI via `python -S`).
-- **Service Boundary (`src/wahs_engine/`):** Lightweight FastAPI service (`app.py`, `assembler.py`, `upstream.py`, `jwt_claims.py`, `config.py`, `schemas.py`, `tokenizers_registry.py`, `seeder.py`; runtime deps: `fastapi`, `uvicorn`, `httpx`, `pydantic`, `tokenizers`, `tiktoken`).
-- **Security & Cache Isolation:**
-  - Preserve bearer-token pass-through (`Authorization: Bearer <keycloak_jwt>`) to `fhir-auth` (`WAHSBundleAssembler`), plus optional local RS256 JWKS / HS256 verification in `jwt_claims.py`.
-  - Keep strict `(verified_sub, datasets_fingerprint, scope_hash)` cache isolation with both entry-count and byte-size bounds; never leak patient state across subjects or scope filters.
-  - Reject client-supplied `fhir_bundle` payloads whenever `WAHS_ALLOW_LOCAL_BUNDLE_MODE=false`, and validate `sharing_posture` fail-closed (`patient_self` or `external_share`).
-- **Air-Gapped Tokenizers:** Keep vendored tokenizer assets (`src/wahs_engine/tokenizer_assets/*.gz`) offline-capable (`--network none` container smoke test runs in CI).
-
-## Local Development & Verification
-
-Requires Python `>=3.10`:
-
-```bash
-# Verify pure-stdlib wahs_core import (zero third-party deps)
-PYTHONPATH=src python -S -c "import site; import wahs_core; assert wahs_core.__version__"
-
-# Install editable with test deps and run unit + contract tests
-pip install -e ".[dev]"
-pytest -q
-```
-
-Run the standalone service or HAPI seeder CLI entrypoints:
-
-```bash
-WAHS_FHIR_AUTH_BASE_URL=http://localhost:8081/fhir \
-LLM_BASE_URL=http://localhost:8079/v1 \
-WAHS_DEFAULT_MODEL=wahs-26b-kb \
-wahs-engine
-```
-
-## Git & PR Hygiene
-
-- Keep changes scoped to `wahs_core`, `wahs_engine`, `tests/`, and `docs/`; never commit real PHI or local `.env` secrets.
-- Push feature branches and open PRs on `pmanko/wahs-engine` early so CI (`unit-and-contract`, `docker-smoke`, and `live-hapi-jwt-proxy-integration`) runs right away.
+## Architectural Invariants
+1. **`wahs_core` is pure Python stdlib:** Verify with `PYTHONPATH=src python -S -c "import sys, wahs_core; assert 'site' not in sys.modules and 'wahs_extensions' not in sys.modules"`. Zero third-party imports, zero network calls, zero embedded JSON knowledge packs.
+2. **Zero-privilege FHIR isolation:** `wahs-engine` must always connect through `fhir-auth` (`uwcirg/jwt-proxy`), never directly to `fhir-internal`. `WahsEngineSettings` fails closed if `WAHS_FHIR_AUTH_BASE_URL` contains `fhir-internal`.
+3. **Extensions unplugged by default:** `WAHS_ENABLED_ENRICHERS` defaults to `""`. When empty, `wahs_extensions` must never be imported at app startup or during `/v1/chat/completions` / `/v1/wahs/context/preview`.
+4. **Domain neutrality in core:** Keep clinical rule packs and domain heuristics out of `src/wahs_core/` and `src/wahs_engine/`. Optional enrichment modules belong strictly under `src/wahs_extensions/` implementing `wahs_core.ports.ContextEnricher`.
+5. **No speculative privacy regexes:** Selective disclosure is managed via `fhir-auth` security labels and user-controlled `chart_scope` / `ips_bundle_id`. Do not re-introduce lexical sensitivity classifiers into `wahs-engine`.
+6. **Zero em dashes:** Do not introduce em dashes (`\u2014`) in documentation, prompts, or chart strings.

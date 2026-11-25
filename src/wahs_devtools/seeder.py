@@ -20,7 +20,7 @@ import uuid
 
 import httpx
 
-from .assembler import (
+from wahs_engine.assembler import (
     CATEGORY_SYSTEM,
     IDENTIFIER_SYSTEM,
     METHOD_SYSTEM,
@@ -348,7 +348,7 @@ def build_persona_star_graph_datasets(
                                         "display": "Allergy to peanut",
                                     }
                                 ],
-                                "text": "Peanut (anaphylaxis — carries EpiPen Jr 0.15 mg)",
+                                "text": "Peanut (anaphylaxis - carries EpiPen Jr 0.15 mg)",
                             },
                         },
                     ],

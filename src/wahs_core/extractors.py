@@ -1,86 +1,28 @@
-"""FHIR R4 Bundle parser and clinical resource extractors for progressive chart condensation.
-
-Handles arbitrary US Core / IPS / Synthea FHIR R4 Bundles:
-- Resolves internal references (`Patient`, `Organization`, `Practitioner`, `Encounter`, `Medication`)
-- Inverts `Provenance.target[]` into per-resource `source_org` metadata
-- Deduplicates Base64 clinical notes across `DocumentReference` and `DiagnosticReport.presentedForm`
-- Groups `DiagnosticReport.result[]` panels and `Observation.component[]` multi-part measurements
-- Unifies `MedicationRequest`, `MedicationAdministration`, `MedicationStatement`, and `MedicationDispense`
-- Classifies SDOH privacy sensitivity (`SDOH/PRIVACY-SENSITIVE` vs `SDOH-SOCIAL`)
-- Pre-annotates active condition stage conflicts and immunization duplicate/ACIP anomalies
-"""
+"""Pure-stdlib FHIR R4 Bundle parser and domain-neutral clinical extractors."""
 
 from __future__ import annotations
 
 import base64
-import hashlib
-import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
+import hashlib
+import re
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
-from .kb_lookup import (
-    resolve_condition_code,
-    resolve_immunization_code,
-    resolve_lab_code,
-    resolve_medication_code,
-)
-from .normalizers import (
-    annotate_immunization_anomalies,
-    classify_sensitivity,
-    classify_sensitivity_with_source,
-    classify_vaccine_group,
-    detect_condition_conflicts,
-    detect_medication_conflicts,
-    is_clinic_room_equipment,
-    normalize_drug_ingredient,
-)
-
-# Resources that carry billing/supply/structural lookup data rather than direct clinical events.
 NON_CLINICAL_RESOURCE_TYPES: Set[str] = {
-    "Claim",
-    "ExplanationOfBenefit",
-    "SupplyDelivery",
-    "Coverage",
-    "Account",
-    "ChargeItem",
-    "Invoice",
-    "PaymentNotice",
-    "PaymentReconciliation",
+    "Claim", "ExplanationOfBenefit", "SupplyDelivery", "Coverage",
+    "Account", "ChargeItem", "Invoice", "PaymentNotice", "PaymentReconciliation",
 }
-
 LOOKUP_ONLY_RESOURCE_TYPES: Set[str] = {
-    "Provenance",
-    "Organization",
-    "Practitioner",
-    "PractitionerRole",
-    "Location",
-    "Medication",
+    "Provenance", "Organization", "Practitioner", "PractitionerRole", "Location", "Medication",
 }
-
-_SURVEY_PANEL_PATTERNS = re.compile(
-    r"\b(?:"
-    r"phq-?[29]|patient\s+health\s+questionnaire|"
-    r"gad-?7|generalized\s+anxiety|"
-    r"audit-?c|alcohol\s+use\s+disorder|"
-    r"dast-?10|drug\s+abuse\s+screening|"
-    r"hark|humiliation|intimate\s+partner|"
-    r"prapare|fall\s+scale|morse\s+fall|"
-    r"web-?based\s+danger\s+assessment"
-    r")\b",
-    re.IGNORECASE,
-)
-
-_ROUTINE_SCREENING_PROCEDURE_PATTERNS = re.compile(
-    r"\b(?:"
-    r"depression\s+screening|"
-    r"assessment\s+of\s+(?:health\s+and\s+social\s+care\s+needs|anxiety|substance\s+use|alcohol)|"
-    r"screening\s+for\s+(?:domestic\s+abuse|drug\s+abuse|occult\s+blood)|"
-    r"medication\s+reconciliation|"
-    r"assessment\s+using\s+(?:morse\s+fall\s+scale|hark|audit|dast|alcohol\s+use\s+disorders\s+identification)|"
-    r"sleep\s+apnea\s+assessment"
-    r")\b",
-    re.IGNORECASE,
+_INVALIDATED_STATUSES: Set[str] = {"entered-in-error", "cancelled"}
+_INVALIDATED_VERIFICATION: Set[str] = {"entered-in-error", "refuted"}
+_PREFERRED_CODING_SYSTEMS: Tuple[str, ...] = (
+    "nlm.nih.gov/research/umls/rxnorm",
+    "snomed.info/sct",
+    "loinc.org",
+    "hl7.org/fhir/sid/cvx",
 )
 
 
@@ -100,14 +42,25 @@ class NumericPoint:
     status: str = ""
 
 
+@dataclass(frozen=True)
+class ClinicalNote:
+    uuid: str
+    date: Optional[str]
+    title: str
+    text: str
+    source: Optional[str]
+    char_count: int
+    member_uuids: Tuple[str, ...] = ()
+
+
 @dataclass
 class ClinicalItem:
     resource_type: str
     resource_uuid: str
     date: Optional[str]
     clinical_date: Optional[str]
-    date_kind: str  # "clinical_event" | "administrative" | "unknown"
-    section: str    # "patient" | "allergy" | "condition_active" | "condition_resolved" | "med_active" | ...
+    date_kind: str  # "clinical_event" | "administrative" | "planned" | "unknown"
+    section: str
     code: str
     display: str
     text: str
@@ -115,10 +68,6 @@ class ClinicalItem:
     status: str = ""
     end_date: Optional[str] = None
     source_org: Optional[str] = None
-    sensitivity: Optional[str] = None
-    conflict_note: Optional[str] = None
-    ingredient_key: str = ""
-    is_routine: bool = False
     member_uuids: Tuple[str, ...] = ()
     metadata: Dict[str, Any] = field(default_factory=dict)
 
@@ -130,6 +79,7 @@ class ExtractedChart:
     birth_date: Optional[str]
     reference_date: Optional[str]
     items: List[ClinicalItem]
+    notes: List[ClinicalNote]
     numeric_points: List[NumericPoint]
     excluded_resource_counts: Dict[str, int]
     deduplicated_note_count: int
@@ -137,53 +87,31 @@ class ExtractedChart:
 
 
 def _strip_urn(ref: Optional[str]) -> str:
-    if not ref:
-        return ""
-    s = str(ref).strip()
+    s = str(ref or "").strip()
     if s.startswith("urn:uuid:"):
         return s[len("urn:uuid:") :]
-    if "/" in s:
-        return s.rsplit("/", 1)[-1]
-    return s
+    return s.rsplit("/", 1)[-1] if "/" in s else s
 
 
 def _iso_date(val: Optional[str]) -> Optional[str]:
-    if not val:
-        return None
-    s = str(val).strip()
-    if len(s) >= 10 and re.match(r"^\d{4}-\d{2}-\d{2}", s):
-        return s[:10]
-    return None
+    s = str(val or "").strip()
+    return s[:10] if len(s) >= 10 and re.match(r"^\d{4}-\d{2}-\d{2}", s) else None
 
 
 def _iso_timestamp(val: Optional[str]) -> Optional[str]:
-    """Return `YYYY-MM-DDTHH:MM` when an intraday time component is present on an ISO datetime string."""
-    if not val:
-        return None
-    s = str(val).strip()
-    m = re.match(r"^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})", s)
-    if m:
-        return f"{m.group(1)}T{m.group(2)}"
-    return None
+    m = re.match(r"^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})", str(val or "").strip())
+    return f"{m.group(1)}T{m.group(2)}" if m else None
 
 
 def _sort_timestamp_key(val: Optional[str]) -> str:
-    """Return canonical comparable timestamp (`Z:...` UTC or `N:...` naive) when intraday time is present."""
-    if not val:
-        return ""
-    s = str(val).strip()
+    s = str(val or "").strip()
     if not re.match(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}", s):
         return ""
-    iso_norm = re.sub(
-        r"^(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2})($|[Zz]|[+-]\d{2}(?::?\d{2})?)$",
-        r"\1:00\2",
-        s,
-    )
+    iso_norm = re.sub(r"^(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2})($|[Zz]|[+-]\d{2}(?::?\d{2})?)$", r"\1:00\2", s)
     if iso_norm.endswith(("Z", "z")):
         iso_norm = f"{iso_norm[:-1]}+00:00"
-    iso_norm = re.sub(r"(\.\d{6})\d+", r"\1", iso_norm)
     try:
-        dt = datetime.fromisoformat(iso_norm)
+        dt = datetime.fromisoformat(re.sub(r"(\.\d{6})\d+", r"\1", iso_norm))
     except ValueError:
         return ""
     if dt.tzinfo is not None:
@@ -192,36 +120,24 @@ def _sort_timestamp_key(val: Optional[str]) -> str:
     return f"N:{dt.strftime('%Y-%m-%dT%H:%M:%S')}.{dt.microsecond:06d}"
 
 
-_PREFERRED_CODING_SYSTEM_FRAGMENTS: Tuple[str, ...] = (
-    "nlm.nih.gov/research/umls/rxnorm",
-    "snomed.info/sct",
-    "loinc.org",
-    "hl7.org/fhir/sid/cvx",
-)
-
-
 def _coding_pair(codeable: Optional[Mapping[str, Any]]) -> Tuple[str, str]:
     if not isinstance(codeable, Mapping):
         return "", ""
     codings = [c for c in (codeable.get("coding") or []) if isinstance(c, Mapping)]
-    code = ""
-    display = str(codeable.get("text") or "").strip()
-    # Prefer canonical clinical terminologies (RxNorm, SNOMED CT, LOINC, CVX) over billing/local codes at coding[0].
-    for pref in _PREFERRED_CODING_SYSTEM_FRAGMENTS:
+    code, display = "", str(codeable.get("text") or "").strip()
+    for pref in _PREFERRED_CODING_SYSTEMS:
         for c in codings:
-            sys_low = str(c.get("system") or "").strip().lower()
-            if pref in sys_low and c.get("code") is not None:
-                code = str(c.get("code")).strip()
-                if not display and c.get("display"):
-                    display = str(c.get("display")).strip()
+            if pref in str(c.get("system") or "").lower() and c.get("code") is not None:
+                code = str(c["code"]).strip()
+                display = display or str(c.get("display") or "").strip()
                 break
         if code:
             break
     for c in codings:
         if not code and c.get("code") is not None:
-            code = str(c.get("code")).strip()
+            code = str(c["code"]).strip()
         if not display and c.get("display"):
-            display = str(c.get("display")).strip()
+            display = str(c["display"]).strip()
     return code, display
 
 
@@ -229,2202 +145,642 @@ def _codeable_status(val: Any) -> str:
     if isinstance(val, str):
         return val.strip().lower()
     if isinstance(val, Mapping):
-        code, display = _coding_pair(val)
-        return (code or display).lower()
+        c, d = _coding_pair(val)
+        return (c or d).lower()
     return ""
 
 
 def _categories(res: Mapping[str, Any]) -> List[str]:
-    cats: List[str] = []
-    raw_cats = res.get("category")
-    if isinstance(raw_cats, Mapping):
-        raw_cats = [raw_cats]
-    for cat in raw_cats or []:
+    raw = res.get("category")
+    cats = [raw] if isinstance(raw, Mapping) else (raw or [])
+    out: List[str] = []
+    for cat in cats:
         if isinstance(cat, Mapping):
-            code, disp = _coding_pair(cat)
-            if code:
-                cats.append(code.lower())
-            elif disp:
-                cats.append(disp.lower())
-    return cats
+            c, d = _coding_pair(cat)
+            v = (c or d).strip().lower()
+            if v:
+                out.append(v)
+    return out
 
 
 def _format_num(val: Any) -> str:
     if isinstance(val, float):
         if val.is_integer():
             return str(int(val))
-        formatted = f"{val:.6f}".rstrip("0").rstrip(".")
-        return formatted if formatted and formatted != "-0" else "0"
+        s = f"{val:.6f}".rstrip("0").rstrip(".")
+        return s if s and s != "-0" else "0"
     return str(val)
 
 
 def _format_obs_value(obs: Mapping[str, Any]) -> Tuple[str, Optional[float], str]:
-    """Return (formatted_value_with_unit, numeric_float_or_None, unit_str)."""
     components = obs.get("component")
     if isinstance(components, list) and components:
-        comp_parts: List[str] = []
-        sbp: Optional[float] = None
-        dbp: Optional[float] = None
-        bp_unit = "mm[Hg]"
+        parts: List[str] = []
         for comp in components:
             if not isinstance(comp, Mapping):
                 continue
-            c_code, c_disp = _coding_pair(comp.get("code"))
+            cc, cd = _coding_pair(comp.get("code"))
             vq = comp.get("valueQuantity")
             if isinstance(vq, Mapping) and vq.get("value") is not None:
-                v = vq.get("value")
                 u = str(vq.get("unit") or vq.get("code") or "").strip()
-                comp_cmp = str(vq.get("comparator") or "").strip()
-                if not comp_cmp:
-                    if c_code == "8480-6" or "systolic" in c_disp.lower():
-                        sbp = float(v)
-                        bp_unit = u or bp_unit
-                    elif c_code == "8462-4" or "diastolic" in c_disp.lower():
-                        dbp = float(v)
-                        bp_unit = u or bp_unit
-                comp_parts.append(f"{c_disp or c_code}: {comp_cmp}{_format_num(v)} {u}".strip())
+                op = str(vq.get("comparator") or "").strip()
+                parts.append(f"{cd or cc}: {op}{_format_num(vq['value'])} {u}".strip())
             else:
-                _, vc_disp = _coding_pair(comp.get("valueCodeableConcept"))
-                if vc_disp:
-                    comp_parts.append(f"{c_disp or c_code}: {vc_disp}")
-        if comp_parts:
-            return "; ".join(comp_parts), None, ""
+                _, vd = _coding_pair(comp.get("valueCodeableConcept"))
+                if vd:
+                    parts.append(f"{cd or cc}: {vd}")
+        if parts:
+            return "; ".join(parts), None, ""
 
     vq = obs.get("valueQuantity")
     if isinstance(vq, Mapping) and vq.get("value") is not None:
-        raw_val = vq.get("value")
-        unit = str(vq.get("unit") or vq.get("code") or "").strip()
-        comparator = str(vq.get("comparator") or "").strip()
+        raw_v, unit, op = vq["value"], str(vq.get("unit") or vq.get("code") or "").strip(), str(vq.get("comparator") or "").strip()
         try:
-            num_val = float(raw_val)
+            nv: Optional[float] = float(raw_v)
         except (TypeError, ValueError):
-            num_val = None
-        val_str = f"{comparator}{_format_num(num_val if num_val is not None else raw_val)}"
-        exact_num = None if comparator else num_val
-        return (f"{val_str} {unit}".strip() if unit else val_str), exact_num, unit
-
+            nv = None
+        vs = f"{op}{_format_num(nv if nv is not None else raw_v)}"
+        return (f"{vs} {unit}".strip() if unit else vs), (None if op else nv), unit
     if "valueCodeableConcept" in obs:
-        _, disp = _coding_pair(obs.get("valueCodeableConcept"))
-        return disp, None, ""
+        return _coding_pair(obs.get("valueCodeableConcept"))[1], None, ""
     if "valueString" in obs:
         return str(obs.get("valueString") or "").strip(), None, ""
     if "valueBoolean" in obs:
         return str(obs.get("valueBoolean")), None, ""
     if "valueInteger" in obs:
-        v = obs.get("valueInteger")
+        v = obs["valueInteger"]
         return str(v), float(v) if isinstance(v, int) else None, ""
     return "", None, ""
 
 
 def _format_structured_dosage(d_inst: Mapping[str, Any]) -> str:
-    """Format narrative and/or structured FHIR Dosage fields (doseAndRate, timing, route, asNeeded)."""
     d_txt = str(d_inst.get("text") or "").strip()
-    struct_parts: List[str] = []
+    parts: List[str] = []
     for dr in d_inst.get("doseAndRate") or []:
         if not isinstance(dr, Mapping):
             continue
         dq = dr.get("doseQuantity")
         if isinstance(dq, Mapping) and dq.get("value") is not None:
-            dv = _format_num(float(dq["value"]) if isinstance(dq["value"], (int, float)) else dq["value"])
-            du = str(dq.get("unit") or dq.get("code") or "").strip()
-            struct_parts.append(f"{dv} {du}".strip())
-        drange = dr.get("doseRange")
-        if isinstance(drange, Mapping):
-            low = drange.get("low") or {}
-            high = drange.get("high") or {}
-            if low.get("value") is not None and high.get("value") is not None:
-                u = str(high.get("unit") or low.get("unit") or "").strip()
-                struct_parts.append(f"{_format_num(low['value'])}-{_format_num(high['value'])} {u}".strip())
-    admin_dose = d_inst.get("dose")
-    if isinstance(admin_dose, Mapping) and admin_dose.get("value") is not None:
-        adv = _format_num(
-            float(admin_dose["value"]) if isinstance(admin_dose["value"], (int, float)) else admin_dose["value"]
-        )
-        adu = str(admin_dose.get("unit") or admin_dose.get("code") or "").strip()
-        struct_parts.append(f"{adv} {adu}".strip())
-    rate_q = d_inst.get("rateQuantity")
-    if isinstance(rate_q, Mapping) and rate_q.get("value") is not None:
-        rv = _format_num(float(rate_q["value"]) if isinstance(rate_q["value"], (int, float)) else rate_q["value"])
-        ru = str(rate_q.get("unit") or rate_q.get("code") or "").strip()
-        struct_parts.append(f"rate {rv} {ru}".strip())
-    _, route_disp = _coding_pair(d_inst.get("route"))
-    if route_disp:
-        struct_parts.append(route_disp)
+            parts.append(f"{_format_num(dq['value'])} {str(dq.get('unit') or dq.get('code') or '').strip()}".strip())
+        drg = dr.get("doseRange")
+        if isinstance(drg, Mapping):
+            lo, hi = drg.get("low") or {}, drg.get("high") or {}
+            if lo.get("value") is not None and hi.get("value") is not None:
+                u = str(hi.get("unit") or lo.get("unit") or "").strip()
+                parts.append(f"{_format_num(lo['value'])}-{_format_num(hi['value'])} {u}".strip())
+    for key, pfx in (("dose", ""), ("rateQuantity", "rate ")):
+        q = d_inst.get(key)
+        if isinstance(q, Mapping) and q.get("value") is not None:
+            parts.append(f"{pfx}{_format_num(q['value'])} {str(q.get('unit') or q.get('code') or '').strip()}".strip())
+    _, route_d = _coding_pair(d_inst.get("route"))
+    if route_d:
+        parts.append(route_d)
     timing = d_inst.get("timing")
     if isinstance(timing, Mapping):
         rep = timing.get("repeat")
         if isinstance(rep, Mapping):
-            freq = rep.get("frequency")
-            period = rep.get("period")
-            p_unit = str(rep.get("periodUnit") or "").strip().lower()
-            unit_names = {"d": "daily", "wk": "weekly", "mo": "monthly", "h": "h"}
-            if freq == 1 and period == 1 and p_unit == "d":
-                struct_parts.append("once daily")
-            elif freq and period and p_unit:
-                if period == 1 and p_unit in {"d", "wk", "mo"}:
-                    struct_parts.append(f"{freq}x {unit_names[p_unit]}")
-                else:
-                    struct_parts.append(f"{freq}x per {period}{p_unit}")
-        _, t_code_disp = _coding_pair(timing.get("code"))
-        if t_code_disp:
-            struct_parts.append(t_code_disp)
+            f, p, pu = rep.get("frequency"), rep.get("period"), str(rep.get("periodUnit") or "").lower()
+            un = {"d": "daily", "wk": "weekly", "mo": "monthly", "h": "h"}
+            if f == 1 and p == 1 and pu == "d":
+                parts.append("once daily")
+            elif f and p and pu:
+                parts.append(f"{f}x {un[pu]}" if (p == 1 and pu in un) else f"{f}x per {p}{pu}")
+        _, td = _coding_pair(timing.get("code"))
+        if td:
+            parts.append(td)
     if d_inst.get("asNeededBoolean") is True:
-        struct_parts.append("PRN")
-    for add_inst in d_inst.get("additionalInstruction") or []:
-        _, a_disp = _coding_pair(add_inst)
-        if a_disp:
-            struct_parts.append(a_disp)
-    structured_str = " ".join(struct_parts).strip()
-    if d_txt and structured_str and structured_str.lower() not in d_txt.lower():
-        return f"{d_txt} ({structured_str})"
-    return d_txt or structured_str
+        parts.append("PRN")
+    for add in d_inst.get("additionalInstruction") or []:
+        _, ad = _coding_pair(add)
+        if ad:
+            parts.append(ad)
+    s = " ".join(parts).strip()
+    return f"{d_txt} ({s})" if (d_txt and s and s.lower() not in d_txt.lower()) else (d_txt or s)
 
 
-def _extract_meta_security_codes(res: Mapping[str, Any]) -> Tuple[str, ...]:
-    """Extract uppercased HL7 ``Resource.meta.security[].code`` labels."""
-    meta_obj = res.get("meta")
-    if not isinstance(meta_obj, Mapping):
-        return ()
-    codes: List[str] = []
-    for sec in meta_obj.get("security") or []:
-        if isinstance(sec, Mapping):
-            code = str(sec.get("code") or "").strip().upper()
-            if code:
-                codes.append(code)
-    return tuple(dict.fromkeys(codes))
-
-
-def _extract_obs_interpretation_and_range(
-    obs: Mapping[str, Any],
-    num_val: Optional[float],
-) -> Tuple[Optional[str], Optional[str], bool]:
-    """Extract native FHIR ``Observation.interpretation`` and ``referenceRange`` cleanly."""
-    interp_code = ""
-    interp_disp = ""
-    raw_interp = obs.get("interpretation")
-    if isinstance(raw_interp, Mapping):
-        raw_interp = [raw_interp]
-    if isinstance(raw_interp, list):
-        for entry in raw_interp:
-            if isinstance(entry, Mapping):
-                c, d = _coding_pair(entry)
-                if c or d:
-                    interp_code, interp_disp = c, d
-                    break
-
-    range_str: Optional[str] = None
-    low_bound: Optional[float] = None
-    high_bound: Optional[float] = None
-    raw_ranges = obs.get("referenceRange")
-    if isinstance(raw_ranges, list) and raw_ranges and isinstance(raw_ranges[0], Mapping):
-        rr0 = raw_ranges[0]
-        low_obj = rr0.get("low") if isinstance(rr0.get("low"), Mapping) else {}
-        high_obj = rr0.get("high") if isinstance(rr0.get("high"), Mapping) else {}
+def _extract_obs_interp_range(obs: Mapping[str, Any], num_val: Optional[float]) -> Tuple[Optional[str], Optional[str], bool]:
+    raw_i = obs.get("interpretation")
+    ic, idisp = "", ""
+    for e in (raw_i if isinstance(raw_i, list) else ([raw_i] if isinstance(raw_i, Mapping) else [])):
+        if isinstance(e, Mapping):
+            c, d = _coding_pair(e)
+            if c or d:
+                ic, idisp = c, d
+                break
+    rstr, lo, hi = None, None, None
+    rr = obs.get("referenceRange")
+    if isinstance(rr, list) and rr and isinstance(rr[0], Mapping):
+        r0 = rr[0]
+        lobj, hobj = (r0.get("low") or {}), (r0.get("high") or {})
         try:
-            low_bound = float(low_obj["value"]) if low_obj.get("value") is not None else None
+            lo = float(lobj["value"]) if isinstance(lobj, Mapping) and lobj.get("value") is not None else None
         except (TypeError, ValueError):
-            low_bound = None
+            pass
         try:
-            high_bound = float(high_obj["value"]) if high_obj.get("value") is not None else None
+            hi = float(hobj["value"]) if isinstance(hobj, Mapping) and hobj.get("value") is not None else None
         except (TypeError, ValueError):
-            high_bound = None
-        if rr0.get("text"):
-            range_str = str(rr0["text"]).strip()
-        elif low_bound is not None and high_bound is not None:
-            u = str(high_obj.get("unit") or low_obj.get("unit") or "").strip()
-            u_sp = f" {u}" if u else ""
-            range_str = f"{_format_num(low_bound)}-{_format_num(high_bound)}{u_sp}"
-        elif high_bound is not None:
-            u = str(high_obj.get("unit") or "").strip()
-            range_str = f"<= {_format_num(high_bound)}" + (f" {u}" if u else "")
-        elif low_bound is not None:
-            u = str(low_obj.get("unit") or "").strip()
-            range_str = f">= {_format_num(low_bound)}" + (f" {u}" if u else "")
+            pass
+        u = str((hobj.get("unit") if isinstance(hobj, Mapping) else "") or (lobj.get("unit") if isinstance(lobj, Mapping) else "") or "").strip()
+        if r0.get("text"):
+            rstr = str(r0["text"]).strip()
+        elif lo is not None and hi is not None:
+            rstr = f"{_format_num(lo)}-{_format_num(hi)}" + (f" {u}" if u else "")
+        elif hi is not None:
+            rstr = f"<= {_format_num(hi)}" + (f" {u}" if u else "")
+        elif lo is not None:
+            rstr = f">= {_format_num(lo)}" + (f" {u}" if u else "")
 
-    norm_code = interp_code.upper()
-    if norm_code in {"H", "HH", "HU", "L", "LL", "LU", "A", "AA", "CRIT", "POS", "ABNORMAL", "HIGH", "LOW"}:
-        is_abnormal = True
-        interp_label: Optional[str] = interp_code or interp_disp
-    elif norm_code in {"N", "NORMAL"}:
-        is_abnormal = False
-        interp_label = interp_code
-    elif interp_disp:
-        is_abnormal = interp_disp.lower() in {"high", "low", "critical", "abnormal", "positive"}
-        interp_label = interp_disp
+    nc = ic.upper()
+    if nc in {"H", "HH", "HU", "L", "LL", "LU", "A", "AA", "CRIT", "POS", "ABNORMAL", "HIGH", "LOW"}:
+        abn, lbl = True, ic or idisp
+    elif nc in {"N", "NORMAL"}:
+        abn, lbl = False, ic
+    elif idisp:
+        abn, lbl = idisp.lower() in {"high", "low", "critical", "abnormal", "positive"}, idisp
     else:
-        is_abnormal = False
-        interp_label = None
+        abn, lbl = False, None
 
-    if interp_label is None and num_val is not None:
-        if low_bound is not None and num_val < low_bound:
-            interp_label = "L"
-            is_abnormal = True
-        elif high_bound is not None and num_val > high_bound:
-            interp_label = "H"
-            is_abnormal = True
-    elif interp_label is None:
-        vq = obs.get("valueQuantity")
-        if isinstance(vq, Mapping) and vq.get("value") is not None:
-            cmp_op = str(vq.get("comparator") or "").strip()
-            try:
-                cmp_val = float(vq["value"])
-            except (TypeError, ValueError):
-                cmp_val = None
-            if cmp_val is not None:
-                if low_bound is not None and (
-                    (cmp_op == "<" and cmp_val <= low_bound)
-                    or (cmp_op == "<=" and cmp_val < low_bound)
-                ):
-                    interp_label = "L"
-                    is_abnormal = True
-                elif high_bound is not None and (
-                    (cmp_op == ">" and cmp_val >= high_bound)
-                    or (cmp_op == ">=" and cmp_val > high_bound)
-                ):
-                    interp_label = "H"
-                    is_abnormal = True
-
-    return interp_label, range_str, is_abnormal
+    if lbl is None and num_val is not None:
+        if lo is not None and num_val < lo:
+            lbl, abn = "L", True
+        elif hi is not None and num_val > hi:
+            lbl, abn = "H", True
+    elif lbl is None and isinstance(obs.get("valueQuantity"), Mapping):
+        vq = obs["valueQuantity"]
+        op = str(vq.get("comparator") or "").strip()
+        try:
+            cv: Optional[float] = float(vq["value"]) if vq.get("value") is not None else None
+        except (TypeError, ValueError):
+            cv = None
+        if cv is not None:
+            if lo is not None and ((op == "<" and cv <= lo) or (op == "<=" and cv < lo)):
+                lbl, abn = "L", True
+            elif hi is not None and ((op == ">" and cv >= hi) or (op == ">=" and cv > hi)):
+                lbl, abn = "H", True
+    return lbl, rstr, abn
 
 
-def _extract_unique_note_narrative(decoded_text: str, *, preserve_all_sections: bool = True) -> str:
-    """Extract normalized clinical note narrative, preserving all non-empty Markdown sections faithfully."""
-    del preserve_all_sections
-    lines = [line.strip() for line in (decoded_text or "").splitlines()]
+def _normalize_note_text(decoded_text: str) -> str:
+    lines = [ln.strip() for ln in (decoded_text or "").splitlines()]
     if not lines:
         return ""
-
     sections: Dict[str, List[str]] = {}
-    current_header = "preamble"
-    for line in lines:
-        if line.startswith("#"):
-            current_header = line.lstrip("#").strip().lower()
-            sections.setdefault(current_header, [])
-            continue
-        if not line or re.match(r"^[-=_*]{3,}$", line):
-            continue
-        sections.setdefault(current_header, []).append(line)
-
-    kept_parts: List[str] = []
-    has_markdown_headers = any(k != "preamble" for k in sections)
-    if has_markdown_headers:
-        if sections.get("preamble"):
-            pre_body = " ".join(sections["preamble"]).strip()
-            if pre_body:
-                kept_parts.append(pre_body)
-        for header, body_lines in sections.items():
-            if header == "preamble":
-                continue
-            compact_body = " ".join(body_lines).strip()
-            if not compact_body:
-                continue
-            kept_parts.append(f"{header.title()}: {compact_body}")
-        if kept_parts:
-            return " | ".join(kept_parts)
-
-    non_empty = [l for l in lines if l and not re.match(r"^[-=_*]{3,}$", l)]
-    return " ".join(non_empty).strip()
+    cur = "preamble"
+    for ln in lines:
+        if ln.startswith("#"):
+            cur = ln.lstrip("#").strip().lower()
+            sections.setdefault(cur, [])
+        elif ln and not re.match(r"^[-=_*]{3,}$", ln):
+            sections.setdefault(cur, []).append(ln)
+    if any(k != "preamble" for k in sections):
+        parts = ([" ".join(sections["preamble"]).strip()] if sections.get("preamble") else []) + [
+            f"{hdr.title()}: {' '.join(blines).strip()}"
+            for hdr, blines in sections.items()
+            if hdr != "preamble" and " ".join(blines).strip()
+        ]
+        if parts:
+            return " | ".join(p for p in parts if p)
+    return " ".join(ln for ln in lines if ln and not re.match(r"^[-=_*]{3,}$", ln)).strip()
 
 
-def extract_bundle(
-    bundle: Mapping[str, Any],
-    *,
-    include_conflict_annotations: bool = True,
-    enable_privacy_classification: bool = True,
-    preserve_intraday_timestamps: bool = False,
-    preserve_all_note_sections: bool = False,
-    filter_room_equipment_devices: bool = True,
-) -> ExtractedChart:
-    """Parse a FHIR R4 Bundle dict into normalized `ClinicalItem` objects and numeric series points."""
-    entries = bundle.get("entry") or []
-    resources: List[Mapping[str, Any]] = []
-    for idx, entry in enumerate(entries, start=1):
-        if isinstance(entry, Mapping):
-            res = entry.get("resource")
-            if isinstance(res, Mapping) and res.get("resourceType"):
-                if not str(res.get("id") or "").strip():
-                    rtype_slug = str(res.get("resourceType") or "resource").lower()
-                    res = {**res, "id": f"anon-{rtype_slug}-{idx}"}
-                resources.append(res)
-    if not resources and bundle.get("resourceType") and bundle.get("resourceType") != "Bundle":
-        res = bundle
-        if not str(res.get("id") or "").strip():
-            rtype_slug = str(res.get("resourceType") or "resource").lower()
-            res = {**res, "id": f"anon-{rtype_slug}-1"}
-        resources = [res]
-
-    excluded_counts: Dict[str, int] = {}
-    orgs_by_id: Dict[str, str] = {}
-    pracs_by_id: Dict[str, str] = {}
-    meds_by_id: Dict[str, Tuple[str, str]] = {}
-    encounters_by_id: Dict[str, Mapping[str, Any]] = {}
-    obs_by_id: Dict[str, Mapping[str, Any]] = {}
-    conds_by_id: Dict[str, str] = {}
-    cond_sens_by_id: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
-    provenance_org_by_target: Dict[str, str] = {}
-
-    patient_res: Optional[Mapping[str, Any]] = None
-
-    # Pass 1: Index lookup tables (Organization, Practitioner, Medication, Encounter, Observation, Condition)
-    for res in resources:
-        rtype = str(res.get("resourceType") or "")
-        rid = str(res.get("id") or "")
-        if rtype in NON_CLINICAL_RESOURCE_TYPES:
-            excluded_counts[rtype] = excluded_counts.get(rtype, 0) + 1
-            continue
-        if rtype == "Patient" and patient_res is None:
-            patient_res = res
-        elif rtype == "Organization" and rid:
-            orgs_by_id[rid] = str(res.get("name") or rid).strip()
-            excluded_counts[rtype] = excluded_counts.get(rtype, 0) + 1
-        elif rtype == "Practitioner" and rid:
-            names = res.get("name") or []
-            if names and isinstance(names[0], Mapping):
-                given = " ".join(names[0].get("given") or [])
-                family = str(names[0].get("family") or "")
-                pracs_by_id[rid] = f"{given} {family}".strip()
-            excluded_counts[rtype] = excluded_counts.get(rtype, 0) + 1
-        elif rtype == "Medication" and rid:
-            meds_by_id[rid] = _coding_pair(res.get("code"))
-            excluded_counts[rtype] = excluded_counts.get(rtype, 0) + 1
-        elif rtype == "Encounter" and rid:
-            encounters_by_id[rid] = res
-        elif rtype == "Observation" and rid:
-            obs_by_id[rid] = res
-        elif rtype == "Condition" and rid:
-            _, c_disp = _coding_pair(res.get("code"))
-            if c_disp:
-                conds_by_id[rid] = c_disp
-        elif rtype in LOOKUP_ONLY_RESOURCE_TYPES and rtype != "Provenance":
-            excluded_counts[rtype] = excluded_counts.get(rtype, 0) + 1
-
-    # Pass 1b: Invert Provenance.target[] -> source organization/author
-    for res in resources:
-        if res.get("resourceType") != "Provenance":
-            continue
-        excluded_counts["Provenance"] = excluded_counts.get("Provenance", 0) + 1
-        agent_name = ""
-        for agent in res.get("agent") or []:
-            if not isinstance(agent, Mapping):
-                continue
-            who = agent.get("who") or {}
-            on_behalf = agent.get("onBehalfOf") or {}
-            org_id = _strip_urn(on_behalf.get("reference") or who.get("reference"))
-            disp = str(on_behalf.get("display") or who.get("display") or orgs_by_id.get(org_id) or "").strip()
-            if disp:
-                agent_name = disp
-                break
-        if agent_name:
-            for tgt in res.get("target") or []:
-                if isinstance(tgt, Mapping):
-                    tid = _strip_urn(tgt.get("reference"))
-                    if tid and tid not in provenance_org_by_target:
-                        provenance_org_by_target[tid] = agent_name
-
-    def resolve_source_org(res: Mapping[str, Any]) -> Optional[str]:
-        rid = str(res.get("id") or "")
-        # Check explicit serviceProvider / recorder / asserter / requester / performer first
-        for role_field in ("serviceProvider", "recorder", "asserter", "requester"):
-            role_obj = res.get(role_field)
-            if isinstance(role_obj, Mapping):
-                r_ref = _strip_urn(role_obj.get("reference"))
-                r_disp = str(
-                    role_obj.get("display") or orgs_by_id.get(r_ref) or pracs_by_id.get(r_ref) or ""
-                ).strip()
-                if r_disp:
-                    return r_disp
-        for perf in res.get("performer") or []:
-            if isinstance(perf, Mapping):
-                actor = perf.get("actor") or perf
-                p_ref = _strip_urn(actor.get("reference"))
-                p_disp = str(actor.get("display") or orgs_by_id.get(p_ref) or pracs_by_id.get(p_ref) or "").strip()
-                if p_disp:
-                    return p_disp
-        enc_ref = _strip_urn((res.get("encounter") or {}).get("reference"))
-        if enc_ref and enc_ref in encounters_by_id:
-            enc_sp = encounters_by_id[enc_ref].get("serviceProvider")
-            if isinstance(enc_sp, Mapping):
-                sp_disp = str(
-                    enc_sp.get("display") or orgs_by_id.get(_strip_urn(enc_sp.get("reference"))) or ""
-                ).strip()
-                if sp_disp:
-                    return sp_disp
-        prov_org = provenance_org_by_target.get(rid)
-        if prov_org:
-            return prov_org
-        meta_obj = res.get("meta")
-        if isinstance(meta_obj, Mapping):
-            for tag in meta_obj.get("tag") or []:
-                if isinstance(tag, Mapping) and str(tag.get("system") or "").endswith(
-                    "/wahealthsummary-source-name"
-                ):
-                    t_code = str(tag.get("code") or tag.get("display") or "").strip()
-                    if t_code:
-                        return t_code
-        return None
-
-    def _classify_res_sensitivity(
-        res: Mapping[str, Any],
-        code: Optional[str],
-        display: str,
-        categories: Sequence[str] = (),
-        *,
-        fallback_kb_sensitivity: Optional[str] = None,
-    ) -> Tuple[Optional[str], Optional[str]]:
-        if not enable_privacy_classification:
-            return None, None
-        sec_codes = _extract_meta_security_codes(res)
-        sens, src = classify_sensitivity_with_source(
-            code, display, categories, meta_security_codes=sec_codes
-        )
-        if not sens and fallback_kb_sensitivity:
-            return str(fallback_kb_sensitivity), "kb_coded_privacy"
-        return sens, src
-
-    def _classify_visit_sensitivity(
-        res: Mapping[str, Any],
-        primary_code: Optional[str],
-        disp_label: str,
-        reason_pairs: Sequence[Tuple[str, str]],
-        reasons: Sequence[str],
-        ref_cond_ids: Sequence[str],
-        org: Optional[str],
-    ) -> Tuple[Optional[str], Optional[str]]:
-        combined_text = " | ".join(
-            p for p in [disp_label, *reasons, org or ""] if p
-        )
-        sens, src = _classify_res_sensitivity(res, primary_code, combined_text)
-        if sens == "SDOH/PRIVACY-SENSITIVE":
-            return sens, src
-        fallback_pair: Tuple[Optional[str], Optional[str]] = (sens, src)
-        for r_code, r_disp in reason_pairs:
-            r_kb = resolve_condition_code(r_code, r_disp)
-            r_kb_sens = (
-                r_kb.get("sensitivity")
-                if r_kb.get("resolved_by") != "heuristic_fallback"
-                else None
-            )
-            r_sens, r_src = _classify_res_sensitivity(
-                res,
-                r_code,
-                r_disp,
-                fallback_kb_sensitivity=r_kb_sens,
-            )
-            if r_sens == "SDOH/PRIVACY-SENSITIVE":
-                return r_sens, r_src
-            if not fallback_pair[0] and r_sens:
-                fallback_pair = (r_sens, r_src)
-        for cid in ref_cond_ids:
-            c_sens, c_src = cond_sens_by_id.get(cid, (None, None))
-            if c_sens == "SDOH/PRIVACY-SENSITIVE":
-                return c_sens, c_src
-            if not fallback_pair[0] and c_sens:
-                fallback_pair = (c_sens, c_src)
-        return fallback_pair
-
-    items: List[ClinicalItem] = []
-    numeric_points: List[NumericPoint] = []
-    all_clinical_dates: List[str] = []
-
-    _skip_ref_date_statuses = {
-        "planned",
-        "booked",
-        "scheduled",
-        "proposed",
-        "pending",
-        "waitlist",
-        "cancelled",
-        "entered-in-error",
-        "noshow",
+def _compute_reference_date(resources: Sequence[Mapping[str, Any]]) -> Optional[str]:
+    skip = {"planned", "booked", "scheduled", "proposed", "pending", "waitlist", "cancelled", "entered-in-error", "noshow"}
+    ctypes = {
+        "AllergyIntolerance", "Condition", "MedicationRequest", "MedicationAdministration",
+        "MedicationStatement", "MedicationDispense", "Immunization", "DocumentReference",
+        "DiagnosticReport", "Observation", "Procedure", "CarePlan", "Goal", "ImagingStudy",
+        "Encounter", "Appointment",
     }
-
-    _reference_date_clinical_resource_types = {
-        "AllergyIntolerance",
-        "Condition",
-        "MedicationRequest",
-        "MedicationAdministration",
-        "MedicationStatement",
-        "MedicationDispense",
-        "Immunization",
-        "DocumentReference",
-        "DiagnosticReport",
-        "Observation",
-        "Procedure",
-        "CarePlan",
-        "Goal",
-        "ImagingStudy",
-        "Encounter",
-        "Appointment",
-    }
-
-    # Pre-scan clinical dates to establish reference_date solely from extracted clinical resources
+    dates: List[str] = []
     for res in resources:
-        rtype = str(res.get("resourceType") or "")
-        if rtype not in _reference_date_clinical_resource_types:
+        rt = str(res.get("resourceType") or "")
+        if rt not in ctypes:
             continue
-        raw_st = (
-            _codeable_status(res.get("status"))
-            or _codeable_status(res.get("clinicalStatus"))
-        )
-        ver_st = _codeable_status(res.get("verificationStatus"))
-        if raw_st in _skip_ref_date_statuses or ver_st in {"refuted", "entered-in-error"}:
+        st = _codeable_status(res.get("status")) or _codeable_status(res.get("clinicalStatus"))
+        if st in skip or _codeable_status(res.get("verificationStatus")) in _INVALIDATED_VERIFICATION:
             continue
-        for field_name in (
-            "effectiveDateTime",
-            "occurrenceDateTime",
-            "onsetDateTime",
-            "authoredOn",
-            "performedDateTime",
-            "recordedDate",
-            "issued",
-            "date",
-        ):
-            d = _iso_date(res.get(field_name))
+        for fn in ("effectiveDateTime", "occurrenceDateTime", "onsetDateTime", "authoredOn", "performedDateTime", "recordedDate", "issued", "date"):
+            d = _iso_date(res.get(fn))
             if d:
-                all_clinical_dates.append(d)
+                dates.append(d)
                 break
         else:
-            for period_field in ("period", "effectivePeriod", "performedPeriod"):
-                p = res.get(period_field)
+            for pf in ("period", "effectivePeriod", "performedPeriod"):
+                p = res.get(pf)
                 if isinstance(p, Mapping):
-                    if rtype == "Encounter" and raw_st not in {"finished", "completed", "fulfilled", ""}:
-                        d = _iso_date(p.get("start"))
-                    else:
-                        d = _iso_date(p.get("end") or p.get("start"))
+                    d = _iso_date(p.get("start") if (rt == "Encounter" and st not in {"finished", "completed", "fulfilled", ""}) else (p.get("end") or p.get("start")))
                     if d:
-                        all_clinical_dates.append(d)
+                        dates.append(d)
                         break
             else:
-                if rtype == "Appointment" and raw_st == "fulfilled":
+                if rt == "Appointment" and st == "fulfilled":
                     d = _iso_date(res.get("end") or res.get("start"))
                     if d:
-                        all_clinical_dates.append(d)
+                        dates.append(d)
+    return max(dates) if dates else None
 
-    reference_date = max(all_clinical_dates) if all_clinical_dates else None
 
-    # 1. Extract Patient Demographics Header
-    patient_id: Optional[str] = None
-    patient_name = "Unknown Patient"
-    birth_date: Optional[str] = None
-    if patient_res is not None:
-        patient_id = str(patient_res.get("id") or "patient-1")
-        birth_date = _iso_date(patient_res.get("birthDate"))
-        names = patient_res.get("name") or []
-        if names and isinstance(names[0], Mapping):
-            chosen = next((n for n in names if n.get("use") == "official"), names[0])
-            given = " ".join(chosen.get("given") or [])
-            family = str(chosen.get("family") or "")
-            patient_name = f"{given} {family}".strip() or patient_name
-        gender = str(patient_res.get("gender") or "unknown")
-        age_str = ""
-        if birth_date and reference_date:
-            try:
-                b_dt = date.fromisoformat(birth_date)
-                r_dt = date.fromisoformat(reference_date)
-                age_yrs = int((r_dt - b_dt).days // 365.2425)
-                age_str = f", Age: {age_yrs}y (as of {reference_date})"
-            except ValueError:
-                pass
-        langs: List[str] = []
-        for comm in patient_res.get("communication") or []:
-            if isinstance(comm, Mapping):
-                _, l_disp = _coding_pair(comm.get("language"))
-                if l_disp:
-                    langs.append(l_disp)
-        lang_str = f", Language: {', '.join(langs)}" if langs else ""
-        p_date = reference_date or birth_date
-        items.append(
-            ClinicalItem(
-                resource_type="Patient",
-                resource_uuid=patient_id,
-                date=p_date,
-                clinical_date=None,
-                date_kind="administrative",
-                section="patient",
-                code="patient-demographics",
-                display=patient_name,
-                text=f"Patient: {patient_name}, DOB: {birth_date or 'unknown'}, Gender: {gender}{age_str}{lang_str}",
-                mandatory=True,
-                status="active",
-            )
-        )
+def extract_bundle(bundle: Mapping[str, Any], *, preserve_intraday_timestamps: bool = False) -> ExtractedChart:
+    """Parse a FHIR R4 Bundle into domain-neutral `ClinicalItem`, `ClinicalNote`, and `NumericPoint` objects."""
+    raw_entries = bundle.get("entry") or []
+    resources: List[Mapping[str, Any]] = []
+    for idx, entry in enumerate(raw_entries, start=1):
+        res = entry.get("resource") if isinstance(entry, Mapping) else None
+        if isinstance(res, Mapping) and res.get("resourceType"):
+            resources.append(res if str(res.get("id") or "").strip() else {**res, "id": f"anon-{str(res['resourceType']).lower()}-{idx}"})
+    if not resources and bundle.get("resourceType") and bundle.get("resourceType") != "Bundle":
+        resources = [bundle if str(bundle.get("id") or "").strip() else {**bundle, "id": f"anon-{str(bundle['resourceType']).lower()}-1"}]
 
-    # 2. Extract AllergyIntolerance (Active/Confirmed Mandatory IPS Safety Core; exclude entered-in-error)
+    excluded: Dict[str, int] = {}
+    orgs, pracs, meds, encs, obs_by_id, conds, prov_orgs = {}, {}, {}, {}, {}, {}, {}
+    patient_res: Optional[Mapping[str, Any]] = None
+
     for res in resources:
-        if res.get("resourceType") != "AllergyIntolerance":
-            continue
+        rt, rid = str(res.get("resourceType") or ""), str(res.get("id") or "")
+        if rt in NON_CLINICAL_RESOURCE_TYPES:
+            excluded[rt] = excluded.get(rt, 0) + 1
+        elif rt == "Patient" and patient_res is None:
+            patient_res = res
+        elif rt == "Organization" and rid:
+            orgs[rid] = str(res.get("name") or rid).strip()
+            excluded[rt] = excluded.get(rt, 0) + 1
+        elif rt == "Practitioner" and rid:
+            nm = (res.get("name") or [{}])[0]
+            if isinstance(nm, Mapping):
+                pracs[rid] = f"{' '.join(nm.get('given') or [])} {nm.get('family') or ''}".strip()
+            excluded[rt] = excluded.get(rt, 0) + 1
+        elif rt == "Medication" and rid:
+            meds[rid] = _coding_pair(res.get("code"))
+            excluded[rt] = excluded.get(rt, 0) + 1
+        elif rt == "Encounter" and rid:
+            encs[rid] = res
+        elif rt == "Observation" and rid:
+            obs_by_id[rid] = res
+        elif rt == "Condition" and rid:
+            _, cd = _coding_pair(res.get("code"))
+            if cd:
+                conds[rid] = cd
+        elif rt == "Provenance":
+            excluded[rt] = excluded.get(rt, 0) + 1
+            aname = ""
+            for ag in res.get("agent") or []:
+                if isinstance(ag, Mapping):
+                    who, ob = ag.get("who") or {}, ag.get("onBehalfOf") or {}
+                    oid = _strip_urn(ob.get("reference") or who.get("reference"))
+                    aname = str(ob.get("display") or who.get("display") or orgs.get(oid) or "").strip()
+                    if aname:
+                        break
+            for tgt in (res.get("target") or []) if aname else ():
+                if isinstance(tgt, Mapping):
+                    tid = _strip_urn(tgt.get("reference"))
+                    if tid and tid not in prov_orgs:
+                        prov_orgs[tid] = aname
+        elif rt in LOOKUP_ONLY_RESOURCE_TYPES:
+            excluded[rt] = excluded.get(rt, 0) + 1
+
+    def src_of(res: Mapping[str, Any]) -> Optional[str]:
         rid = str(res.get("id") or "")
-        code, disp = _coding_pair(res.get("code"))
-        c_status = _codeable_status(res.get("clinicalStatus")) or "active"
-        v_status = _codeable_status(res.get("verificationStatus"))
-        if c_status == "entered-in-error" or v_status == "entered-in-error":
-            excluded_counts["AllergyIntolerance(entered-in-error)"] = (
-                excluded_counts.get("AllergyIntolerance(entered-in-error)", 0) + 1
-            )
-            continue
-        crit = str(res.get("criticality") or "").strip()
-        cats = [str(c) for c in (res.get("category") or []) if c]
-        reactions: List[str] = []
-        for rxn in res.get("reaction") or []:
-            if isinstance(rxn, Mapping):
-                sev = str(rxn.get("severity") or "").strip()
-                for manif in rxn.get("manifestation") or []:
-                    _, m_disp = _coding_pair(manif)
-                    if m_disp:
-                        reactions.append(f"{m_disp} ({sev})" if sev else m_disp)
-        rec_date = _iso_date(res.get("recordedDate") or res.get("onsetDateTime"))
-        src_org = resolve_source_org(res)
-        sens, sens_source = _classify_res_sensitivity(
-            res, code, f"{disp} {' '.join(reactions)} {src_org or ''}".strip(), cats
-        )
-        is_actionable_allergy = (
-            c_status not in {"inactive", "resolved"} and v_status != "refuted"
-        )
-        qualifiers = [f"status: {c_status}"]
-        if v_status:
-            qualifiers.append(f"verification: {v_status}")
-        if crit:
-            qualifiers.append(f"criticality: {crit}")
-        if cats:
-            qualifiers.append(f"category: {'/'.join(cats)}")
-        if reactions:
-            qualifiers.append(f"reaction: {', '.join(reactions)}")
-        allergy_meta: Dict[str, Any] = {}
-        if sens_source:
-            allergy_meta["sensitivity_source"] = sens_source
-        if v_status:
-            allergy_meta["verification_status"] = v_status
-        items.append(
-            ClinicalItem(
-                resource_type="AllergyIntolerance",
-                resource_uuid=rid,
-                date=rec_date,
-                clinical_date=rec_date if v_status != "refuted" else None,
-                date_kind="clinical_event" if (rec_date and v_status != "refuted") else "unknown",
-                section="allergy",
-                code=code or disp,
-                display=disp or code or "Unspecified allergy",
-                text=f"Allergy: {disp or code} ({', '.join(qualifiers)})",
-                mandatory=is_actionable_allergy,
-                status=c_status,
-                source_org=src_org,
-                sensitivity=sens,
-                metadata=allergy_meta,
-            )
-        )
+        for rf in ("serviceProvider", "recorder", "asserter", "requester"):
+            ro = res.get(rf)
+            if isinstance(ro, Mapping):
+                rref = _strip_urn(ro.get("reference"))
+                d = str(ro.get("display") or orgs.get(rref) or pracs.get(rref) or "").strip()
+                if d:
+                    return d
+        for pf in res.get("performer") or []:
+            if isinstance(pf, Mapping):
+                act = pf.get("actor") or pf
+                pref = _strip_urn(act.get("reference"))
+                d = str(act.get("display") or orgs.get(pref) or pracs.get(pref) or "").strip()
+                if d:
+                    return d
+        enc_ref = _strip_urn((res.get("encounter") or {}).get("reference"))
+        if enc_ref in encs and isinstance(encs[enc_ref].get("serviceProvider"), Mapping):
+            sp = encs[enc_ref]["serviceProvider"]
+            d = str(sp.get("display") or orgs.get(_strip_urn(sp.get("reference"))) or "").strip()
+            if d:
+                return d
+        if rid in prov_orgs:
+            return prov_orgs[rid]
+        for tag in ((res.get("meta") or {}).get("tag") or []) if isinstance(res.get("meta"), Mapping) else ():
+            if isinstance(tag, Mapping) and str(tag.get("system") or "").endswith("/wahealthsummary-source-name"):
+                tc = str(tag.get("code") or tag.get("display") or "").strip()
+                if tc:
+                    return tc
+        return None
 
-    # 3. Extract Condition (Active vs Resolved/Historical)
-    raw_conditions: List[Dict[str, Any]] = []
-    for res in resources:
-        if res.get("resourceType") != "Condition":
-            continue
-        rid = str(res.get("id") or "")
-        code, disp = _coding_pair(res.get("code"))
-        c_status = _codeable_status(res.get("clinicalStatus")) or "active"
-        v_status = _codeable_status(res.get("verificationStatus"))
-        onset = _iso_date(res.get("onsetDateTime") or res.get("recordedDate"))
-        abatement = _iso_date(res.get("abatementDateTime"))
-        cats = _categories(res)
-        cond_kb = resolve_condition_code(code, disp)
-        kb_sens = cond_kb.get("sensitivity") if cond_kb.get("resolved_by") != "heuristic_fallback" else None
-        sens, sens_source = _classify_res_sensitivity(
-            res, code, disp, cats, fallback_kb_sensitivity=kb_sens
-        )
-        raw_conditions.append(
-            {
-                "resourceUuid": rid,
-                "code": code,
-                "display": disp or str(cond_kb.get("display") or code or "Condition"),
-                "status": c_status,
-                "verification": v_status,
-                "onset": onset,
-                "abatement": abatement,
-                "categories": cats,
-                "sensitivity": sens,
-                "sensitivity_source": sens_source,
-                "source_org": resolve_source_org(res),
-                "kb_resolution": cond_kb,
-            }
-        )
-
-    _non_actionable_cond_verif = {"refuted", "entered-in-error"}
-    active_cond_dicts = [
-        c
-        for c in raw_conditions
-        if c["status"] in {"active", "recurrence", "relapse"}
-        and c["verification"] not in _non_actionable_cond_verif
-    ]
-    resolved_cond_dicts = [
-        c
-        for c in raw_conditions
-        if c["verification"] not in _non_actionable_cond_verif
-        and c["status"] != "entered-in-error"
-        and c["status"] not in {"active", "recurrence", "relapse"}
-    ]
-    condition_conflicts = (
-        detect_condition_conflicts(active_cond_dicts, resolved_cond_dicts)
-        if include_conflict_annotations
-        else {}
-    )
-
-    for c in raw_conditions:
-        rid = c["resourceUuid"]
-        is_active = (
-            c["status"] in {"active", "recurrence", "relapse"}
-            and c["verification"] not in _non_actionable_cond_verif
-        )
-        conflict = condition_conflicts.get(rid)
-        sens = c["sensitivity"]
-        if rid and sens:
-            cond_sens_by_id[rid] = (sens, c["sensitivity_source"] or "condition_privacy")
-        event_date = c["onset"] if is_active else (c["abatement"] or c["onset"])
-        details = [f"status: {c['status']}"]
-        if c["verification"]:
-            details.append(f"verification: {c['verification']}")
-        if c["onset"]:
-            details.append(f"onset: {c['onset']}")
-        if c["abatement"]:
-            details.append(f"resolved: {c['abatement']}")
-        if c["source_org"]:
-            details.append(f"source: {c['source_org']}")
-        if c["code"]:
-            details.append(f"SNOMED: {c['code']}")
-        cond_kb = c["kb_resolution"]
-        cond_meta: Dict[str, Any] = {
-            "onset": c["onset"],
-            "abatement": c["abatement"],
-            "kb_resolution": cond_kb,
-        }
-        if c["verification"]:
-            cond_meta["verification_status"] = c["verification"]
-        if c["sensitivity_source"]:
-            cond_meta["sensitivity_source"] = c["sensitivity_source"]
-        items.append(
-            ClinicalItem(
-                resource_type="Condition",
-                resource_uuid=rid,
-                date=event_date,
-                clinical_date=event_date,
-                date_kind="clinical_event" if event_date else "unknown",
-                section="condition_active" if is_active else "condition_resolved",
-                code=c["code"] or c["display"],
-                display=c["display"],
-                text=f"Condition: {c['display']} ({', '.join(details)})",
-                mandatory=is_active or bool(conflict),
-                status=c["status"],
-                end_date=c["abatement"],
-                source_org=c["source_org"],
-                sensitivity=sens,
-                conflict_note=conflict,
-                is_routine=(sens == "SDOH-SOCIAL"),
-                metadata=cond_meta,
-            )
-        )
-
-    # 4. Extract Unified Medications (MedicationRequest, MedicationAdministration, MedicationStatement, MedicationDispense)
-    med_types = {
-        "MedicationRequest",
-        "MedicationAdministration",
-        "MedicationStatement",
-        "MedicationDispense",
-    }
-    raw_meds: List[Dict[str, Any]] = []
-    for res in resources:
-        rtype = str(res.get("resourceType") or "")
-        if rtype not in med_types:
-            continue
-        rid = str(res.get("id") or "")
-        code, disp = _coding_pair(res.get("medicationCodeableConcept"))
-        if not disp and isinstance(res.get("medicationReference"), Mapping):
-            m_ref = _strip_urn(res["medicationReference"].get("reference"))
-            if m_ref in meds_by_id:
-                code, disp = meds_by_id[m_ref]
-            else:
-                disp = str(res["medicationReference"].get("display") or "")
-        status = str(res.get("status") or "unknown").strip().lower()
-        if status == "entered-in-error":
-            excluded_counts[f"{rtype}(entered-in-error)"] = (
-                excluded_counts.get(f"{rtype}(entered-in-error)", 0) + 1
-            )
-            continue
-        m_raw_ts = str(
-            res.get("authoredOn")
-            or res.get("effectiveDateTime")
-            or (res.get("effectivePeriod") or {}).get("start")
-            or res.get("whenHandedOver")
-            or res.get("whenPrepared")
-            or res.get("dateAsserted")
-            or ""
-        ).strip()
-        end_raw_ts = str((res.get("effectivePeriod") or {}).get("end") or "").strip()
-        m_date = _iso_date(m_raw_ts)
-        end_date = _iso_date(end_raw_ts)
-
-        # Extract dosage text and/or structured dosage instructions across R4 list and object shapes
-        dose_strs: List[str] = []
-        for d_inst in res.get("dosageInstruction") or []:
-            if isinstance(d_inst, Mapping):
-                d_txt = _format_structured_dosage(d_inst)
-                if d_txt:
-                    dose_strs.append(d_txt)
-        raw_dosage = res.get("dosage")
-        if not dose_strs and isinstance(raw_dosage, list):
-            for d_inst in raw_dosage:
-                if isinstance(d_inst, Mapping):
-                    d_txt = _format_structured_dosage(d_inst)
-                    if d_txt:
-                        dose_strs.append(d_txt)
-        elif not dose_strs and isinstance(raw_dosage, Mapping):
-            d_txt = _format_structured_dosage(raw_dosage)
-            if d_txt:
-                dose_strs.append(d_txt)
-
-        # Extract reason (reasonCode or reasonReference -> Condition)
-        reasons: List[str] = []
-        med_ref_cond_ids: List[str] = []
-        for rc in res.get("reasonCode") or []:
-            _, r_disp = _coding_pair(rc)
-            if r_disp:
-                reasons.append(r_disp)
+    def reasons_of(res: Mapping[str, Any]) -> List[str]:
+        out = [_coding_pair(rc)[1] for rc in (res.get("reasonCode") or []) if _coding_pair(rc)[1]]
         for rr in res.get("reasonReference") or []:
             if isinstance(rr, Mapping):
-                c_id = _strip_urn(rr.get("reference"))
-                if c_id:
-                    med_ref_cond_ids.append(c_id)
-                r_disp = str(rr.get("display") or conds_by_id.get(c_id) or "").strip()
-                if r_disp:
-                    reasons.append(r_disp)
+                d = str(rr.get("display") or conds.get(_strip_urn(rr.get("reference"))) or "").strip()
+                if d:
+                    out.append(d)
+        return out
 
-        setting = "inpatient/administered" if rtype == "MedicationAdministration" else "prescribed"
-        is_active = status in {"active", "in-progress", "on-hold"}
-        med_kb = resolve_medication_code(code, disp)
-        resolved_disp = disp or (
-            str(med_kb.get("display") or "")
-            if med_kb.get("resolved_by") != "heuristic_fallback"
-            else ""
-        )
-        ingredient = str(
-            med_kb.get("ingredient")
-            if med_kb.get("resolved_by") != "heuristic_fallback" and med_kb.get("ingredient")
-            else normalize_drug_ingredient(resolved_disp or code)
-        )
-        linked_order_uuids: List[str] = []
-        for link_field in ("basedOn", "partOf", "request", "prescription", "authorizingPrescription"):
-            raw_link = res.get(link_field)
-            if isinstance(raw_link, Mapping) and raw_link.get("reference"):
-                linked_order_uuids.append(_strip_urn(str(raw_link.get("reference"))))
-            elif isinstance(raw_link, list):
-                for entry_link in raw_link:
-                    if isinstance(entry_link, Mapping) and entry_link.get("reference"):
-                        linked_order_uuids.append(_strip_urn(str(entry_link.get("reference"))))
-        med_src_org = resolve_source_org(res)
-        med_sens_text = " | ".join(
-            p for p in [resolved_disp or disp, *reasons, med_src_org or ""] if p
-        )
-        med_sens, med_sens_src = _classify_res_sensitivity(res, code, med_sens_text)
-        if med_sens != "SDOH/PRIVACY-SENSITIVE":
-            for cid in med_ref_cond_ids:
-                c_sens, c_src = cond_sens_by_id.get(cid, (None, None))
-                if c_sens == "SDOH/PRIVACY-SENSITIVE":
-                    med_sens, med_sens_src = c_sens, c_src
-                    break
-        raw_meds.append(
-            {
-                "resourceType": rtype,
-                "resourceUuid": rid,
-                "code": code,
-                "display": resolved_disp or code or "Medication",
-                "status": status,
-                "is_active": is_active,
-                "date": m_date,
-                "end_date": end_date,
-                "raw_timestamp": m_raw_ts,
-                "end_raw_timestamp": end_raw_ts,
-                "dose_strs": dose_strs,
-                "reasons": reasons,
-                "setting": setting,
-                "ingredient_key": ingredient,
-                "source_org": med_src_org,
-                "sensitivity": med_sens,
-                "sensitivity_source": med_sens_src,
-                "linked_order_uuids": tuple(dict.fromkeys(u for u in linked_order_uuids if u)),
-                "kb_resolution": med_kb,
-            }
-        )
+    items: List[ClinicalItem] = []
+    notes_list: List[ClinicalNote] = []
+    numeric_points: List[NumericPoint] = []
+    ref_date = _compute_reference_date(resources)
+    pid, pname, dob = None, "Unknown Patient", None
 
-    med_conflicts = (
-        detect_medication_conflicts([m for m in raw_meds if m["is_active"]])
-        if include_conflict_annotations
-        else {}
-    )
-    for m in raw_meds:
-        rid = m["resourceUuid"]
-        m_conflict = med_conflicts.get(rid)
-        med_kb = m["kb_resolution"]
-        ing_grp = str(med_kb.get("ingredient") or m["ingredient_key"])
-        t_class = str(med_kb.get("therapeutic_class") or "medication")
-        quals = [f"status: {m['status']}", f"type: {m['setting']}"]
-        if m["dose_strs"]:
-            quals.append(f"dosage: {'; '.join(m['dose_strs'][:2])}")
-        if m["reasons"]:
-            quals.append(f"reason: {', '.join(dict.fromkeys(m['reasons']))}")
-        if m["source_org"]:
-            quals.append(f"source: {m['source_org']}")
-        if m["code"]:
-            quals.append(f"RxNorm: {m['code']}")
-        med_meta: Dict[str, Any] = {
-            "reasons": m["reasons"],
-            "dosage": m["dose_strs"],
-            "setting": m["setting"],
-            "ingredient_group": ing_grp,
-            "therapeutic_class": t_class,
-            "kb_resolution": med_kb,
-        }
-        if m["sensitivity_source"]:
-            med_meta["sensitivity_source"] = m["sensitivity_source"]
-        if m["raw_timestamp"]:
-            med_meta["raw_timestamp"] = m["raw_timestamp"]
-        if m["end_raw_timestamp"]:
-            med_meta["end_raw_timestamp"] = m["end_raw_timestamp"]
-        if m["linked_order_uuids"]:
-            med_meta["linked_order_uuids"] = list(m["linked_order_uuids"])
-        items.append(
-            ClinicalItem(
-                resource_type=m["resourceType"],
-                resource_uuid=rid,
-                date=m["date"],
-                clinical_date=m["date"],
-                date_kind="clinical_event" if m["date"] else "unknown",
-                section="med_active" if m["is_active"] else "med_historical",
-                code=m["code"] or m["ingredient_key"],
-                display=m["display"],
-                text=f"Medication: {m['display']} ({', '.join(quals)})",
-                mandatory=m["is_active"],
-                status=m["status"],
-                end_date=m["end_date"],
-                source_org=m["source_org"],
-                sensitivity=m["sensitivity"],
-                conflict_note=m_conflict,
-                ingredient_key=m["ingredient_key"],
-                metadata=med_meta,
-            )
-        )
-
-    # 5. Extract Immunization
-    raw_imms: List[Dict[str, Any]] = []
-    for res in resources:
-        if res.get("resourceType") != "Immunization":
-            continue
-        rid = str(res.get("id") or "")
-        code, disp = _coding_pair(res.get("vaccineCode"))
-        occ_date = _iso_date(res.get("occurrenceDateTime"))
-        status = str(res.get("status") or "completed").strip().lower()
-        if status == "entered-in-error":
-            excluded_counts["Immunization(entered-in-error)"] = (
-                excluded_counts.get("Immunization(entered-in-error)", 0) + 1
-            )
-            continue
-        imm_src_org = resolve_source_org(res)
-        imm_sens, imm_sens_src = _classify_res_sensitivity(
-            res, code, f"{disp} {imm_src_org or ''}".strip()
-        )
-        raw_imms.append(
-            {
-                "resourceUuid": rid,
-                "code": code,
-                "display": disp or code or "Vaccine",
-                "date": occ_date,
-                "status": status,
-                "source_org": imm_src_org,
-                "sensitivity": imm_sens,
-                "sensitivity_source": imm_sens_src,
-                "group": classify_vaccine_group(code, disp),
-            }
-        )
-
-    completed_imms = [im for im in raw_imms if im["status"] == "completed"]
-    imm_anomalies = (
-        annotate_immunization_anomalies(completed_imms, birth_date)
-        if include_conflict_annotations
-        else {}
-    )
-    imms_by_group: Dict[str, List[str]] = {}
-    for imm in completed_imms:
-        imms_by_group.setdefault(imm["group"], []).append(imm["resourceUuid"])
-
-    for imm in raw_imms:
-        rid = imm["resourceUuid"]
-        anom = imm_anomalies.get(rid)
-        is_completed_imm = imm["status"] == "completed"
-        quals = [f"status: {imm['status']}"]
-        if imm["code"]:
-            quals.append(f"CVX: {imm['code']}")
-        if imm["source_org"]:
-            quals.append(f"source: {imm['source_org']}")
-        series_members: Tuple[str, ...] = (
-            tuple(imms_by_group.get(imm["group"], [rid]))
-            if anom and anom.startswith("acip_schedule_note:")
-            else ()
-        )
-        imm_kb = resolve_immunization_code(imm["code"], imm["display"])
-        imm_meta: Dict[str, Any] = {
-            "vaccine_group": imm_kb.get("vaccine_group", imm["group"]),
-            "kb_resolution": imm_kb,
-        }
-        if imm["sensitivity_source"]:
-            imm_meta["sensitivity_source"] = imm["sensitivity_source"]
-        items.append(
-            ClinicalItem(
-                resource_type="Immunization",
-                resource_uuid=rid,
-                date=imm["date"],
-                clinical_date=imm["date"] if is_completed_imm else None,
-                date_kind="clinical_event" if (imm["date"] and is_completed_imm) else "unknown",
-                section="immunization",
-                code=imm["code"] or imm["group"],
-                display=imm["display"],
-                text=f"Immunization: {imm['display']} ({', '.join(quals)})",
-                mandatory=bool(anom),
-                status=imm["status"],
-                source_org=imm["source_org"],
-                sensitivity=imm["sensitivity"],
-                conflict_note=anom,
-                ingredient_key=imm["group"],
-                member_uuids=series_members,
-                metadata=imm_meta,
-            )
-        )
-
-    # 6. Deduplicate Base64 Clinical Notes across DocumentReference & DiagnosticReport.presentedForm
-    notes_by_hash: Dict[str, Dict[str, Any]] = {}
-    dedup_note_count = 0
-    presented_form_dr_ids: Set[str] = set()
-
-    for res in resources:
-        rtype = str(res.get("resourceType") or "")
-        rid = str(res.get("id") or "")
-        if rtype == "DocumentReference":
-            doc_st = str(res.get("status") or "").strip().lower()
-            doc_ver_st = str(res.get("docStatus") or "").strip().lower()
-            if doc_st == "entered-in-error" or doc_ver_st == "entered-in-error":
-                excluded_counts["DocumentReference(entered-in-error)"] = (
-                    excluded_counts.get("DocumentReference(entered-in-error)", 0) + 1
-                )
-                continue
-            n_raw_ts = str(res.get("date") or (res.get("context") or {}).get("period", {}).get("start") or "").strip()
-            n_date = _iso_date(n_raw_ts)
-            _, n_type = _coding_pair(res.get("type"))
-            sec_codes = _extract_meta_security_codes(res)
-            for content_item in res.get("content") or []:
-                att = (content_item or {}).get("attachment") or {}
-                b64_data = att.get("data")
-                if isinstance(b64_data, str) and b64_data:
-                    digest = hashlib.sha256(b64_data.strip().encode("ascii", errors="ignore")).hexdigest()
-                    if digest in notes_by_hash:
-                        notes_by_hash[digest]["member_uuids"].append(rid)
-                        if n_date:
-                            notes_by_hash[digest]["dates"].append(n_date)
-                        if n_raw_ts:
-                            notes_by_hash[digest]["timestamps"].append(n_raw_ts)
-                        notes_by_hash[digest]["meta_security"].extend(sec_codes)
-                        dedup_note_count += 1
-                    else:
-                        try:
-                            decoded = base64.b64decode(b64_data).decode("utf-8", errors="replace")
-                        except Exception:
-                            decoded = ""
-                        notes_by_hash[digest] = {
-                            "primary_type": "DocumentReference",
-                            "primary_uuid": rid,
-                            "date": n_date,
-                            "dates": [n_date] if n_date else [],
-                            "timestamps": [n_raw_ts] if n_raw_ts else [],
-                            "title": n_type or "Clinical Note",
-                            "decoded": decoded,
-                            "source_org": resolve_source_org(res),
-                            "member_uuids": [rid],
-                            "meta_security": list(sec_codes),
-                        }
-        elif rtype == "DiagnosticReport" and (res.get("presentedForm") or []):
-            dr_pf_st = str(res.get("status") or "").strip().lower()
-            if dr_pf_st in {"entered-in-error", "cancelled"}:
-                continue
-            if rid:
-                presented_form_dr_ids.add(rid)
-            n_raw_ts = str(res.get("effectiveDateTime") or res.get("issued") or "").strip()
-            n_date = _iso_date(n_raw_ts)
-            _, n_type = _coding_pair(res.get("code"))
-            sec_codes = _extract_meta_security_codes(res)
-            for pf in res.get("presentedForm") or []:
-                b64_data = (pf or {}).get("data")
-                if isinstance(b64_data, str) and b64_data:
-                    digest = hashlib.sha256(b64_data.strip().encode("ascii", errors="ignore")).hexdigest()
-                    if digest in notes_by_hash:
-                        notes_by_hash[digest]["member_uuids"].append(rid)
-                        if n_date:
-                            notes_by_hash[digest]["dates"].append(n_date)
-                        if n_raw_ts:
-                            notes_by_hash[digest]["timestamps"].append(n_raw_ts)
-                        notes_by_hash[digest]["meta_security"].extend(sec_codes)
-                        dedup_note_count += 1
-                    else:
-                        try:
-                            decoded = base64.b64decode(b64_data).decode("utf-8", errors="replace")
-                        except Exception:
-                            decoded = ""
-                        notes_by_hash[digest] = {
-                            "primary_type": "DiagnosticReport",
-                            "primary_uuid": rid,
-                            "date": n_date,
-                            "dates": [n_date] if n_date else [],
-                            "timestamps": [n_raw_ts] if n_raw_ts else [],
-                            "title": n_type or "Clinical Note",
-                            "decoded": decoded,
-                            "source_org": resolve_source_org(res),
-                            "member_uuids": [rid],
-                            "meta_security": list(sec_codes),
-                        }
-
-    def _raw_ts_sort_key(raw_ts: str) -> str:
-        if len(raw_ts) > 10:
+    if patient_res is not None:
+        pid = str(patient_res.get("id") or "patient-1")
+        dob = _iso_date(patient_res.get("birthDate"))
+        names = patient_res.get("name") or []
+        if names and isinstance(names[0], Mapping):
+            ch = next((n for n in names if n.get("use") == "official"), names[0])
+            pname = f"{' '.join(ch.get('given') or [])} {ch.get('family') or ''}".strip() or pname
+        age_str = ""
+        if dob and ref_date:
             try:
-                dt = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
-                if dt.tzinfo is not None:
-                    return dt.astimezone(timezone.utc).isoformat(timespec="microseconds")
+                age_str = f", Age: {int((date.fromisoformat(ref_date) - date.fromisoformat(dob)).days // 365.2425)}y (as of {ref_date})"
             except ValueError:
                 pass
-        return raw_ts
+        langs = [_coding_pair(cm.get("language"))[1] for cm in (patient_res.get("communication") or []) if isinstance(cm, Mapping) and _coding_pair(cm.get("language"))[1]]
+        items.append(ClinicalItem("Patient", pid, ref_date or dob, None, "administrative", "patient", "patient-demographics", pname, f"Patient: {pname}, DOB: {dob or 'unknown'}, Gender: {patient_res.get('gender') or 'unknown'}{age_str}{(', Language: ' + ', '.join(langs)) if langs else ''}", True, "active"))
 
-    for note_info in notes_by_hash.values():
-        snippet = _extract_unique_note_narrative(
-            note_info["decoded"],
-            preserve_all_sections=preserve_all_note_sections,
-        )
-        if not snippet:
-            continue
-        members = tuple(dict.fromkeys(note_info["member_uuids"]))
-        distinct_dates = sorted({d for d in (note_info.get("dates") or []) if d})
-        distinct_ts = sorted({t for t in (note_info.get("timestamps") or []) if t}, key=_raw_ts_sort_key)
-        primary_date = distinct_dates[-1] if distinct_dates else note_info["date"]
-        latest_raw_ts = distinct_ts[-1] if distinct_ts else ""
-        extra_dates_str = (
-            f" (recorded across dates: {', '.join(distinct_dates)})"
-            if len(distinct_dates) > 1
-            else ""
-        )
-        if enable_privacy_classification:
-            note_sens, note_sens_src = classify_sensitivity_with_source(
-                "",
-                f"{note_info['title']} {note_info['decoded']} {snippet}",
-                meta_security_codes=note_info.get("meta_security") or (),
-            )
-        else:
-            note_sens, note_sens_src = None, None
-        note_meta: Dict[str, Any] = {
-            "full_text": snippet,
-            "raw_decoded_text": note_info["decoded"],
-            "title": note_info["title"],
-            "duplicate_wrapper_count": len(members),
-            **({"dates": distinct_dates} if distinct_dates else {}),
-            **({"raw_timestamp": latest_raw_ts} if latest_raw_ts else {}),
-            **({"sensitivity_source": note_sens_src} if note_sens_src else {}),
-        }
-        items.append(
-            ClinicalItem(
-                resource_type=note_info["primary_type"],
-                resource_uuid=note_info["primary_uuid"],
-                date=primary_date,
-                clinical_date=primary_date,
-                date_kind="clinical_event" if primary_date else "unknown",
-                section="clinical_note",
-                code="clinical-note",
-                display=note_info["title"],
-                text=f"Clinical Note — {note_info['title']}: {snippet}{extra_dates_str}",
-                mandatory=False,
-                status="current",
-                source_org=note_info["source_org"],
-                sensitivity=note_sens,
-                member_uuids=members,
-                metadata=note_meta,
-            )
-        )
+    notes_by_hash: Dict[str, Dict[str, Any]] = {}
+    dedup_note_count = 0
+    claimed_obs: Set[str] = set()
 
-    # 7. Extract DiagnosticReport Lab & Survey Panels (and track claimed child Observations)
-    _INVALIDATED_OBS_STATUSES = {"entered-in-error", "cancelled"}
+    def _add_note(ptype: str, rid: str, raw_ts: str, title: str, b64: str, org: Optional[str]) -> None:
+        nonlocal dedup_note_count
+        iso_d = _iso_date(raw_ts)
+        dig = hashlib.sha256(b64.strip().encode("ascii", errors="ignore")).hexdigest()
+        if dig in notes_by_hash:
+            notes_by_hash[dig]["members"].append(rid)
+            if iso_d:
+                notes_by_hash[dig]["dates"].append(iso_d)
+            dedup_note_count += 1
+            return
+        try:
+            decoded = base64.b64decode(b64).decode("utf-8", errors="replace")
+        except Exception:
+            decoded = ""
+        notes_by_hash[dig] = {"ptype": ptype, "uuid": rid, "date": iso_d, "dates": [iso_d] if iso_d else [], "title": title or "Clinical Note", "decoded": decoded, "org": org, "members": [rid]}
 
-    def _extract_obs_components(
-        obs_res: Mapping[str, Any],
-        obs_uuid: str,
-        obs_date: str,
-        obs_cat: str,
-        obs_cats: Sequence[str],
-        obs_ts: str = "",
-        obs_status: str = "",
-        include_numeric_points: bool = True,
-    ) -> Tuple[List[NumericPoint], List[str], Optional[str], List[Dict[str, Any]], bool]:
-        pts: List[NumericPoint] = []
-        comp_sens: List[str] = []
-        comp_src: Optional[str] = None
-        comp_entries: List[Dict[str, Any]] = []
-        structured_comp_count = 0
-        parent_sec_codes = _extract_meta_security_codes(obs_res)
-        raw_components = [c for c in (obs_res.get("component") or []) if isinstance(c, Mapping)]
-        for comp in raw_components:
-            c_code, c_disp = _coding_pair(comp.get("code"))
+    def _add_components(obs_res: Mapping[str, Any], ouuid: str, odate: str, ocat: str, ots: str, ost: str) -> None:
+        for comp in obs_res.get("component") or []:
+            if not isinstance(comp, Mapping):
+                continue
+            cc, cd = _coding_pair(comp.get("code"))
             vq = comp.get("valueQuantity")
-            c_val_str = ""
-            comp_entry: Optional[Dict[str, Any]] = None
-            if isinstance(vq, Mapping) and vq.get("value") is not None:
-                c_cmp = str(vq.get("comparator") or "").strip()
-                c_unit = str(vq.get("unit") or vq.get("code") or "").strip()
-                c_val_str = f"{c_cmp}{_format_num(vq.get('value'))} {c_unit}".strip()
+            if isinstance(vq, Mapping) and vq.get("value") is not None and not vq.get("comparator"):
                 try:
-                    c_num: Optional[float] = float(vq["value"])
+                    cnum = float(vq["value"])
                 except (TypeError, ValueError):
-                    c_num = None
-                c_interp, c_rr, c_abn = _extract_obs_interpretation_and_range(
-                    comp, None if c_cmp else c_num
-                )
-                if not c_cmp and c_num is not None:
-                    structured_comp_count += 1
-                    if include_numeric_points:
-                        pts.append(
-                            NumericPoint(
-                                resource_uuid=obs_uuid,
-                                date=obs_date,
-                                code=c_code or c_disp,
-                                concept=c_disp or c_code,
-                                value=c_num,
-                                unit=c_unit,
-                                category=obs_cat,
-                                interpretation=c_interp,
-                                reference_range=c_rr,
-                                is_abnormal=c_abn,
-                                timestamp=obs_ts or _sort_timestamp_key(obs_date),
-                                status=obs_status,
-                            )
-                        )
-                elif c_cmp:
-                    structured_comp_count += 1
-                    if include_numeric_points:
-                        comp_entry = {
-                            "resource_uuid": obs_uuid,
-                            "date": obs_date,
-                            "code": c_code or c_disp,
-                            "concept": c_disp or c_code or "Component",
-                            "display": c_disp or c_code or "Component",
-                            "category": obs_cat,
-                            "comparator": c_cmp,
-                            "value": c_val_str,
-                            "numeric": None,
-                            "threshold": c_num,
-                            "unit": c_unit,
-                            "interpretation": c_interp,
-                            "reference_range": c_rr,
-                            "is_abnormal": c_abn,
-                            "status": obs_status,
-                            "sensitivity": "",
-                        }
-            else:
-                _, vc_disp = _coding_pair(comp.get("valueCodeableConcept"))
-                c_val_str = vc_disp
-            if enable_privacy_classification:
-                cs, csrc = classify_sensitivity_with_source(
-                    c_code, f"{c_disp} {c_val_str}", obs_cats, meta_security_codes=parent_sec_codes
-                )
-                if cs:
-                    comp_sens.append(cs)
-                    if cs == "SDOH/PRIVACY-SENSITIVE" or not comp_src:
-                        comp_src = csrc
-                    if comp_entry is not None:
-                        comp_entry["sensitivity"] = cs
-            if comp_entry is not None:
-                comp_entries.append(comp_entry)
-        all_comp_structured = bool(raw_components) and (
-            structured_comp_count == len(raw_components)
-        )
-        return pts, comp_sens, comp_src, comp_entries, all_comp_structured
+                    continue
+                ci, cr, ca = _extract_obs_interp_range(comp, cnum)
+                numeric_points.append(NumericPoint(ouuid, odate, cc or cd, cd or cc, cnum, str(vq.get("unit") or vq.get("code") or "").strip(), ocat, ci, cr, ca, ots or _sort_timestamp_key(odate), ost))
 
-    claimed_obs_ids: Set[str] = set()
     for res in resources:
-        if res.get("resourceType") != "DiagnosticReport":
-            continue
-        rid = str(res.get("id") or "")
-        dr_status = str(res.get("status") or "final").strip().lower()
-        dr_invalid = dr_status in _INVALIDATED_OBS_STATUSES
-        result_refs = res.get("result") or []
-        dr_conclusion = str(res.get("conclusion") or "").strip()
-        cc_labels: List[str] = []
-        for cc_obj in res.get("conclusionCode") or []:
-            if isinstance(cc_obj, Mapping):
-                _, cc_disp = _coding_pair(cc_obj)
-                if cc_disp:
-                    cc_labels.append(cc_disp)
-        if dr_invalid:
-            for ref_obj in result_refs:
-                if isinstance(ref_obj, Mapping):
-                    oid = _strip_urn(ref_obj.get("reference"))
-                    if oid:
-                        claimed_obs_ids.add(oid)
-            excluded_counts[f"DiagnosticReport({dr_status})"] = (
-                excluded_counts.get(f"DiagnosticReport({dr_status})", 0) + 1
-            )
-            continue
-        if not result_refs and not dr_conclusion and not cc_labels:
-            continue
-        if not result_refs and rid in presented_form_dr_ids and not dr_conclusion and not cc_labels:
-            continue
-        code, disp = _coding_pair(res.get("code"))
-        p_date_raw = res.get("effectiveDateTime") or res.get("issued")
-        p_date = _iso_date(p_date_raw)
-        is_survey = bool(_SURVEY_PANEL_PATTERNS.search(disp or ""))
-
-        member_uuids: List[str] = [rid]
-        child_parts: List[str] = []
-        child_sensitivities: List[str] = []
-        child_sens_sources: List[str] = []
-        panel_abn = False
-        panel_interps: List[str] = []
-        panel_ranges: List[str] = []
-        panel_comp_entries: List[Dict[str, Any]] = []
-        total_child_refs = 0
-        structured_child_count = 0
-
-        for ref_obj in result_refs:
-            if not isinstance(ref_obj, Mapping):
+        rt, rid = str(res.get("resourceType") or ""), str(res.get("id") or "")
+        if rt == "AllergyIntolerance":
+            cs, vs = _codeable_status(res.get("clinicalStatus")) or "active", _codeable_status(res.get("verificationStatus"))
+            if cs == "entered-in-error" or vs == "entered-in-error":
+                excluded["AllergyIntolerance(entered-in-error)"] = excluded.get("AllergyIntolerance(entered-in-error)", 0) + 1
                 continue
-            oid = _strip_urn(ref_obj.get("reference"))
-            if not oid:
+            c, d = _coding_pair(res.get("code"))
+            rxns = [f"{md} ({rx.get('severity')})" if rx.get("severity") else md for rx in (res.get("reaction") or []) if isinstance(rx, Mapping) for mn in (rx.get("manifestation") or []) for _, md in [_coding_pair(mn)] if md]
+            rd = _iso_date(res.get("recordedDate") or res.get("onsetDateTime"))
+            quals = [f"status: {cs}"] + ([f"verification: {vs}"] if vs else []) + ([f"criticality: {res['criticality']}"] if res.get("criticality") else []) + ([f"reaction: {', '.join(rxns)}"] if rxns else [])
+            items.append(ClinicalItem(rt, rid, rd, rd if vs != "refuted" else None, "clinical_event" if (rd and vs != "refuted") else "unknown", "allergy", c or d, d or c or "Unspecified allergy", f"Allergy: {d or c} ({', '.join(quals)})", cs not in {"inactive", "resolved"} and vs != "refuted", cs, None, src_of(res), metadata={"verification_status": vs} if vs else {}))
+        elif rt == "Condition":
+            cs, vs = _codeable_status(res.get("clinicalStatus")) or "active", _codeable_status(res.get("verificationStatus"))
+            if cs == "entered-in-error" or vs == "entered-in-error":
+                excluded["Condition(entered-in-error)"] = excluded.get("Condition(entered-in-error)", 0) + 1
                 continue
-            claimed_obs_ids.add(oid)
-            member_uuids.append(oid)
-            total_child_refs += 1
-            child_obs = obs_by_id.get(oid)
-            if not child_obs:
-                r_disp = str(ref_obj.get("display") or "").strip()
-                if r_disp:
-                    child_parts.append(r_disp)
+            c, d = _coding_pair(res.get("code"))
+            on, ab, so = _iso_date(res.get("onsetDateTime") or res.get("recordedDate")), _iso_date(res.get("abatementDateTime")), src_of(res)
+            act = cs in {"active", "recurrence", "relapse"} and vs not in _INVALIDATED_VERIFICATION
+            ev = on if act else (ab or on)
+            det = [f"status: {cs}"] + ([f"verification: {vs}"] if vs else []) + ([f"onset: {on}"] if on else []) + ([f"resolved: {ab}"] if ab else []) + ([f"source: {so}"] if so else []) + ([f"SNOMED: {c}"] if c else [])
+            items.append(ClinicalItem(rt, rid, ev, ev if vs != "refuted" else None, "clinical_event" if (ev and vs != "refuted") else "unknown", "condition_active" if act else "condition_resolved", c or d, d or c or "Condition", f"Condition: {d or c} ({', '.join(det)})", act, cs, ab, so, metadata={"onset": on, "abatement": ab, **({"verification_status": vs} if vs else {})}))
+        elif rt in {"MedicationRequest", "MedicationAdministration", "MedicationStatement", "MedicationDispense"}:
+            st = str(res.get("status") or "unknown").strip().lower()
+            if st == "entered-in-error":
+                excluded[f"{rt}(entered-in-error)"] = excluded.get(f"{rt}(entered-in-error)", 0) + 1
                 continue
-            child_status = str(child_obs.get("status") or "final").strip().lower()
-            child_invalid = dr_invalid or (child_status in _INVALIDATED_OBS_STATUSES)
-            o_code, o_disp = _coding_pair(child_obs.get("code"))
-            val_str, num_val, unit = _format_obs_value(child_obs)
-            o_interp, o_range, o_abn = _extract_obs_interpretation_and_range(child_obs, num_val)
-            o_cats = _categories(child_obs)
-            o_date_raw = child_obs.get("effectiveDateTime") or child_obs.get("issued")
-            o_date = (
-                (_iso_timestamp(o_date_raw) if preserve_intraday_timestamps else _iso_date(o_date_raw))
-                or p_date
-            )
-            o_sort_ts = _sort_timestamp_key(o_date_raw if o_date_raw else p_date_raw)
-            o_primary_cat = o_cats[0] if o_cats else ("survey" if is_survey else "laboratory")
-            o_sens, o_sens_src = _classify_res_sensitivity(
-                child_obs, o_code, f"{o_disp} {val_str}", o_cats
-            )
-            if o_sens:
-                child_sensitivities.append(o_sens)
-            if o_sens_src:
-                child_sens_sources.append(o_sens_src)
-            short_label = o_disp or o_code or "item"
-            if o_abn and not child_invalid:
-                panel_abn = True
-                if o_interp:
-                    panel_interps.append(o_interp)
-            if o_range:
-                panel_ranges.append(o_range)
-            child_comp_entries: List[Dict[str, Any]] = []
-            if child_obs.get("component"):
-                (
-                    comp_pts,
-                    comp_sens,
-                    comp_src,
-                    child_comp_entries,
-                    child_comp_structured,
-                ) = _extract_obs_components(
-                    child_obs,
-                    oid,
-                    o_date or "",
-                    o_primary_cat,
-                    o_cats,
-                    obs_ts=o_sort_ts,
-                    obs_status=child_status,
-                    include_numeric_points=not child_invalid,
-                )
-                if child_comp_structured:
-                    structured_child_count += 1
-                numeric_points.extend(comp_pts)
-                child_sensitivities.extend(comp_sens)
-                if comp_src:
-                    child_sens_sources.append(comp_src)
-                panel_comp_entries.extend(child_comp_entries)
-                if any(pt.is_abnormal for pt in comp_pts) or any(
-                    bool(ce.get("is_abnormal")) for ce in child_comp_entries
-                ):
-                    panel_abn = True
-                for ce in child_comp_entries:
-                    if ce.get("is_abnormal") and ce.get("interpretation"):
-                        panel_interps.append(str(ce["interpretation"]))
-                for pt in comp_pts:
-                    if pt.is_abnormal and pt.interpretation:
-                        panel_interps.append(pt.interpretation)
-            elif num_val is not None:
-                structured_child_count += 1
-                if not child_invalid:
-                    numeric_points.append(
-                        NumericPoint(
-                            resource_uuid=oid,
-                            date=o_date or "",
-                            code=o_code or short_label,
-                            concept=short_label,
-                            value=num_val,
-                            unit=unit,
-                            category=o_primary_cat,
-                            interpretation=o_interp,
-                            reference_range=o_range,
-                            is_abnormal=o_abn,
-                            timestamp=o_sort_ts,
-                            status=child_status,
-                        )
-                    )
+            c, d = _coding_pair(res.get("medicationCodeableConcept"))
+            if not d and isinstance(res.get("medicationReference"), Mapping):
+                mr = _strip_urn(res["medicationReference"].get("reference"))
+                c, d = meds.get(mr, (c, str(res["medicationReference"].get("display") or "")))
+            mts = str(res.get("authoredOn") or res.get("effectiveDateTime") or (res.get("effectivePeriod") or {}).get("start") or res.get("whenHandedOver") or res.get("whenPrepared") or res.get("dateAsserted") or "").strip()
+            md_d, ed_d = _iso_date(mts), _iso_date((res.get("effectivePeriod") or {}).get("end"))
+            raw_dos = res.get("dosageInstruction") or (res.get("dosage") if isinstance(res.get("dosage"), list) else ([res.get("dosage")] if isinstance(res.get("dosage"), Mapping) else []))
+            doses = [dt for di in raw_dos if isinstance(di, Mapping) for dt in [_format_structured_dosage(di)] if dt]
+            rsn, setting, so = reasons_of(res), ("inpatient/administered" if rt == "MedicationAdministration" else "prescribed"), src_of(res)
+            act, mdisp = st in {"active", "in-progress", "on-hold"}, d or c or "Medication"
+            qls = [f"status: {st}", f"type: {setting}"] + ([f"dosage: {'; '.join(doses[:2])}"] if doses else []) + ([f"reason: {', '.join(dict.fromkeys(rsn))}"] if rsn else []) + ([f"source: {so}"] if so else []) + ([f"RxNorm: {c}"] if c else [])
+            items.append(ClinicalItem(rt, rid, md_d, md_d, "clinical_event" if md_d else "unknown", "med_active" if act else "med_historical", c or mdisp.lower(), mdisp, f"Medication: {mdisp} ({', '.join(qls)})", act, st, ed_d, so, metadata={"reasons": rsn, "dosage": doses, "setting": setting}))
+        elif rt == "Immunization":
+            st = str(res.get("status") or "completed").strip().lower()
+            if st == "entered-in-error":
+                excluded["Immunization(entered-in-error)"] = excluded.get("Immunization(entered-in-error)", 0) + 1
+                continue
+            c, d = _coding_pair(res.get("vaccineCode"))
+            od, so, comp = _iso_date(res.get("occurrenceDateTime")), src_of(res), (st == "completed")
+            qls = [f"status: {st}"] + ([f"CVX: {c}"] if c else []) + ([f"source: {so}"] if so else [])
+            items.append(ClinicalItem(rt, rid, od, od if comp else None, "clinical_event" if (od and comp) else "unknown", "immunization", c or (d or "vaccine"), d or c or "Vaccine", f"Immunization: {d or c or 'Vaccine'} ({', '.join(qls)})", comp, st, None, so))
+        elif rt == "DocumentReference":
+            if str(res.get("status") or "").lower() in _INVALIDATED_STATUSES or str(res.get("docStatus") or "").lower() == "entered-in-error":
+                excluded["DocumentReference(invalid)"] = excluded.get("DocumentReference(invalid)", 0) + 1
+                continue
+            nts = str(res.get("date") or ((res.get("context") or {}).get("period") or {}).get("start") or "").strip()
+            _, nt = _coding_pair(res.get("type"))
+            for ci in res.get("content") or []:
+                b64 = ((ci or {}).get("attachment") or {}).get("data")
+                if isinstance(b64, str) and b64:
+                    _add_note("DocumentReference", rid, nts, nt, b64, src_of(res))
+        elif rt == "DiagnosticReport":
+            dr_st = str(res.get("status") or "final").strip().lower()
+            rrefs, dr_conc = (res.get("result") or []), str(res.get("conclusion") or "").strip()
+            ccs = [_coding_pair(cc)[1] for cc in (res.get("conclusionCode") or []) if isinstance(cc, Mapping) and _coding_pair(cc)[1]]
+            if dr_st in _INVALIDATED_STATUSES:
+                for ro in rrefs:
+                    if isinstance(ro, Mapping) and _strip_urn(ro.get("reference")):
+                        claimed_obs.add(_strip_urn(ro.get("reference")))
+                excluded[f"DiagnosticReport({dr_st})"] = excluded.get(f"DiagnosticReport({dr_st})", 0) + 1
+                continue
+            for pf in res.get("presentedForm") or []:
+                b64 = (pf or {}).get("data")
+                if isinstance(b64, str) and b64:
+                    _add_note("DiagnosticReport", rid, str(res.get("effectiveDateTime") or res.get("issued") or ""), _coding_pair(res.get("code"))[1], b64, src_of(res))
+            if not rrefs and not dr_conc and not ccs:
+                continue
+            dr_cats, (code, disp) = _categories(res), _coding_pair(res.get("code"))
+            p_raw = res.get("effectiveDateTime") or res.get("issued")
+            p_dt = _iso_date(p_raw)
+            muuids, cparts, pabn = [rid], [], False
+            for ro in rrefs:
+                oid = _strip_urn(ro.get("reference")) if isinstance(ro, Mapping) else ""
+                if not oid:
+                    continue
+                claimed_obs.add(oid)
+                muuids.append(oid)
+                co = obs_by_id.get(oid)
+                if not co:
+                    if ro.get("display"):
+                        cparts.append(str(ro["display"]).strip())
+                    continue
+                cst = str(co.get("status") or "final").strip().lower()
+                if cst in _INVALIDATED_STATUSES:
+                    continue
+                oc, od = _coding_pair(co.get("code"))
+                vs_o, nv_o, un_o = _format_obs_value(co)
+                oi, orr, oa = _extract_obs_interp_range(co, nv_o)
+                ocats = _categories(co)
+                od_raw = co.get("effectiveDateTime") or co.get("issued")
+                od_dt = (_iso_timestamp(od_raw) if preserve_intraday_timestamps else _iso_date(od_raw)) or p_dt
+                ots = _sort_timestamp_key(od_raw or p_raw)
+                ocat = ocats[0] if ocats else ("survey" if "survey" in dr_cats else "laboratory")
+                sl = od or oc or "item"
+                pabn = pabn or oa
+                if co.get("component"):
+                    _add_components(co, oid, od_dt or "", ocat, ots, cst)
+                elif nv_o is not None:
+                    numeric_points.append(NumericPoint(oid, od_dt or "", oc or sl, sl, nv_o, un_o, ocat, oi, orr, oa, ots, cst))
+                if vs_o:
+                    ann = [x for x in (oi, f"ref: {orr}" if orr else "") if x]
+                    cparts.append(f"{sl}: {vs_o}" + (f" ({'; '.join(ann)})" if ann else ""))
+            segs = (["; ".join(cparts)] if cparts else []) + ([f"Conclusion: {dr_conc}"] if dr_conc else ([f"Conclusion: {', '.join(dict.fromkeys(ccs))}"] if ccs else []))
+            sec = "survey_panel" if "survey" in dr_cats else ("imaging" if "imaging" in dr_cats else "lab_panel")
+            pfx = "Survey Panel" if sec == "survey_panel" else ("Imaging Report" if sec == "imaging" else "Diagnostic Panel")
+            items.append(ClinicalItem(rt, rid, p_dt, p_dt, "clinical_event" if p_dt else "unknown", sec, code or disp, disp or code or "Diagnostic Report", f"{pfx} ({disp or code}): {' | '.join(segs) if segs else 'completed'}", False, dr_st, None, src_of(res), tuple(dict.fromkeys(muuids)), {"is_abnormal": pabn, **({"conclusion": dr_conc} if dr_conc else {})}))
+        elif rt == "Procedure":
+            st = str(res.get("status") or "completed").strip().lower()
+            if st == "entered-in-error":
+                excluded["Procedure(entered-in-error)"] = excluded.get("Procedure(entered-in-error)", 0) + 1
+                continue
+            c, d = _coding_pair(res.get("code"))
+            pd = _iso_date(res.get("performedDateTime") or (res.get("performedPeriod") or {}).get("start") or (res.get("performedPeriod") or {}).get("end"))
+            rsn, perf = reasons_of(res), st not in {"not-done", "stopped", "preparation"}
+            qls = ([f"status: {st}"] if st != "completed" else []) + ([f"reason: {', '.join(dict.fromkeys(rsn))}"] if rsn else [])
+            items.append(ClinicalItem(rt, rid, pd, pd if perf else None, "clinical_event" if (pd and perf) else "unknown", "procedure", c or d, d or c or "Procedure", f"Procedure: {d or c}" + (f" ({', '.join(qls)})" if qls else ""), False, st, None, src_of(res)))
+        elif rt == "CarePlan":
+            st = str(res.get("status") or "active").strip().lower()
+            if st in _INVALIDATED_STATUSES:
+                excluded[f"CarePlan({st})"] = excluded.get(f"CarePlan({st})", 0) + 1
+                continue
+            cd, ed = _iso_date((res.get("period") or {}).get("start") or res.get("created")), _iso_date((res.get("period") or {}).get("end"))
+            cats = [_coding_pair(ci)[1] for ci in (res.get("category") or []) if _coding_pair(ci)[1] and _coding_pair(ci)[1].lower() != "assess-plan"]
+            acts = [_coding_pair(((a or {}).get("detail") or {}).get("code"))[1] for a in (res.get("activity") or []) if _coding_pair(((a or {}).get("detail") or {}).get("code"))[1]]
+            lbl = ", ".join(cats) or str(res.get("title") or "").strip() or "Care Plan"
+            items.append(ClinicalItem(rt, rid, cd, cd, "clinical_event" if cd else "unknown", "careplan_active" if st == "active" else "careplan_historical", lbl, lbl, f"CarePlan: {lbl} (status: {st}{(', activities: ' + ', '.join(acts[:4])) if acts else ''})", False, st, ed, src_of(res)))
+        elif rt == "Goal":
+            st = str(res.get("lifecycleStatus") or "active").strip().lower()
+            if st in _INVALIDATED_STATUSES:
+                excluded[f"Goal({st})"] = excluded.get(f"Goal({st})", 0) + 1
+                continue
+            gd = _iso_date(res.get("startDate") or res.get("statusDate"))
+            dues = [_iso_date(t.get("dueDate")) for t in (res.get("target") or []) if isinstance(t, Mapping) and _iso_date(t.get("dueDate"))]
+            desc = res.get("description")
+            gc, gdisp = _coding_pair(desc) if isinstance(desc, Mapping) else ("", str(desc or "").strip())
+            glbl = gdisp or "Patient Health Goal"
+            ntxt = "; ".join(str(n.get("text") or "").strip() for n in (res.get("note") or []) if isinstance(n, Mapping) and str(n.get("text") or "").strip())
+            so = src_of(res)
+            items.append(ClinicalItem(rt, rid, gd, gd, "clinical_event" if gd else "unknown", "careplan_active" if st in {"active", "accepted", "planned", "proposed", "on-hold"} else "careplan_historical", gc or glbl, glbl, f"Goal: {glbl} (status: {st}{(', target due: ' + dues[0]) if dues else ''}){(' - ' + ntxt) if ntxt else ''}{(' [source: ' + so + ']') if so else ''}", False, st, dues[0] if dues else None, so))
+        elif rt == "ImagingStudy":
+            st = str(res.get("status") or "available").strip().lower()
+            if st in _INVALIDATED_STATUSES:
+                continue
+            imd = _iso_date(res.get("started"))
+            _, pdisp = _coding_pair((res.get("procedureCode") or [{}])[0] if res.get("procedureCode") else {})
+            sites = [_coding_pair(s.get("bodySite"))[1] for s in (res.get("series") or []) if isinstance(s, Mapping) and _coding_pair(s.get("bodySite"))[1]]
+            mods = [str((s.get("modality") or {}).get("display") or "") for s in (res.get("series") or []) if isinstance(s, Mapping) and (s.get("modality") or {}).get("display")]
+            desc = pdisp or ", ".join(dict.fromkeys(mods)) or "Imaging Study"
+            items.append(ClinicalItem(rt, rid, imd, imd, "clinical_event" if imd else "unknown", "imaging", desc, desc, f"ImagingStudy: {desc}{(' (' + ', '.join(dict.fromkeys(sites)) + ')') if sites else ''}", False, st, None, src_of(res)))
+        elif rt == "Device":
+            st = str(res.get("status") or "active").strip().lower()
+            if st == "entered-in-error":
+                continue
+            c, d = _coding_pair(res.get("type"))
+            if not d and isinstance((res.get("deviceName") or [None])[0], Mapping):
+                d = str(res["deviceName"][0].get("name") or "")
+            dd = _iso_date(res.get("manufactureDate"))
+            items.append(ClinicalItem(rt, rid, dd, None, "administrative" if dd else "unknown", "device", c or d, d or c or "Medical Device", f"Device: {d or c} (status: {st})", st == "active", st, None, src_of(res)))
+        elif rt == "Encounter":
+            st = str(res.get("status") or "finished").strip().lower()
+            if st == "entered-in-error":
+                excluded["Encounter(entered-in-error)"] = excluded.get("Encounter(entered-in-error)", 0) + 1
+                continue
+            ep = res.get("period") or {}
+            es, ee = _iso_date(ep.get("start")), _iso_date(ep.get("end"))
+            term, plan, exc = {"finished", "completed", "fulfilled", ""}, {"planned", "booked", "scheduled", "proposed", "pending", "waitlist"}, {"cancelled", "entered-in-error", "noshow"}
+            if st in term:
+                ed, ecd, ek = ee or es, ee or es, "clinical_event" if (ee or es) else "unknown"
+            elif st in plan or st in exc:
+                ed, ecd, ek = es or ee, None, "planned" if ((es or ee) and st in plan) else "unknown"
             else:
-                vq_child = child_obs.get("valueQuantity")
-                o_cmp = (
-                    str(vq_child.get("comparator") or "").strip()
-                    if isinstance(vq_child, Mapping)
-                    else ""
-                )
-                if o_cmp and vq_child.get("value") is not None:
-                    structured_child_count += 1
-                    try:
-                        o_thresh: Optional[float] = float(vq_child["value"])
-                    except (TypeError, ValueError):
-                        o_thresh = None
-                    if not child_invalid:
-                        panel_comp_entries.append(
-                            {
-                                "resource_uuid": oid,
-                                "date": o_date or "",
-                                "code": o_code or short_label,
-                                "concept": short_label,
-                                "display": short_label,
-                                "category": o_primary_cat,
-                                "comparator": o_cmp,
-                                "value": val_str,
-                                "numeric": None,
-                                "threshold": o_thresh,
-                                "unit": unit,
-                                "interpretation": o_interp,
-                                "reference_range": o_range,
-                                "is_abnormal": o_abn,
-                                "status": child_status,
-                                "sensitivity": o_sens or "",
-                            }
-                        )
-            if val_str and not child_invalid:
-                annot_bits: List[str] = []
-                child_interp_disp = o_interp or ", ".join(
-                    dict.fromkeys(
-                        str(ce.get("interpretation") or "")
-                        for ce in child_comp_entries
-                        if ce.get("is_abnormal") and ce.get("interpretation")
-                    )
-                )
-                if child_interp_disp:
-                    annot_bits.append(child_interp_disp)
-                if o_range:
-                    annot_bits.append(f"ref: {o_range}")
-                annot_str = f" ({'; '.join(annot_bits)})" if annot_bits else ""
-                child_parts.append(f"{short_label}: {val_str}{annot_str}")
+                ed, ecd, ek = es or ee, es, "clinical_event" if es else ("planned" if ee else "unknown")
+            ec = str((res.get("class") or {}).get("code") or "AMB").upper()
+            _, td = _coding_pair((res.get("type") or [{}])[0] if res.get("type") else {})
+            rsn, so = reasons_of(res), src_of(res)
+            qls = [f"class: {ec}"] + ([f"discharged: {ee}" if st in term else f"est. end: {ee}"] if ee and ee != es else []) + ([f"reason: {', '.join(dict.fromkeys(rsn))}"] if rsn else []) + ([f"facility: {so}"] if so else [])
+            items.append(ClinicalItem(rt, rid, ed, ecd, ek, "encounter_acuity" if ec in {"IMP", "INPATIENT", "EMER", "EMERGENCY", "ACUTE"} else "encounter_routine", ec, td or ec, f"Encounter: {td or ec} ({', '.join(qls)})", False, st, ee, so, metadata={"start": es, "end": ee, "class": ec}))
+        elif rt == "Appointment":
+            st = str(res.get("status") or "booked").strip().lower()
+            if st == "entered-in-error":
+                continue
+            as_d, ae_d = _iso_date(res.get("start")), _iso_date(res.get("end"))
+            ad = as_d or ae_d
+            sc, sd = _coding_pair((res.get("serviceType") or [{}])[0] if res.get("serviceType") else {})
+            tc, td = _coding_pair(res.get("appointmentType") or {})
+            disp = str(res.get("description") or "").strip() or sd or td or "Appointment"
+            rsn, so = reasons_of(res), src_of(res)
+            qls = [f"status: {st}"] + ([f"reason: {', '.join(dict.fromkeys(rsn))}"] if rsn else []) + ([f"facility: {so}"] if so else [])
+            dk = "clinical_event" if (st == "fulfilled" and ad) else ("administrative" if (st in {"cancelled", "noshow"} and ad) else ("planned" if ad else "unknown"))
+            items.append(ClinicalItem(rt, rid, ad, ad if st == "fulfilled" else None, dk, "encounter_routine", sc or tc, disp, f"Appointment: {disp} ({', '.join(qls)})", False, st, ae_d, so, metadata={"start": as_d, "end": ae_d}))
 
-        dr_src_org = resolve_source_org(res)
-        dr_conclusion_combined = " | ".join(
-            p for p in ([dr_conclusion] if dr_conclusion else []) + cc_labels if p
-        )
-        dr_sens, dr_sens_src = _classify_res_sensitivity(
-            res,
-            code,
-            " | ".join(p for p in [disp, dr_conclusion_combined, dr_src_org or ""] if p),
-        )
-        if enable_privacy_classification:
-            if "SDOH/PRIVACY-SENSITIVE" in child_sensitivities or dr_sens == "SDOH/PRIVACY-SENSITIVE":
-                panel_sens: Optional[str] = "SDOH/PRIVACY-SENSITIVE"
-                panel_sens_src: Optional[str] = (
-                    dr_sens_src
-                    if dr_sens == "SDOH/PRIVACY-SENSITIVE" and dr_sens_src
-                    else (child_sens_sources[0] if child_sens_sources else "kb_coded_privacy")
-                )
-            else:
-                panel_sens = dr_sens
-                panel_sens_src = dr_sens_src
-        else:
-            panel_sens = None
-            panel_sens_src = None
-        panel_segments: List[str] = []
-        if child_parts:
-            panel_segments.append("; ".join(child_parts))
-        if dr_conclusion:
-            panel_segments.append(f"Conclusion: {dr_conclusion}")
-        elif cc_labels:
-            panel_segments.append(f"Conclusion: {', '.join(dict.fromkeys(cc_labels))}")
-        joined_children = " | ".join(panel_segments) if panel_segments else "completed"
-        panel_prefix = "Survey Panel" if is_survey else "Diagnostic Panel"
-        panel_kb = resolve_lab_code(code, disp) if not is_survey else {}
-        panel_meta: Dict[str, Any] = {
-            "is_abnormal": panel_abn,
-            "all_children_structured": total_child_refs > 0
-            and structured_child_count == total_child_refs
-            and not dr_conclusion,
-        }
-        if dr_conclusion:
-            panel_meta["conclusion"] = dr_conclusion
-        if panel_interps:
-            panel_meta["interpretation"] = ", ".join(dict.fromkeys(panel_interps))
-        if len(panel_ranges) == 1:
-            panel_meta["reference_range"] = panel_ranges[0]
-        if panel_comp_entries:
-            panel_meta["comparator_observations"] = panel_comp_entries
-            if len(panel_comp_entries) == 1:
-                only_ce = panel_comp_entries[0]
-                panel_meta["comparator"] = only_ce["comparator"]
-                panel_meta["value"] = only_ce["value"]
-                panel_meta["unit"] = only_ce["unit"]
-        if panel_kb:
-            panel_meta["kb_resolution"] = panel_kb
-        if panel_sens_src:
-            panel_meta["sensitivity_source"] = panel_sens_src
-        items.append(
-            ClinicalItem(
-                resource_type="DiagnosticReport",
-                resource_uuid=rid,
-                date=p_date,
-                clinical_date=None if dr_invalid else p_date,
-                date_kind="clinical_event" if (p_date and not dr_invalid) else "unknown",
-                section="survey_panel" if is_survey else "lab_panel",
-                code=code or disp,
-                display=disp or code or "Diagnostic Report",
-                text=f"{panel_prefix} — {disp or code}: {joined_children}",
-                mandatory=False,
-                status=dr_status,
-                source_org=dr_src_org,
-                sensitivity=panel_sens,
-                is_routine=is_survey,
-                member_uuids=tuple(dict.fromkeys(member_uuids)),
-                metadata=panel_meta,
-            )
-        )
-
-    # 8. Extract Standalone Observations (Vitals, Unbundled Labs, Social History, Survey answers)
     for res in resources:
         if res.get("resourceType") != "Observation":
             continue
         rid = str(res.get("id") or "")
-        if rid in claimed_obs_ids:
+        if rid in claimed_obs:
             continue
-        obs_status = str(res.get("status") or "final").strip().lower()
-        obs_invalid = obs_status in _INVALIDATED_OBS_STATUSES
+        ost = str(res.get("status") or "final").strip().lower()
+        if ost in _INVALIDATED_STATUSES:
+            excluded[f"Observation({ost})"] = excluded.get(f"Observation({ost})", 0) + 1
+            continue
         code, disp = _coding_pair(res.get("code"))
-        raw_obs_dt = res.get("effectiveDateTime") or res.get("issued")
-        o_date = _iso_date(raw_obs_dt)
-        o_ts = (_iso_timestamp(raw_obs_dt) if preserve_intraday_timestamps else None) or o_date
-        o_sort_ts = _sort_timestamp_key(raw_obs_dt)
+        raw_dt = res.get("effectiveDateTime") or res.get("issued")
+        odate = _iso_date(raw_dt)
+        ots = (_iso_timestamp(raw_dt) if preserve_intraday_timestamps else None) or odate
+        sort_ts = _sort_timestamp_key(raw_dt)
         cats = _categories(res)
-        val_str, num_val, unit = _format_obs_value(res)
-        obs_interp, obs_range, obs_abn = _extract_obs_interpretation_and_range(res, num_val)
-        sens, sens_src = _classify_res_sensitivity(res, code, f"{disp} {val_str}", cats)
-
-        primary_cat = cats[0] if cats else "observation"
-        has_components = bool(res.get("component"))
-        comp_entries: List[Dict[str, Any]] = []
-        all_comp_structured = False
-        if has_components:
-            (
-                comp_pts,
-                comp_sens,
-                comp_src,
-                comp_entries,
-                all_comp_structured,
-            ) = _extract_obs_components(
-                res,
-                rid,
-                o_ts or o_date or "",
-                primary_cat,
-                cats,
-                obs_ts=o_sort_ts,
-                obs_status=obs_status,
-                include_numeric_points=not obs_invalid,
-            )
-            numeric_points.extend(comp_pts)
-            if any(pt.is_abnormal for pt in comp_pts) or any(
-                bool(ce.get("is_abnormal")) for ce in comp_entries
-            ):
-                obs_abn = True
-            if not obs_interp:
-                abn_interps = [
-                    str(ce.get("interpretation") or "")
-                    for ce in comp_entries
-                    if ce.get("is_abnormal") and ce.get("interpretation")
-                ] + [
-                    str(pt.interpretation or "")
-                    for pt in comp_pts
-                    if pt.is_abnormal and pt.interpretation
-                ]
-                if abn_interps:
-                    obs_interp = ", ".join(dict.fromkeys(abn_interps))
-            if not obs_range:
-                comp_ranges = [
-                    str(ce.get("reference_range") or "")
-                    for ce in comp_entries
-                    if ce.get("reference_range")
-                ]
-                if len(comp_ranges) == 1:
-                    obs_range = comp_ranges[0]
-            if "SDOH/PRIVACY-SENSITIVE" in comp_sens:
-                sens = "SDOH/PRIVACY-SENSITIVE"
-                sens_src = comp_src or sens_src
-            elif not sens and comp_sens:
-                sens = comp_sens[0]
-                sens_src = comp_src or sens_src
-        elif num_val is not None and not obs_invalid:
-            numeric_points.append(
-                NumericPoint(
-                    resource_uuid=rid,
-                    date=o_ts or o_date or "",
-                    code=code or disp,
-                    concept=disp or code or "Observation",
-                    value=num_val,
-                    unit=unit,
-                    category=primary_cat,
-                    interpretation=obs_interp,
-                    reference_range=obs_range,
-                    is_abnormal=obs_abn,
-                    timestamp=o_sort_ts,
-                    status=obs_status,
-                )
-            )
-
-        if "vital-signs" in cats:
-            sec = "vital_sign"
-            cls_label = "Vital Sign"
-        elif "laboratory" in cats:
-            sec = "lab_observation"
-            cls_label = "Lab"
-        elif "social-history" in cats or sens == "SDOH/PRIVACY-SENSITIVE":
-            sec = "social_history"
-            cls_label = "Social History"
-        elif "survey" in cats or _SURVEY_PANEL_PATTERNS.search(disp or ""):
-            sec = "survey_observation"
-            cls_label = "Survey"
-        else:
-            sec = "observation"
-            cls_label = "Finding"
-
-        ts_suffix = f" (timestamp: {o_ts})" if (preserve_intraday_timestamps and o_ts and "T" in o_ts) else ""
-        annot_bits_o: List[str] = []
-        if obs_interp:
-            annot_bits_o.append(f"interp: {obs_interp}")
-        if obs_range:
-            annot_bits_o.append(f"ref: {obs_range}")
-        annot_str_o = f" [{'; '.join(annot_bits_o)}]" if annot_bits_o else ""
-        body_val = f": {val_str}{annot_str_o}" if val_str else ""
-        obs_kb = resolve_lab_code(code, disp) if sec in {"vital_sign", "lab_observation"} else {}
+        vstr, nval, unit = _format_obs_value(res)
+        oi, orr, oa = _extract_obs_interp_range(res, nval)
+        pcat = cats[0] if cats else "observation"
+        if res.get("component"):
+            _add_components(res, rid, ots or odate or "", pcat, sort_ts, ost)
+        elif nval is not None:
+            numeric_points.append(NumericPoint(rid, ots or odate or "", code or disp, disp or code or "Observation", nval, unit, pcat, oi, orr, oa, sort_ts, ost))
+        sec_map = {"vital-signs": ("vital_sign", "Vital Sign"), "laboratory": ("lab_observation", "Lab"), "social-history": ("social_history", "Social History"), "survey": ("survey_observation", "Survey"), "imaging": ("imaging", "Imaging Finding")}
+        sec, clbl = next((sec_map[c] for c in cats if c in sec_map), ("observation", "Observation"))
+        ann = [b for b in (f"interp: {oi}" if oi else "", f"ref: {orr}" if orr else "") if b]
+        ts_sfx = f" (timestamp: {ots})" if (preserve_intraday_timestamps and ots and "T" in ots) else ""
+        bval = f": {vstr}" + (f" [{'; '.join(ann)}]" if ann else "") if vstr else ""
         top_vq = res.get("valueQuantity")
-        top_cmp = (
-            str(top_vq.get("comparator") or "").strip()
-            if (not has_components and isinstance(top_vq, Mapping))
-            else ""
-        )
-        if not top_cmp and len(comp_entries) == 1:
-            top_cmp = str(comp_entries[0].get("comparator") or "")
-        obs_meta: Dict[str, Any] = {
-            "value": val_str,
-            "numeric": num_val,
-            "unit": unit,
-            "category": primary_cat,
-            "timestamp": o_ts,
-            "is_abnormal": obs_abn,
-            **({"all_components_structured": all_comp_structured} if has_components else {}),
-            **({"comparator": top_cmp} if top_cmp else {}),
-            **({"comparator_observations": comp_entries} if comp_entries else {}),
-            **({"interpretation": obs_interp} if obs_interp else {}),
-            **({"reference_range": obs_range} if obs_range else {}),
-            **({"kb_resolution": obs_kb} if obs_kb else {}),
-            **({"sensitivity_source": sens_src} if sens_src else {}),
-        }
-        items.append(
-            ClinicalItem(
-                resource_type="Observation",
-                resource_uuid=rid,
-                date=o_date,
-                clinical_date=None if obs_invalid else o_date,
-                date_kind="clinical_event" if (o_date and not obs_invalid) else "unknown",
-                section=sec,
-                code=code or disp,
-                display=disp or code or "Observation",
-                text=f"{cls_label} — {disp or code}{body_val}{ts_suffix}",
-                mandatory=False,
-                status=obs_status,
-                source_org=resolve_source_org(res),
-                sensitivity=sens,
-                is_routine=(sec in {"survey_observation", "vital_sign"}),
-                metadata=obs_meta,
-            )
-        )
+        tcmp = str(top_vq.get("comparator") or "").strip() if isinstance(top_vq, Mapping) else ""
+        ometa = {"value": vstr, "numeric": nval, "unit": unit, "category": pcat, "is_abnormal": oa, **({"comparator": tcmp} if tcmp else {}), **({"interpretation": oi} if oi else {}), **({"reference_range": orr} if orr else {})}
+        items.append(ClinicalItem("Observation", rid, odate, odate, "clinical_event" if odate else "unknown", sec, code or disp, disp or code or "Observation", f"{clbl} ({disp or code}){bval}{ts_sfx}", False, ost, None, src_of(res), metadata=ometa))
 
-    # 9. Extract Procedures (Surgical/Therapeutic vs Routine Screening)
-    for res in resources:
-        if res.get("resourceType") != "Procedure":
+    for ni in notes_by_hash.values():
+        snip = _normalize_note_text(ni["decoded"])
+        if not snip:
             continue
-        rid = str(res.get("id") or "")
-        code, disp = _coding_pair(res.get("code"))
-        p_date = _iso_date(
-            res.get("performedDateTime")
-            or (res.get("performedPeriod") or {}).get("start")
-            or (res.get("performedPeriod") or {}).get("end")
-        )
-        status = str(res.get("status") or "completed").strip().lower()
-        if status == "entered-in-error":
-            excluded_counts["Procedure(entered-in-error)"] = (
-                excluded_counts.get("Procedure(entered-in-error)", 0) + 1
-            )
-            continue
-        is_routine = bool(_ROUTINE_SCREENING_PROCEDURE_PATTERNS.search(disp or ""))
-        reasons: List[str] = []
-        proc_ref_cond_ids: List[str] = []
-        for rc in res.get("reasonCode") or []:
-            _, r_disp = _coding_pair(rc)
-            if r_disp:
-                reasons.append(r_disp)
-        for rr in res.get("reasonReference") or []:
-            if isinstance(rr, Mapping):
-                c_id = _strip_urn(rr.get("reference"))
-                if c_id:
-                    proc_ref_cond_ids.append(c_id)
-                r_disp = str(rr.get("display") or conds_by_id.get(c_id) or "").strip()
-                if r_disp:
-                    reasons.append(r_disp)
-        proc_src_org = resolve_source_org(res)
-        proc_sens_text = " | ".join(p for p in [disp, *reasons, proc_src_org or ""] if p)
-        proc_sens, proc_sens_src = _classify_res_sensitivity(res, code, proc_sens_text)
-        if proc_sens != "SDOH/PRIVACY-SENSITIVE":
-            for cid in proc_ref_cond_ids:
-                c_sens, c_src = cond_sens_by_id.get(cid, (None, None))
-                if c_sens == "SDOH/PRIVACY-SENSITIVE":
-                    proc_sens, proc_sens_src = c_sens, c_src
-                    break
-        proc_quals: List[str] = []
-        if status and status != "completed":
-            proc_quals.append(f"status: {status}")
-        if reasons:
-            proc_quals.append(f"reason: {', '.join(dict.fromkeys(reasons))}")
-        reason_str = f" ({', '.join(proc_quals)})" if proc_quals else ""
-        proc_performed = status not in {"not-done", "stopped", "preparation"}
-        items.append(
-            ClinicalItem(
-                resource_type="Procedure",
-                resource_uuid=rid,
-                date=p_date,
-                clinical_date=p_date if proc_performed else None,
-                date_kind="clinical_event" if (p_date and proc_performed) else "unknown",
-                section="procedure_routine" if is_routine else "procedure_major",
-                code=code or disp,
-                display=disp or code or "Procedure",
-                text=f"Procedure: {disp or code}{reason_str}",
-                mandatory=False,
-                status=status,
-                source_org=proc_src_org,
-                sensitivity=proc_sens,
-                is_routine=is_routine,
-                metadata={"sensitivity_source": proc_sens_src} if proc_sens_src else {},
-            )
-        )
+        mems = tuple(dict.fromkeys(ni["members"]))
+        ddates = sorted({d for d in ni["dates"] if d})
+        pdt = ddates[-1] if ddates else ni["date"]
+        extra = f" (recorded across dates: {', '.join(ddates)})" if len(ddates) > 1 else ""
+        notes_list.append(ClinicalNote(ni["uuid"], pdt, ni["title"], snip, ni["org"], len(snip), mems))
+        items.append(ClinicalItem(ni["ptype"], ni["uuid"], pdt, pdt, "clinical_event" if pdt else "unknown", "clinical_note", "clinical-note", ni["title"], f"Clinical Note ({ni['title']}): {snip}{extra}", False, "current", None, ni["org"], mems, {"full_text": snip, "raw_decoded_text": ni["decoded"], "title": ni["title"], "duplicate_wrapper_count": len(mems)}))
 
-    # 10. Extract CarePlan, Goal, ImagingStudy, Patient-Carried Device, and Encounter
-    for res in resources:
-        rtype = str(res.get("resourceType") or "")
-        rid = str(res.get("id") or "")
-        if rtype == "CarePlan":
-            status = str(res.get("status") or "active").strip().lower()
-            if status == "entered-in-error":
-                excluded_counts["CarePlan(entered-in-error)"] = (
-                    excluded_counts.get("CarePlan(entered-in-error)", 0) + 1
-                )
-                continue
-            cp_date = _iso_date(
-                (res.get("period") or {}).get("start") or res.get("created")
-            )
-            end_date = _iso_date((res.get("period") or {}).get("end"))
-            cats: List[str] = []
-            for c_item in res.get("category") or []:
-                _, c_disp = _coding_pair(c_item)
-                if c_disp and c_disp.lower() != "assess-plan":
-                    cats.append(c_disp)
-            acts: List[str] = []
-            for act in res.get("activity") or []:
-                detail = (act or {}).get("detail") or {}
-                _, a_disp = _coding_pair(detail.get("code"))
-                if a_disp:
-                    acts.append(a_disp)
-            cp_addr_ids: List[str] = []
-            cp_addr_texts: List[str] = []
-            for addr in res.get("addresses") or []:
-                if isinstance(addr, Mapping):
-                    cid = _strip_urn(addr.get("reference"))
-                    if cid:
-                        cp_addr_ids.append(cid)
-                    adisp = str(addr.get("display") or conds_by_id.get(cid) or "").strip()
-                    if adisp:
-                        cp_addr_texts.append(adisp)
-            cp_title = str(res.get("title") or "").strip()
-            cp_desc = str(res.get("description") or "").strip()
-            label = ", ".join(cats) or cp_title or "Care Plan"
-            act_str = f" — activities: {', '.join(acts[:4])}" if acts else ""
-            cp_src_org = resolve_source_org(res)
-            cp_sens_hay = " | ".join(
-                p for p in [label, cp_title, cp_desc, *acts, *cp_addr_texts, cp_src_org or ""] if p
-            )
-            cp_sens, cp_sens_src = _classify_res_sensitivity(res, "", cp_sens_hay)
-            if cp_sens != "SDOH/PRIVACY-SENSITIVE":
-                for cid in cp_addr_ids:
-                    c_sens, c_src = cond_sens_by_id.get(cid, (None, None))
-                    if c_sens == "SDOH/PRIVACY-SENSITIVE":
-                        cp_sens, cp_sens_src = c_sens, c_src
-                        break
-            items.append(
-                ClinicalItem(
-                    resource_type="CarePlan",
-                    resource_uuid=rid,
-                    date=cp_date,
-                    clinical_date=cp_date,
-                    date_kind="clinical_event" if cp_date else "unknown",
-                    section="careplan_active" if status == "active" else "careplan_historical",
-                    code=label,
-                    display=label,
-                    text=f"CarePlan: {label} (status: {status}{act_str})",
-                    mandatory=False,
-                    status=status,
-                    end_date=end_date,
-                    source_org=cp_src_org,
-                    sensitivity=cp_sens,
-                    metadata={"sensitivity_source": cp_sens_src} if cp_sens_src else {},
-                )
-            )
-        elif rtype == "Goal":
-            lifecycle = str(res.get("lifecycleStatus") or "active").strip().lower()
-            if lifecycle == "entered-in-error":
-                excluded_counts["Goal(entered-in-error)"] = (
-                    excluded_counts.get("Goal(entered-in-error)", 0) + 1
-                )
-                continue
-            g_date = _iso_date(res.get("startDate") or res.get("statusDate"))
-            due_dates: List[str] = []
-            for tgt in res.get("target") or []:
-                if isinstance(tgt, Mapping):
-                    dd = _iso_date(tgt.get("dueDate"))
-                    if dd:
-                        due_dates.append(dd)
-            g_code, g_disp = _coding_pair(res.get("description"))
-            if not g_disp:
-                desc_obj = res.get("description")
-                if isinstance(desc_obj, str):
-                    g_disp = desc_obj.strip()
-            g_label = g_disp or "Patient Health Goal"
-            notes_txt = "; ".join(
-                str(n.get("text") or "").strip()
-                for n in (res.get("note") or [])
-                if isinstance(n, Mapping) and str(n.get("text") or "").strip()
-            )
-            g_addr_ids: List[str] = []
-            g_addr_texts: List[str] = []
-            for addr in res.get("addresses") or []:
-                if isinstance(addr, Mapping):
-                    cid = _strip_urn(addr.get("reference"))
-                    if cid:
-                        g_addr_ids.append(cid)
-                    adisp = str(addr.get("display") or conds_by_id.get(cid) or "").strip()
-                    if adisp:
-                        g_addr_texts.append(adisp)
-            due_str = f", target due: {due_dates[0]}" if due_dates else ""
-            note_str = f" — {notes_txt}" if notes_txt else ""
-            is_active_goal = lifecycle in {"active", "accepted", "planned", "proposed", "on-hold"}
-            src_org = resolve_source_org(res)
-            src_suffix = f" [source: {src_org}]" if src_org else ""
-            g_sens_hay = " | ".join(
-                p for p in [g_label, notes_txt, *g_addr_texts, src_org or ""] if p
-            )
-            g_sens, g_sens_src = _classify_res_sensitivity(res, g_code, g_sens_hay)
-            if g_sens != "SDOH/PRIVACY-SENSITIVE":
-                for cid in g_addr_ids:
-                    c_sens, c_src = cond_sens_by_id.get(cid, (None, None))
-                    if c_sens == "SDOH/PRIVACY-SENSITIVE":
-                        g_sens, g_sens_src = c_sens, c_src
-                        break
-            items.append(
-                ClinicalItem(
-                    resource_type="Goal",
-                    resource_uuid=rid,
-                    date=g_date,
-                    clinical_date=g_date,
-                    date_kind="clinical_event" if g_date else "unknown",
-                    section="careplan_active" if is_active_goal else "careplan_historical",
-                    code=g_code or g_label,
-                    display=g_label,
-                    text=f"Goal: {g_label} (status: {lifecycle}{due_str}){note_str}{src_suffix}",
-                    mandatory=is_active_goal,
-                    status=lifecycle,
-                    end_date=due_dates[0] if due_dates else None,
-                    source_org=src_org,
-                    sensitivity=g_sens,
-                    metadata={"sensitivity_source": g_sens_src} if g_sens_src else {},
-                )
-            )
-        elif rtype == "ImagingStudy":
-            im_date = _iso_date(res.get("started"))
-            _, proc_disp = _coding_pair((res.get("procedureCode") or [{}])[0] if res.get("procedureCode") else {})
-            series_list = res.get("series") or []
-            body_sites: List[str] = []
-            modalities: List[str] = []
-            for s in series_list:
-                if isinstance(s, Mapping):
-                    _, bs_disp = _coding_pair(s.get("bodySite"))
-                    if bs_disp:
-                        body_sites.append(bs_disp)
-                    mod = s.get("modality") or {}
-                    if isinstance(mod, Mapping) and mod.get("display"):
-                        modalities.append(str(mod.get("display")))
-            desc = proc_disp or ", ".join(dict.fromkeys(modalities)) or "Imaging Study"
-            site_str = f" ({', '.join(dict.fromkeys(body_sites))})" if body_sites else ""
-            im_sens, im_sens_src = _classify_res_sensitivity(res, "", desc)
-            items.append(
-                ClinicalItem(
-                    resource_type="ImagingStudy",
-                    resource_uuid=rid,
-                    date=im_date,
-                    clinical_date=im_date,
-                    date_kind="clinical_event" if im_date else "unknown",
-                    section="imaging",
-                    code=desc,
-                    display=desc,
-                    text=f"ImagingStudy: {desc}{site_str}",
-                    mandatory=False,
-                    status=str(res.get("status") or "available").lower(),
-                    source_org=resolve_source_org(res),
-                    sensitivity=im_sens,
-                    metadata={"sensitivity_source": im_sens_src} if im_sens_src else {},
-                )
-            )
-        elif rtype == "Device":
-            code, disp = _coding_pair(res.get("type"))
-            if not disp:
-                names = res.get("deviceName") or []
-                if names and isinstance(names[0], Mapping):
-                    disp = str(names[0].get("name") or "")
-            is_room_equip = is_clinic_room_equipment(disp)
-            if is_room_equip and filter_room_equipment_devices:
-                excluded_counts["Device(clinic_equipment)"] = (
-                    excluded_counts.get("Device(clinic_equipment)", 0) + 1
-                )
-                continue
-            elif is_room_equip:
-                excluded_counts["Device(clinic_equipment_retained)"] = (
-                    excluded_counts.get("Device(clinic_equipment_retained)", 0) + 1
-                )
-            d_date = _iso_date(res.get("manufactureDate"))
-            status = str(res.get("status") or "active").lower()
-            dev_sens, dev_sens_src = _classify_res_sensitivity(res, code, disp)
-            dev_meta: Dict[str, Any] = {"is_room_equipment": is_room_equip}
-            if dev_sens_src:
-                dev_meta["sensitivity_source"] = dev_sens_src
-            items.append(
-                ClinicalItem(
-                    resource_type="Device",
-                    resource_uuid=rid,
-                    date=d_date,
-                    clinical_date=None,
-                    date_kind="administrative" if d_date else "unknown",
-                    section="device",
-                    code=code or disp,
-                    display=disp or code or "Medical Device",
-                    text=f"Device: {disp or code} (status: {status})",
-                    mandatory=(status == "active" and not is_room_equip),
-                    status=status,
-                    source_org=resolve_source_org(res),
-                    sensitivity=dev_sens,
-                    is_routine=is_room_equip,
-                    metadata=dev_meta,
-                )
-            )
-        elif rtype == "Encounter":
-            enc_period = res.get("period") or {}
-            e_start = _iso_date(enc_period.get("start"))
-            e_end = _iso_date(enc_period.get("end"))
-            enc_status = str(res.get("status") or "finished").strip().lower()
-            _terminal_enc_statuses = {"finished", "completed", "fulfilled", ""}
-            _planned_enc_statuses = {"planned", "booked", "scheduled", "proposed", "pending", "waitlist"}
-            _excluded_enc_statuses = {"cancelled", "entered-in-error", "noshow"}
-            if enc_status in _terminal_enc_statuses:
-                enc_date = e_end or e_start
-                enc_clinical_date = enc_date
-                enc_date_kind = "clinical_event" if enc_date else "unknown"
-            elif enc_status in _planned_enc_statuses or enc_status in _excluded_enc_statuses:
-                enc_date = e_start or e_end
-                enc_clinical_date = None
-                enc_date_kind = "planned" if (enc_date and enc_status in _planned_enc_statuses) else "unknown"
-            else:
-                # Active non-terminal encounters (e.g. in-progress, onleave, arrived, triaged)
-                # anchor clinical realization strictly on start, never future estimated end.
-                enc_date = e_start or e_end
-                enc_clinical_date = e_start
-                enc_date_kind = "clinical_event" if e_start else ("planned" if e_end else "unknown")
-            enc_class = str((res.get("class") or {}).get("code") or "AMB").upper()
-            types = res.get("type") or []
-            _, t_disp = _coding_pair(types[0] if types else {})
-            reasons: List[str] = []
-            reason_pairs: List[Tuple[str, str]] = []
-            ref_cond_ids: List[str] = []
-            for rc in res.get("reasonCode") or []:
-                r_code, r_disp = _coding_pair(rc)
-                if r_code or r_disp:
-                    reason_pairs.append((r_code, r_disp))
-                if r_disp:
-                    reasons.append(r_disp)
-            for rr in res.get("reasonReference") or []:
-                if isinstance(rr, Mapping):
-                    c_id = _strip_urn(rr.get("reference"))
-                    if c_id:
-                        ref_cond_ids.append(c_id)
-                    r_disp = str(rr.get("display") or conds_by_id.get(c_id) or "").strip()
-                    if r_disp:
-                        reasons.append(r_disp)
-            org = resolve_source_org(res)
-            enc_sens, enc_sens_src = _classify_visit_sensitivity(
-                res, enc_class, t_disp or "", reason_pairs, reasons, ref_cond_ids, org
-            )
-            is_high_acuity = enc_class in {"IMP", "INPATIENT", "EMER", "EMERGENCY"} or any(
-                w in (t_disp or "").lower() for w in ("inpatient", "emergency", "admission", "intensive")
-            )
-            quals = [f"class: {enc_class}"]
-            if e_end and e_end != e_start:
-                quals.append(
-                    f"discharged: {e_end}" if enc_status in _terminal_enc_statuses else f"est. end: {e_end}"
-                )
-            if reasons:
-                quals.append(f"reason: {', '.join(dict.fromkeys(reasons))}")
-            if org:
-                quals.append(f"facility: {org}")
-            enc_meta: Dict[str, Any] = {"start": e_start, "end": e_end, "class": enc_class}
-            if enc_sens_src:
-                enc_meta["sensitivity_source"] = enc_sens_src
-            items.append(
-                ClinicalItem(
-                    resource_type="Encounter",
-                    resource_uuid=rid,
-                    date=enc_date,
-                    clinical_date=enc_clinical_date,
-                    date_kind=enc_date_kind,
-                    section="encounter_acuity" if is_high_acuity else "encounter_routine",
-                    code=enc_class,
-                    display=t_disp or enc_class,
-                    text=f"Encounter: {t_disp or enc_class} ({', '.join(quals)})",
-                    mandatory=False,
-                    status=enc_status or "finished",
-                    end_date=e_end,
-                    source_org=org,
-                    sensitivity=enc_sens,
-                    is_routine=not is_high_acuity,
-                    metadata=enc_meta,
-                )
-            )
-        elif rtype == "Appointment":
-            appt_start = _iso_date(res.get("start"))
-            appt_end = _iso_date(res.get("end"))
-            appt_date = appt_start or appt_end
-            appt_status = str(res.get("status") or "booked").strip().lower()
-            if appt_status == "entered-in-error":
-                excluded_counts["Appointment(entered-in-error)"] = (
-                    excluded_counts.get("Appointment(entered-in-error)", 0) + 1
-                )
-                continue
-            appt_type_code, appt_type_disp = _coding_pair(res.get("appointmentType") or {})
-            svc_types = res.get("serviceType") or []
-            svc_code, svc_disp = _coding_pair(svc_types[0] if svc_types else {})
-            specs = res.get("specialty") or []
-            spec_code, spec_disp = _coding_pair(specs[0] if specs else {})
-            appt_disp = (
-                str(res.get("description") or "").strip()
-                or svc_disp
-                or spec_disp
-                or appt_type_disp
-                or "Scheduled Appointment"
-            )
-            appt_code = svc_code or spec_code or appt_type_code
-            reasons: List[str] = []
-            reason_pairs: List[Tuple[str, str]] = []
-            ref_cond_ids: List[str] = []
-            for rc in res.get("reasonCode") or []:
-                r_code, r_disp = _coding_pair(rc)
-                if r_code or r_disp:
-                    reason_pairs.append((r_code, r_disp))
-                if r_disp:
-                    reasons.append(r_disp)
-            for rr in res.get("reasonReference") or []:
-                if isinstance(rr, Mapping):
-                    c_id = _strip_urn(rr.get("reference"))
-                    if c_id:
-                        ref_cond_ids.append(c_id)
-                    r_disp = str(rr.get("display") or conds_by_id.get(c_id) or "").strip()
-                    if r_disp:
-                        reasons.append(r_disp)
-            org = resolve_source_org(res)
-            appt_sens, appt_sens_src = _classify_visit_sensitivity(
-                res, appt_code, appt_disp, reason_pairs, reasons, ref_cond_ids, org
-            )
-            quals = [f"status: {appt_status}"]
-            if reasons:
-                quals.append(f"reason: {', '.join(dict.fromkeys(reasons))}")
-            if org:
-                quals.append(f"facility: {org}")
-            appt_meta: Dict[str, Any] = {"start": appt_start, "end": appt_end}
-            if appt_sens_src:
-                appt_meta["sensitivity_source"] = appt_sens_src
-            is_fulfilled = appt_status == "fulfilled"
-            is_cancelled_appt = appt_status in {"cancelled", "noshow"}
-            items.append(
-                ClinicalItem(
-                    resource_type="Appointment",
-                    resource_uuid=rid,
-                    date=appt_date,
-                    clinical_date=appt_date if is_fulfilled else None,
-                    date_kind=(
-                        "clinical_event"
-                        if (is_fulfilled and appt_date)
-                        else (
-                            "administrative"
-                            if (is_cancelled_appt and appt_date)
-                            else ("planned" if appt_date else "unknown")
-                        )
-                    ),
-                    section="encounter_routine",
-                    code=appt_code,
-                    display=appt_disp,
-                    text=f"Appointment: {appt_disp} ({', '.join(quals)})",
-                    mandatory=False,
-                    status=appt_status,
-                    end_date=appt_end,
-                    source_org=org,
-                    sensitivity=appt_sens,
-                    is_routine=True,
-                    metadata=appt_meta,
-                )
-            )
+    return ExtractedChart(pid, pname, dob, ref_date, items, notes_list, numeric_points, excluded, dedup_note_count, len(resources))
 
-    return ExtractedChart(
-        patient_id=patient_id,
-        patient_name=patient_name,
-        birth_date=birth_date,
-        reference_date=reference_date,
-        items=items,
-        numeric_points=numeric_points,
-        excluded_resource_counts=excluded_counts,
-        deduplicated_note_count=dedup_note_count,
-        total_bundle_entries=len(resources),
-    )
+
+__all__ = [
+    "ClinicalItem", "ClinicalNote", "ExtractedChart", "LOOKUP_ONLY_RESOURCE_TYPES",
+    "NON_CLINICAL_RESOURCE_TYPES", "NumericPoint", "extract_bundle",
+]
