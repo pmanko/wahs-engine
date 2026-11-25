@@ -19,7 +19,7 @@ from .config import WahsEngineSettings
 from .jwt_claims import VerifiedCallerIdentity, decode_and_bind_jwt, extract_bearer_token
 from .pipeline import EnricherPipeline
 from .schemas import OpenAIChatCompletionRequest, WahsContextPreviewRequest, WahsRequestOptions
-from .tokenizers_registry import get_exact_token_counter
+from .tokenizers_registry import count_chat_messages_tokens, get_exact_token_counter
 from .upstream import SouthboundOpenAIClient, build_x_wahs_envelope
 
 
@@ -72,7 +72,15 @@ def create_app(
         identity = _resolve_caller_identity(request, options, cfg)
         requested_model = (req.model or cfg.default_model).strip()
         force_refresh = "no-cache" in request.headers.get("cache-control", "").lower()
-        ctx = await assembler.assemble(options=options, identity=identity, requested_model=requested_model, force_refresh=force_refresh)
+        conv_msgs = [{"role": m.role, "content": m.content} for m in (getattr(req, "messages", None) or ())]
+        ctx = await assembler.assemble(
+            options=options,
+            identity=identity,
+            requested_model=requested_model,
+            conversation_messages=conv_msgs,
+            requested_max_tokens=getattr(req, "max_tokens", None),
+            force_refresh=force_refresh,
+        )
         return options, requested_model, ctx
 
     @application.get("/health")
@@ -97,11 +105,13 @@ def create_app(
         if pipeline.enabled_ids:
             ctx = copy.copy(ctx)
             ctx.citation_map = copy.deepcopy(ctx.citation_map)
-            last_q = next((str(m.content or "") for m in reversed(req.messages) if (m.role or "").lower() == "user" and str(m.content or "").strip()), "")
+            turns = [{"role": str(m.role or "").strip().lower(), "content": str(m.content or "")} for m in req.messages if str(m.role or "").strip().lower() in {"user", "assistant"} and str(m.content or "").strip()]
+            last_q = next((t["content"] for t in reversed(turns) if t["role"] == "user"), "")
+            current_toks = count_chat_messages_tokens([{"role": "system", "content": ctx.system_prompt}, *turns], tokenizer_family=spec.tokenizer_family)
+            headroom = max(0, int(spec.context_window) - int(spec.default_max_output_tokens) - current_toks)
             p_res = await asyncio.to_thread(
                 pipeline.run, extracted=ctx.extracted, condensed=ctx.condensed, citation_map=ctx.citation_map,
-                question=last_q, conversation=[{"role": m.role, "content": str(m.content or "")} for m in req.messages],
-                headroom_tokens=1024, token_counter=get_exact_token_counter(spec.tokenizer_family),
+                question=last_q, conversation=turns, headroom_tokens=headroom, token_counter=get_exact_token_counter(spec.tokenizer_family),
             )
             enrichers_meta = p_res.disclosures
         return {

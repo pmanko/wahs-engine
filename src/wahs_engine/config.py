@@ -49,7 +49,7 @@ class ModelSpec:
 
     upstream_model: str
     context_window: int = 32768
-    chart_budget_ceiling: Optional[int] = 16384
+    preferred_chart_tokens: Optional[int] = None
     default_max_output_tokens: int = 1024
     tokenizer_family: str = "gemma4"
     provider_flavor: str = "litellm"
@@ -68,8 +68,7 @@ class WahsEngineSettings:
     model_map: Dict[str, str] = field(default_factory=lambda: dict(DEFAULT_MODEL_ALIASES))
     model_specs: Dict[str, ModelSpec] = field(default_factory=dict)
     default_context_window: int = 32768
-    max_context_window: int = 131072
-    default_chart_budget_ceiling: Optional[int] = 16384
+    default_preferred_chart_tokens: Optional[int] = None
     default_provider_flavor: str = "litellm"
     enabled_enrichers: Tuple[str, ...] = ()
     allow_local_bundle_mode: bool = False
@@ -113,7 +112,7 @@ class WahsEngineSettings:
         return ModelSpec(
             upstream_model=upstream,
             context_window=self.default_context_window,
-            chart_budget_ceiling=self.default_chart_budget_ceiling,
+            preferred_chart_tokens=self.default_preferred_chart_tokens,
             tokenizer_family=_infer_tokenizer_family(model, upstream),
             provider_flavor=_infer_provider_flavor(upstream, self.default_provider_flavor),
         )
@@ -149,9 +148,14 @@ class WahsEngineSettings:
                 parsed_map.update({str(k): str(v) for k, v in loaded.items()})
 
         default_ctx = int(os.environ.get("WAHS_CONTEXT_WINDOW", "32768"))
-        max_ctx = max(default_ctx, int(os.environ.get("WAHS_MAX_CONTEXT_WINDOW", "131072")))
-        raw_ceil = os.environ.get("WAHS_CHART_BUDGET_CEILING")
-        default_ceil: Optional[int] = 16384 if raw_ceil is None else (None if raw_ceil.strip().lower() in {"", "none", "null"} else int(raw_ceil))
+        raw_pref = os.environ.get("WAHS_PREFERRED_CHART_TOKENS")
+        default_pref: Optional[int] = (
+            None
+            if (raw_pref is None or raw_pref.strip().lower() in {"", "none", "null"})
+            else int(raw_pref)
+        )
+        if default_pref is not None and default_pref <= 0:
+            raise ValueError("WAHS_PREFERRED_CHART_TOKENS must be a positive integer when set.")
         default_flavor = _env_str("WAHS_PROVIDER_FLAVOR").lower() or ("llamacpp" if ":8077" in llm_url else "litellm")
 
         parsed_specs: Dict[str, ModelSpec] = {}
@@ -162,11 +166,17 @@ class WahsEngineSettings:
                     if not isinstance(entry, dict):
                         continue
                     up = str(entry.get("upstream_model") or parsed_map.get(str(alias), str(alias)))
-                    c_val = (int(entry["chart_budget_ceiling"]) if entry["chart_budget_ceiling"] is not None else None) if "chart_budget_ceiling" in entry else default_ceil
+                    p_val = (
+                        (int(entry["preferred_chart_tokens"]) if entry["preferred_chart_tokens"] is not None else None)
+                        if "preferred_chart_tokens" in entry
+                        else default_pref
+                    )
+                    if p_val is not None and p_val <= 0:
+                        raise ValueError(f"preferred_chart_tokens for '{alias}' must be a positive integer.")
                     parsed_specs[str(alias)] = ModelSpec(
                         upstream_model=up,
                         context_window=int(entry.get("context_window") or default_ctx),
-                        chart_budget_ceiling=c_val,
+                        preferred_chart_tokens=p_val,
                         default_max_output_tokens=int(entry.get("default_max_output_tokens") or 1024),
                         tokenizer_family=str(entry.get("tokenizer_family") or _infer_tokenizer_family(str(alias), up)),
                         provider_flavor=str(entry.get("provider_flavor") or _infer_provider_flavor(up, default_flavor)),
@@ -178,7 +188,7 @@ class WahsEngineSettings:
         return cls(
             fhir_auth_base_url=fhir_url, llm_base_url=llm_url, llm_api_key=llm_key,
             default_model=default_model, available_models=avail, model_map=parsed_map, model_specs=parsed_specs,
-            default_context_window=default_ctx, max_context_window=max_ctx, default_chart_budget_ceiling=default_ceil,
+            default_context_window=default_ctx, default_preferred_chart_tokens=default_pref,
             default_provider_flavor=default_flavor, enabled_enrichers=enabled_enrichers,
             allow_local_bundle_mode=_env_bool("WAHS_ALLOW_LOCAL_BUNDLE_MODE", False),
             jwt_hs256_secret=_env_str("WAHS_JWT_HS256_SECRET"), jwt_jwks_url=_env_str("WAHS_JWT_JWKS_URL"),

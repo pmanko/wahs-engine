@@ -475,7 +475,7 @@ async def test_live_http_service_preview_sse_cache_and_partial_409_over_jwt_prox
             "wahs-12b": ModelSpec(
                 upstream_model="ollama/gemma4:12b",
                 context_window=32768,
-                chart_budget_ceiling=16384,
+                preferred_chart_tokens=16384,
                 tokenizer_family="gemma4",
                 provider_flavor="litellm",
                 disable_thinking=True,
@@ -508,12 +508,24 @@ async def test_live_http_service_preview_sse_cache_and_partial_409_over_jwt_prox
             prev_data = prev_resp.json()
             prev_cond = prev_data["x_wahs"]["condensation"]
             assert prev_cond["budget_effective"] == 16384
-            assert prev_cond["clamp_reason"] == "chart_budget_ceiling"
+            assert prev_cond["clamp_reason"] == "model_preferred_chart_tokens"
             assert prev_cond["cache_hit"] is False
             assert prev_cond["dataset_fetches"] == 2
             assert prev_cond["partial_fetch"] is False
             assert "Warfarin sodium" in prev_data["chart_text"]
             assert "OTC ibuprofen" in prev_data["chart_text"]
+
+            # 2b. Explicit target_budget_tokens overrides preferred_chart_tokens cleanly without re-fetching FHIR
+            wide_resp = await api.post(
+                "/v1/wahs/context/preview",
+                headers=headers,
+                json={"model": "wahs-12b", "wahs": {"target_budget_tokens": 24576}},
+            )
+            assert wide_resp.status_code == 200, wide_resp.text
+            wide_cond = wide_resp.json()["x_wahs"]["condensation"]
+            assert wide_cond["budget_effective"] == 24576
+            assert wide_cond["clamp_reason"] == "caller_target_budget_tokens"
+            assert wide_cond["dataset_fetches"] == 0
 
             # 3. SSE chat immediately hits warm prefix cache (`cache_hit=True`, `dataset_fetches=0`)
             sse_resp = await api.post(

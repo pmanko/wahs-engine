@@ -163,3 +163,67 @@ def test_wahs_devtools_cli_help() -> None:
     )
     assert proc.returncode == 0
     assert "Seed multi-source WAHS FHIR R4 star-graph personas into HAPI / fhir-auth." in proc.stdout
+
+
+def test_dynamic_budget_resolution_and_unclamped_explicit_override() -> None:
+    def llm_handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "cmpl-dyn",
+                "object": "chat.completion",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "OK [1]."}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 2},
+            },
+        )
+
+    from wahs_engine.config import ModelSpec
+
+    settings = WahsEngineSettings(
+        fhir_auth_base_url="http://fhir-auth:8080/fhir",
+        llm_base_url="http://llm-mock:8079/v1",
+        allow_local_bundle_mode=True,
+        model_specs={
+            "wahs-26b": ModelSpec(
+                upstream_model="ollama/gemma4:26b",
+                context_window=65536,
+                preferred_chart_tokens=16384,
+            ),
+            "wahs-12b": ModelSpec(
+                upstream_model="ollama/gemma4:12b",
+                context_window=65536,
+                preferred_chart_tokens=None,
+            ),
+        },
+    )
+    app = create_app(settings, llm_http_client=httpx.AsyncClient(transport=httpx.MockTransport(llm_handler)))
+    bundle = _bundle_with_two_records()
+
+    with TestClient(app) as client:
+        # 1. Model without preferred_chart_tokens uses full remaining physical context window in Auto
+        p_full = client.post("/v1/wahs/context/preview", json={"model": "wahs-12b", "wahs": {"fhir_bundle": bundle}}).json()
+        c_full = p_full["x_wahs"]["condensation"]
+        assert c_full["clamp_reason"] == "context_window_available"
+        assert c_full["budget_effective"] > 60000
+        assert c_full["preferred_chart_tokens"] is None
+
+        # 2. Model with preferred_chart_tokens uses it ONLY for Auto, never clamping explicit caller overrides
+        p_pref = client.post("/v1/wahs/context/preview", json={"model": "wahs-26b", "wahs": {"fhir_bundle": bundle}}).json()
+        assert p_pref["x_wahs"]["condensation"]["clamp_reason"] == "model_preferred_chart_tokens"
+        assert p_pref["x_wahs"]["condensation"]["budget_effective"] == 16384
+
+        p_over = client.post(
+            "/v1/wahs/context/preview",
+            json={"model": "wahs-26b", "wahs": {"fhir_bundle": bundle, "target_budget_tokens": 32768}},
+        ).json()
+        assert p_over["x_wahs"]["condensation"]["clamp_reason"] == "caller_target_budget_tokens"
+        assert p_over["x_wahs"]["condensation"]["budget_effective"] == 32768
+
+        # 3. Explicit budget above physical window clamps strictly to physical context_window
+        p_clamp = client.post(
+            "/v1/wahs/context/preview",
+            json={"model": "wahs-26b", "wahs": {"fhir_bundle": bundle, "target_budget_tokens": 99999}},
+        ).json()
+        assert p_clamp["x_wahs"]["condensation"]["clamp_reason"] == "clamped_to_context_window"
+        assert p_clamp["x_wahs"]["condensation"]["budget_effective"] < 65536
+        assert p_clamp["x_wahs"]["condensation"]["budget_effective"] > 60000
