@@ -29,11 +29,20 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def _infer_tokenizer_family(requested_model: str, upstream_model: str) -> str:
-    for candidate in ((requested_model or "").lower(), (upstream_model or "").lower()):
-        if any(tok in candidate for tok in ("qwen", "llama", "mistral", "deepseek", "gpt-", "claude", "o1", "o3", "o4")):
-            return "o200k_base"
-        if any(tok in candidate for tok in ("gemma", "medgemma", "wahs-26b", "wahs-12b", "wahs-e4b")):
+    for raw_candidate in ((requested_model or "").lower(), (upstream_model or "").lower()):
+        candidate = raw_candidate.strip()
+        if not candidate:
+            continue
+        bare = candidate.rsplit("/", 1)[-1]
+        if any(tok in bare for tok in ("gemma", "medgemma")) or any(
+            tok in candidate for tok in ("wahs-26b", "wahs-12b", "wahs-e4b")
+        ):
             return "gemma4"
+        if any(
+            tok in bare
+            for tok in ("qwen", "llama", "hermes", "mistral", "deepseek", "gpt-", "claude", "o1", "o3", "o4")
+        ):
+            return "o200k_base"
     return "o200k_base"
 
 

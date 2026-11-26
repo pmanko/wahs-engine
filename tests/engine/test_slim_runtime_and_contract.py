@@ -227,3 +227,13 @@ def test_dynamic_budget_resolution_and_unclamped_explicit_override() -> None:
         assert p_clamp["x_wahs"]["condensation"]["clamp_reason"] == "clamped_to_context_window"
         assert p_clamp["x_wahs"]["condensation"]["budget_effective"] < 65536
         assert p_clamp["x_wahs"]["condensation"]["budget_effective"] > 60000
+
+
+def test_ollama_provider_prefix_does_not_misclassify_gemma_as_llama() -> None:
+    cfg = WahsEngineSettings()
+    assert cfg.resolve_model_spec("ollama/gemma4:26b").tokenizer_family == "gemma4"
+    assert cfg.resolve_model_spec("ollama/gemma4:12b").tokenizer_family == "gemma4"
+    assert cfg.resolve_model_spec("ollama/gemma4:e4b").tokenizer_family == "gemma4"
+    assert cfg.resolve_model_spec("llamacpp/medgemma-27b").tokenizer_family == "gemma4"
+    assert WahsEngineSettings(model_map={"custom-default": "ollama/gemma4:12b"}).resolve_model_spec("custom-default").tokenizer_family == "gemma4"
+    assert cfg.resolve_model_spec("ollama/llama3.1:8b").tokenizer_family == "o200k_base"
