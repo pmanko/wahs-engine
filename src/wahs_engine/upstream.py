@@ -136,16 +136,21 @@ def resolve_ollama_num_ctx(
     exact_prompt_tokens: int,
     effective_max_tokens: int,
     context_window: int,
-) -> int:
-    """Right-size Ollama `num_ctx` to the smallest stable bucket covering the actual turn.
+    configured_num_ctx: Optional[int] = None,
+) -> Optional[int]:
+    """Resolve Ollama `num_ctx` pinned to configured `WAHS_OLLAMA_NUM_CTX` (default `65536` ceiling-clamped).
 
-    Keeps 2k-32k prompts pinned to a single warm 32768 KV cache (when `context_window >= 32768`)
-    so toggling chart sizes never triggers Ollama model reloads or 128k VRAM spills, while scaling
-    up to 65536 or 131072 only when the assembled prompt + output tokens actually exceed 32768.
+    - `configured_num_ctx == 0` omits `num_ctx` so Ollama uses its server-side `OLLAMA_CONTEXT_LENGTH`.
+    - Otherwise keeps all prompts `<= 64k` (or `configured_num_ctx`) pinned to one warm KV cache
+      with full parity across `2k`-`64k` selections and zero model reloads, stepping up only if
+      a prompt physically exceeds the pin and `context_window` allows it.
     """
+    if configured_num_ctx is not None and int(configured_num_ctx) == 0:
+        return None
     ceiling = max(4096, int(context_window))
+    pin = min(max(4096, int(configured_num_ctx)), ceiling) if configured_num_ctx is not None else min(65536, ceiling)
     needed = max(1, int(exact_prompt_tokens)) + max(1, int(effective_max_tokens)) + 1024
-    desired = max(needed, min(32768, ceiling))
+    desired = max(needed, pin)
     for bucket in _OLLAMA_NUM_CTX_BUCKETS:
         if bucket >= desired:
             return min(bucket, ceiling)
@@ -161,11 +166,14 @@ def _apply_provider_params(
 ) -> None:
     flavor = (spec.provider_flavor or "litellm").strip().lower()
     if flavor in {"litellm", "ollama"}:
-        payload["num_ctx"] = resolve_ollama_num_ctx(
+        resolved_num_ctx = resolve_ollama_num_ctx(
             exact_prompt_tokens=exact_prompt_tokens,
             effective_max_tokens=effective_max_tokens,
             context_window=spec.context_window,
+            configured_num_ctx=spec.ollama_num_ctx,
         )
+        if resolved_num_ctx is not None:
+            payload["num_ctx"] = resolved_num_ctx
         if spec.disable_thinking:
             payload["reasoning_effort"] = "none"
     elif flavor == "llamacpp" and spec.disable_thinking:

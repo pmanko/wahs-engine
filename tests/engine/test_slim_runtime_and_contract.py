@@ -242,13 +242,14 @@ def test_ollama_provider_prefix_does_not_misclassify_gemma_as_llama() -> None:
 def test_dynamic_ollama_num_ctx_avoids_128k_overallocation_and_scales_on_large_prompts() -> None:
     from wahs_engine.upstream import resolve_ollama_num_ctx
 
-    # Small / 16k prompts under a 128k ceiling stay pinned to warm 32768 bucket (no 128k reload)
-    assert resolve_ollama_num_ctx(exact_prompt_tokens=4500, effective_max_tokens=1024, context_window=131072) == 32768
-    assert resolve_ollama_num_ctx(exact_prompt_tokens=18000, effective_max_tokens=1024, context_window=131072) == 32768
-    # Prompts exceeding 32k step up to 65536 and 131072 cleanly
+    # Default pins 2k-64k prompts cleanly at 65536 under a 64k or 128k ceiling (no 128k VRAM spill)
+    assert resolve_ollama_num_ctx(exact_prompt_tokens=4500, effective_max_tokens=1024, context_window=65536) == 65536
+    assert resolve_ollama_num_ctx(exact_prompt_tokens=18000, effective_max_tokens=1024, context_window=131072) == 65536
     assert resolve_ollama_num_ctx(exact_prompt_tokens=42000, effective_max_tokens=1024, context_window=131072) == 65536
+    # Prompts exceeding 64k step up to 131072 only when context_window allows
     assert resolve_ollama_num_ctx(exact_prompt_tokens=72000, effective_max_tokens=1024, context_window=131072) == 131072
-    # Respects smaller physical ceilings
+    # Explicit configured_num_ctx=0 omits num_ctx completely; smaller ceilings are respected
+    assert resolve_ollama_num_ctx(exact_prompt_tokens=6000, effective_max_tokens=1024, context_window=65536, configured_num_ctx=0) is None
     assert resolve_ollama_num_ctx(exact_prompt_tokens=6000, effective_max_tokens=1024, context_window=16384) == 16384
 
     captured: List[Dict[str, Any]] = []
@@ -272,7 +273,8 @@ def test_dynamic_ollama_num_ctx_avoids_128k_overallocation_and_scales_on_large_p
         fhir_auth_base_url="http://fhir-auth:8080/fhir",
         llm_base_url="http://llm-mock:8079/v1",
         allow_local_bundle_mode=True,
-        default_context_window=131072,
+        default_context_window=65536,
+        default_ollama_num_ctx=65536,
     )
     app = create_app(settings, llm_http_client=httpx.AsyncClient(transport=httpx.MockTransport(llm_handler)))
     with TestClient(app) as client:
@@ -286,9 +288,9 @@ def test_dynamic_ollama_num_ctx_avoids_128k_overallocation_and_scales_on_large_p
             },
         )
         assert resp.status_code == 200
-        assert captured[-1]["num_ctx"] == 32768
-        assert resp.json()["x_wahs"]["condensation"]["upstream_num_ctx"] == 32768
-        assert resp.json()["x_wahs"]["condensation"]["context_window"] == 131072
+        assert captured[-1]["num_ctx"] == 65536
+        assert resp.json()["x_wahs"]["condensation"]["upstream_num_ctx"] == 65536
+        assert resp.json()["x_wahs"]["condensation"]["context_window"] == 65536
 
 
 def test_sse_stream_surfaces_upstream_http_error_as_structured_error_chunk() -> None:
