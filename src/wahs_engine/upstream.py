@@ -87,7 +87,8 @@ def clean_model_text(content: str) -> str:
 def build_x_wahs_envelope(
     *, ctx: AssembledWahsContext, requested_model: str, upstream_model: str, options: WahsRequestOptions,
     engine_version: str, enrichers: Sequence[Mapping[str, Any]] = (), timings: Optional[Dict[str, Any]] = None,
-    exact_prompt_tokens: int = 0, upstream_prompt_tokens: int = 0, suspected_upstream_truncation: bool = False,
+    exact_prompt_tokens: int = 0, upstream_prompt_tokens: int = 0, upstream_num_ctx: Optional[int] = None,
+    suspected_upstream_truncation: bool = False,
     history_trimmed_turns: int = 0, enrichment_tokens: int = 0, enrichment_text: str = "",
 ) -> Dict[str, Any]:
     manifest, enricher_list = ctx.condensed.completeness_manifest or {}, [dict(e) for e in enrichers]
@@ -108,6 +109,7 @@ def build_x_wahs_envelope(
             "dataset_cache_hits": ctx.dataset_cache_hits, "dataset_fetches": ctx.dataset_fetches,
             "partial_fetch": ctx.partial_fetch, "partial_datasets": ctx.partial_datasets,
             "exact_prompt_tokens": exact_prompt_tokens, "upstream_prompt_tokens": upstream_prompt_tokens,
+            **({"upstream_num_ctx": int(upstream_num_ctx)} if upstream_num_ctx is not None else {}),
             "suspected_upstream_truncation": suspected_upstream_truncation, "history_trimmed_turns": history_trimmed_turns,
         },
         "completeness_manifest": manifest, "notices": list(ctx.notices), "enrichers": enricher_list,
@@ -126,10 +128,44 @@ def build_x_wahs_envelope(
     return env
 
 
-def _apply_provider_params(payload: Dict[str, Any], spec: ModelSpec) -> None:
+_OLLAMA_NUM_CTX_BUCKETS: Tuple[int, ...] = (8192, 16384, 32768, 65536, 131072)
+
+
+def resolve_ollama_num_ctx(
+    *,
+    exact_prompt_tokens: int,
+    effective_max_tokens: int,
+    context_window: int,
+) -> int:
+    """Right-size Ollama `num_ctx` to the smallest stable bucket covering the actual turn.
+
+    Keeps 2k-32k prompts pinned to a single warm 32768 KV cache (when `context_window >= 32768`)
+    so toggling chart sizes never triggers Ollama model reloads or 128k VRAM spills, while scaling
+    up to 65536 or 131072 only when the assembled prompt + output tokens actually exceed 32768.
+    """
+    ceiling = max(4096, int(context_window))
+    needed = max(1, int(exact_prompt_tokens)) + max(1, int(effective_max_tokens)) + 1024
+    desired = max(needed, min(32768, ceiling))
+    for bucket in _OLLAMA_NUM_CTX_BUCKETS:
+        if bucket >= desired:
+            return min(bucket, ceiling)
+    return ceiling
+
+
+def _apply_provider_params(
+    payload: Dict[str, Any],
+    spec: ModelSpec,
+    *,
+    exact_prompt_tokens: int = 0,
+    effective_max_tokens: int = 1024,
+) -> None:
     flavor = (spec.provider_flavor or "litellm").strip().lower()
     if flavor in {"litellm", "ollama"}:
-        payload["num_ctx"] = int(spec.context_window)
+        payload["num_ctx"] = resolve_ollama_num_ctx(
+            exact_prompt_tokens=exact_prompt_tokens,
+            effective_max_tokens=effective_max_tokens,
+            context_window=spec.context_window,
+        )
         if spec.disable_thinking:
             payload["reasoning_effort"] = "none"
     elif flavor == "llamacpp" and spec.disable_thinking:
@@ -206,9 +242,23 @@ def prepare_upstream_messages(
     return messages, disclosures, exact_toks, trimmed, enrichment_tokens, enrichment_text
 
 
-def _build_southbound_payload(*, upstream_model: str, messages: Sequence[Mapping[str, Any]], req: OpenAIChatCompletionRequest, spec: ModelSpec, effective_max_tokens: int, stream: bool) -> Dict[str, Any]:
+def _build_southbound_payload(
+    *,
+    upstream_model: str,
+    messages: Sequence[Mapping[str, Any]],
+    req: OpenAIChatCompletionRequest,
+    spec: ModelSpec,
+    effective_max_tokens: int,
+    exact_prompt_tokens: int,
+    stream: bool,
+) -> Dict[str, Any]:
     payload: Dict[str, Any] = {"model": upstream_model, "messages": list(messages), "temperature": req.temperature, "max_tokens": int(effective_max_tokens), "stream": stream}
-    _apply_provider_params(payload, spec)
+    _apply_provider_params(
+        payload,
+        spec,
+        exact_prompt_tokens=exact_prompt_tokens,
+        effective_max_tokens=effective_max_tokens,
+    )
     for opt in ("top_p", "stop", "presence_penalty", "frequency_penalty", "seed", "user"):
         val = getattr(req, opt, None)
         if val is not None:
@@ -272,11 +322,20 @@ class SouthboundOpenAIClient:
             pipeline=self.pipeline, max_enrichment_tokens=self.settings.max_enrichment_tokens,
         )
         prep_ms = round(assemble_ms + (time.perf_counter() - prep_t0) * 1000.0, 2)
-        payload = _build_southbound_payload(upstream_model=spec.upstream_model, messages=messages, req=req, spec=spec, effective_max_tokens=eff_max, stream=stream)
+        payload = _build_southbound_payload(
+            upstream_model=spec.upstream_model,
+            messages=messages,
+            req=req,
+            spec=spec,
+            effective_max_tokens=eff_max,
+            exact_prompt_tokens=exact_toks,
+            stream=stream,
+        )
         return ctx_copy, requested_model, spec, disclosures, exact_toks, trimmed, enr_toks, enr_text, prep_ms, payload
 
     async def complete(self, *, ctx: AssembledWahsContext, req: OpenAIChatCompletionRequest, options: WahsRequestOptions, assemble_ms: float = 0.0) -> Dict[str, Any]:
         ctx, requested_model, spec, disclosures, exact_toks, trimmed, enr_toks, enr_text, prep_ms, payload = await self._prepare_turn(ctx, req, stream=False, assemble_ms=assemble_ms)
+        sent_num_ctx = int(payload["num_ctx"]) if "num_ctx" in payload else None
 
         llm_t0 = time.perf_counter()
         try:
@@ -305,7 +364,7 @@ class SouthboundOpenAIClient:
                 "predicted_n": pred_n, "predicted_ms": round(pred_ms, 2), "predicted_per_second": round(pred_n / (pred_ms / 1000.0), 2) if pred_ms > 0 else 0.0,
                 "cache_n": int(t_obj.get("cache_n") or 0),
             },
-            exact_prompt_tokens=exact_toks, upstream_prompt_tokens=up_ptoks,
+            exact_prompt_tokens=exact_toks, upstream_prompt_tokens=up_ptoks, upstream_num_ctx=sent_num_ctx,
             suspected_upstream_truncation=bool(up_ptoks > 0 and exact_toks >= 1024 and up_ptoks < int(exact_toks * 0.85)),
             history_trimmed_turns=trimmed, enrichment_tokens=enr_toks, enrichment_text=enr_text,
         )
@@ -321,25 +380,45 @@ class SouthboundOpenAIClient:
 
     async def start_stream(self, *, ctx: AssembledWahsContext, req: OpenAIChatCompletionRequest, options: WahsRequestOptions, assemble_ms: float = 0.0) -> AsyncIterator[str]:
         ctx, requested_model, spec, disclosures, exact_toks, trimmed, enr_toks, enr_text, prep_ms, payload = await self._prepare_turn(ctx, req, stream=True, assemble_ms=assemble_ms)
-
+        sent_num_ctx = int(payload["num_ctx"]) if "num_ctx" in payload else None
         client = self._get_http_client()
-        llm_t0 = time.perf_counter()
-        try:
-            resp = await client.send(client.build_request("POST", self.settings.upstream_chat_completions_url, headers=self._headers(), json=payload), stream=True)
-        except httpx.HTTPError as exc:
-            raise HTTPException(status_code=502, detail=f"Southbound LLM stream request failed: {exc}") from exc
-        if resp.status_code >= 400:
-            await resp.aclose()
-            raise HTTPException(status_code=502, detail=f"Southbound LLM stream returned HTTP {resp.status_code}.")
+        upstream_req = client.build_request("POST", self.settings.upstream_chat_completions_url, headers=self._headers(), json=payload)
 
         async def _sse() -> AsyncIterator[str]:
             cid, created, finish_reason, up_usage = f"chatcmpl-wahs-{uuid.uuid4().hex[:12]}", int(time.time()), "stop", {}
             stripper = _StreamingThinkStripper()
+            role_chunk: Dict[str, Any] = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": requested_model, "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]}
+            if options.emit_stream_events:
+                role_chunk["x_wahs_stream"] = {"event": "context_ready", "prefix_cache_key_hash": ctx.prefix_cache_key_hash, "citation_map": ctx.citation_map}
+            yield f"data: {json.dumps(role_chunk)}\n\n"
+
+            llm_t0 = time.perf_counter()
+            send_task = asyncio.create_task(client.send(upstream_req, stream=True))
+            resp: Optional[httpx.Response] = None
             try:
-                role_chunk: Dict[str, Any] = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": requested_model, "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]}
-                if options.emit_stream_events:
-                    role_chunk["x_wahs_stream"] = {"event": "context_ready", "prefix_cache_key_hash": ctx.prefix_cache_key_hash, "citation_map": ctx.citation_map}
-                yield f"data: {json.dumps(role_chunk)}\n\n"
+                while not send_task.done():
+                    done_set, _ = await asyncio.wait({send_task}, timeout=15.0)
+                    if not done_set:
+                        yield ": keepalive\n\n"
+                resp = await send_task
+            except httpx.HTTPError as exc:
+                err_chunk = {"id": cid, "error": {"message": f"Southbound LLM stream request failed: {exc}", "status": 502}}
+                yield f"data: {json.dumps(err_chunk)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+            except asyncio.CancelledError:
+                send_task.cancel()
+                raise
+
+            if resp.status_code >= 400:
+                status_code = resp.status_code
+                await resp.aclose()
+                err_chunk = {"id": cid, "error": {"message": f"Southbound LLM stream returned HTTP {status_code}.", "status": 502}}
+                yield f"data: {json.dumps(err_chunk)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+            try:
                 async for line in resp.aiter_lines():
                     ln = line.strip()
                     if not ln.startswith("data:"):
@@ -363,6 +442,11 @@ class SouthboundOpenAIClient:
                 tail = stripper.flush()
                 if tail:
                     yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': created, 'model': requested_model, 'choices': [{'index': 0, 'delta': {'content': tail}, 'finish_reason': None}]})}\n\n"
+            except httpx.HTTPError as exc:
+                err_chunk = {"id": cid, "error": {"message": f"Southbound LLM stream interrupted: {exc}", "status": 502}}
+                yield f"data: {json.dumps(err_chunk)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
             finally:
                 await resp.aclose()
 
@@ -372,7 +456,7 @@ class SouthboundOpenAIClient:
                 ctx=ctx, requested_model=requested_model, upstream_model=spec.upstream_model, options=options,
                 engine_version=self.settings.engine_version, enrichers=disclosures,
                 timings={"engine_prep_ms": prep_ms, "upstream_llm_ms": llm_ms, "total_latency_ms": round(prep_ms + llm_ms, 2)},
-                exact_prompt_tokens=exact_toks, upstream_prompt_tokens=up_ptoks,
+                exact_prompt_tokens=exact_toks, upstream_prompt_tokens=up_ptoks, upstream_num_ctx=sent_num_ctx,
                 suspected_upstream_truncation=bool(up_ptoks > 0 and exact_toks >= 1024 and up_ptoks < int(exact_toks * 0.85)),
                 history_trimmed_turns=trimmed, enrichment_tokens=enr_toks, enrichment_text=enr_text,
             )
