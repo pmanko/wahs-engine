@@ -59,6 +59,7 @@ class ModelSpec:
     upstream_model: str
     context_window: int = 32768
     preferred_chart_tokens: Optional[int] = None
+    ollama_num_ctx: Optional[int] = None
     default_max_output_tokens: int = 1024
     tokenizer_family: str = "gemma4"
     provider_flavor: str = "litellm"
@@ -78,6 +79,7 @@ class WahsEngineSettings:
     model_specs: Dict[str, ModelSpec] = field(default_factory=dict)
     default_context_window: int = 32768
     default_preferred_chart_tokens: Optional[int] = None
+    default_ollama_num_ctx: Optional[int] = None
     default_provider_flavor: str = "litellm"
     default_profile: str = ""
     profiles_path: str = ""
@@ -127,6 +129,7 @@ class WahsEngineSettings:
             upstream_model=upstream,
             context_window=self.default_context_window,
             preferred_chart_tokens=self.default_preferred_chart_tokens,
+            ollama_num_ctx=self.default_ollama_num_ctx,
             tokenizer_family=_infer_tokenizer_family(model, upstream),
             provider_flavor=_infer_provider_flavor(upstream, self.default_provider_flavor),
         )
@@ -162,6 +165,16 @@ class WahsEngineSettings:
                 parsed_map.update({str(k): str(v) for k, v in loaded.items()})
 
         default_ctx = int(os.environ.get("WAHS_CONTEXT_WINDOW", "32768"))
+        raw_ollama_num_ctx = os.environ.get("WAHS_OLLAMA_NUM_CTX")
+        default_ollama_num_ctx: Optional[int] = None
+        if raw_ollama_num_ctx is not None and raw_ollama_num_ctx.strip():
+            low_nc = raw_ollama_num_ctx.strip().lower()
+            if low_nc in {"omit", "off", "none", "null", "0"}:
+                default_ollama_num_ctx = 0
+            else:
+                default_ollama_num_ctx = int(low_nc)
+                if default_ollama_num_ctx < 0:
+                    raise ValueError("WAHS_OLLAMA_NUM_CTX must be >= 0 or 'omit'.")
         raw_pref = os.environ.get("WAHS_PREFERRED_CHART_TOKENS")
         default_pref: Optional[int] = (
             None
@@ -191,6 +204,11 @@ class WahsEngineSettings:
                         upstream_model=up,
                         context_window=int(entry.get("context_window") or default_ctx),
                         preferred_chart_tokens=p_val,
+                        ollama_num_ctx=(
+                            int(entry["ollama_num_ctx"])
+                            if entry.get("ollama_num_ctx") is not None
+                            else default_ollama_num_ctx
+                        ),
                         default_max_output_tokens=int(entry.get("default_max_output_tokens") or 1024),
                         tokenizer_family=str(entry.get("tokenizer_family") or _infer_tokenizer_family(str(alias), up)),
                         provider_flavor=str(entry.get("provider_flavor") or _infer_provider_flavor(up, default_flavor)),
@@ -203,6 +221,7 @@ class WahsEngineSettings:
             fhir_auth_base_url=fhir_url, llm_base_url=llm_url, llm_api_key=llm_key,
             default_model=default_model, available_models=avail, model_map=parsed_map, model_specs=parsed_specs,
             default_context_window=default_ctx, default_preferred_chart_tokens=default_pref,
+            default_ollama_num_ctx=default_ollama_num_ctx,
             default_provider_flavor=default_flavor,
             default_profile=_env_str("WAHS_DEFAULT_PROFILE"),
             profiles_path=_env_str("WAHS_PROFILES_PATH"),
