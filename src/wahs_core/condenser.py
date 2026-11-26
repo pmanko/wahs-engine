@@ -1,15 +1,22 @@
 """3-Tier Verbatim-First Monotonic Structural FHIR Chart Condenser (`wahs_core`).
 
-- Tier 0 (Verbatim Complete Ledger): Whenever all extracted clinical items and full
-  decoded clinical notes fit within ``target_tokens``, emits 100% verbatim lines and
-  full notes (`folded_items_count=0`, `omitted_clinical_items_count=0`).
-- Tier 1 (Ontology-Free RLE Folded Ledger): If Tier 0 exceeds budget, run-length folds
-  repeated historical observations, medication renewals, panels, resolved conditions,
-  procedures, and routine encounters strictly by FHIR code/unit/setting while keeping
-  the HL7 IPS Safety Core, high-acuity encounters, and full clinical notes verbatim.
-- Tier 2 (Budget-Packed Ledger): Preserves the HL7 IPS Safety Core intact, binary-searches
-  a budget-independent section-interleaved recency prefix (with clean 400-char head-only
-  note previews), and expands newest notes back to full text while within budget.
+Zero hardcoded budget ceilings, zero static per-section item counts, and zero static
+note character cutoffs:
+- Tier 0 (Verbatim Complete Ledger): Whenever `target_tokens is None` or all extracted
+  clinical items and full decoded clinical notes fit within `target_tokens`, emits 100%
+  verbatim lines and full notes (`folded_items_count=0`, `omitted_clinical_items_count=0`).
+- Tier 1 (Uniform Ontology-Free RLE Folded Ledger): When Tier 0 exceeds `target_tokens`,
+  uniformly run-length folds repeated historical items sharing the same FHIR
+  `(section, code, unit/status)` key into the latest record + count + date span + numeric
+  range + merged `member_uuids`, keeping the HL7 IPS Safety Core, acute encounters, and
+  full clinical notes verbatim.
+- Tier 2 (Budget-Packed Ledger with Continuous Note Water-Filling): Preserves the HL7 IPS
+  Safety Core intact (stripping verbose qualifiers or collapsing by section only when the
+  IPS core itself exceeds budget), binary-searches a budget-independent section-interleaved
+  recency prefix using minimal note headers so UUID coverage is strictly monotonic in
+  `target_tokens`, and binary-searches a continuous character horizon across included notes
+  so short notes remain full text and longer notes expand dynamically to fill remaining
+  capacity.
 """
 
 from __future__ import annotations
@@ -22,14 +29,12 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, 
 from .chart_serializer import render_chart
 from .extractors import ClinicalItem, ExtractedChart, extract_bundle
 
-_NOTE_EXCERPT_HEAD_CHARS = 400
-
 
 @dataclass(frozen=True)
 class CondensedChartResult:
     tier: int
     tier_name: str
-    target_tokens: int
+    target_tokens: Optional[int]
     actual_tokens: int
     chart_text: str
     records: List[Dict[str, Any]]
@@ -84,23 +89,16 @@ def _fold_group_by_key(
     text_fn: Callable[[ClinicalItem, List[ClinicalItem], str], str],
     *,
     section: Optional[str] = None,
-    keep_latest_individual: int = 0,
 ) -> Tuple[List[ClinicalItem], int]:
-    """Run-length fold repeated items sharing `key_fn`, returning `(items, folded_count)`."""
+    """Uniformly run-length fold repeated items sharing `key_fn`, returning `(items, folded_count)`."""
     if not items:
         return [], 0
-    unfolded: List[ClinicalItem] = []
-    pool = list(items)
-    if keep_latest_individual > 0:
-        ordered_all = sorted(pool, key=lambda x: (_date_sort_key(x.date), x.resource_uuid), reverse=True)
-        unfolded.extend(ordered_all[:keep_latest_individual])
-        pool = ordered_all[keep_latest_individual:]
 
     groups: Dict[Tuple[Any, ...], List[ClinicalItem]] = {}
-    for it in pool:
+    for it in items:
         groups.setdefault(key_fn(it), []).append(it)
 
-    out: List[ClinicalItem] = list(unfolded)
+    out: List[ClinicalItem] = []
     folded_count = 0
     for group in groups.values():
         chron = sorted(group, key=lambda x: (_date_sort_key(x.date), x.resource_uuid))
@@ -161,49 +159,18 @@ def _fold_observations_rle(items: Sequence[ClinicalItem]) -> Tuple[List[Clinical
     )
 
 
-def _fold_panels_rle(items: Sequence[ClinicalItem], *, keep_latest_per_code: int = 2) -> Tuple[List[ClinicalItem], int]:
-    by_code: Dict[str, List[ClinicalItem]] = {}
-    for p in items:
-        by_code.setdefault((p.code or p.display).lower(), []).append(p)
-    out: List[ClinicalItem] = []
-    folded_count = 0
-    for group in by_code.values():
-        ordered = sorted(group, key=lambda x: (_date_sort_key(x.date), x.resource_uuid), reverse=True)
-        out.extend(ordered[:keep_latest_per_code])
-        older = ordered[keep_latest_per_code:]
-        if not older:
-            continue
-        if len(older) == 1:
-            out.append(older[0])
-            continue
-        folded_count += len(older) - 1
-        latest_older = older[0]
-        latest_date, span_str = _span_phrase([x.date for x in older])
-        span_part = f" ({span_str})" if span_str else ""
-        eff_date = latest_date or latest_older.date
-        out.append(
-            ClinicalItem(
-                resource_type=latest_older.resource_type,
-                resource_uuid=latest_older.resource_uuid,
-                date=eff_date,
-                clinical_date=eff_date,
-                date_kind="clinical_event" if eff_date else latest_older.date_kind,
-                section=latest_older.section,
-                code=latest_older.code,
-                display=latest_older.display,
-                text=f"Diagnostic Panel History ({latest_older.display}): {len(older)} prior panels{span_part}",
-                mandatory=False,
-                status=latest_older.status,
-                source_org=latest_older.source_org,
-                member_uuids=_merge_uuids(older),
-            )
-        )
-    out.sort(key=lambda x: (_date_sort_key(x.date), x.resource_uuid), reverse=True)
-    return out, folded_count
+def _fold_panels_rle(items: Sequence[ClinicalItem]) -> Tuple[List[ClinicalItem], int]:
+    """Uniformly fold repeated diagnostic/survey panels sharing `(code or display)`."""
+
+    return _fold_group_by_key(
+        items,
+        key_fn=lambda x: ((x.code or x.display).lower(), x.status),
+        text_fn=lambda latest, chron, span: f"{latest.text} ({len(chron)} panels{', ' + span if span else ''})",
+    )
 
 
 def _build_tier1_items(extracted: ExtractedChart) -> Tuple[List[ClinicalItem], List[ClinicalItem], int]:
-    """Return `(mandatory_ips, optional_rle_items, folded_items_count)` without clinical heuristics."""
+    """Return `(mandatory_ips, optional_rle_items, folded_items_count)` uniformly without heuristics."""
     src = extracted.items
     patient = [x for x in src if x.section == "patient"]
     allergies = [x for x in src if x.section == "allergy" and x.mandatory]
@@ -253,19 +220,17 @@ def _build_tier1_items(extracted: ExtractedChart) -> Tuple[List[ClinicalItem], L
         enc_routine,
         key_fn=lambda x: ((x.display or x.code).lower(), x.code),
         text_fn=lambda lat, grp, sp: f"Encounter History: {lat.display} ({len(grp)} visits{', ' + sp if sp else ''}, class: {lat.code})",
-        keep_latest_individual=3,
     )
     folded_total += fc
     f_procs, fc = _fold_group_by_key(
         procs,
         key_fn=lambda x: ((x.code or x.display).lower(), x.status),
         text_fn=lambda lat, grp, sp: f"Procedure History: {lat.display} ({len(grp)} records{', ' + sp if sp else ''})",
-        keep_latest_individual=2,
     )
     folded_total += fc
-    f_lab_panels, fc = _fold_panels_rle(lab_panels, keep_latest_per_code=2)
+    f_lab_panels, fc = _fold_panels_rle(lab_panels)
     folded_total += fc
-    f_survey_panels, fc = _fold_panels_rle(survey_panels, keep_latest_per_code=1)
+    f_survey_panels, fc = _fold_panels_rle(survey_panels)
     folded_total += fc
     f_labs, fc = _fold_observations_rle(labs)
     folded_total += fc
@@ -308,8 +273,36 @@ def _build_tier1_items(extracted: ExtractedChart) -> Tuple[List[ClinicalItem], L
     return mandatory_ips, optional_rle, folded_total
 
 
-def _compact_ips_for_tiny_budget(mandatory_items: Sequence[ClinicalItem]) -> List[ClinicalItem]:
-    """Preserve every mandatory IPS Safety Core UUID while trimming verbose qualifiers."""
+def _strip_ips_code_qualifiers(mandatory_items: Sequence[ClinicalItem]) -> List[ClinicalItem]:
+    """Pass A IPS compaction: strip verbose coding system suffixes while retaining 1 line per item."""
+    out: List[ClinicalItem] = []
+    for it in mandatory_items:
+        if it.section == "patient":
+            out.append(it)
+            continue
+        short = re.sub(r",\s*(?:RxNorm|SNOMED|CVX):\s*[^,)]+", "", it.text)
+        out.append(
+            ClinicalItem(
+                resource_type=it.resource_type,
+                resource_uuid=it.resource_uuid,
+                date=it.date,
+                clinical_date=it.clinical_date,
+                date_kind=it.date_kind,
+                section=it.section,
+                code=it.code,
+                display=it.display,
+                text=short,
+                mandatory=True,
+                status=it.status,
+                source_org=it.source_org,
+                member_uuids=it.member_uuids,
+            )
+        )
+    return out
+
+
+def _collapse_ips_by_section(mandatory_items: Sequence[ClinicalItem]) -> List[ClinicalItem]:
+    """Pass B IPS compaction: collapse each IPS section into a single summary preserving all UUIDs."""
     out: List[ClinicalItem] = []
     grouped_by_sec: Dict[str, List[ClinicalItem]] = {}
     for it in mandatory_items:
@@ -322,26 +315,8 @@ def _compact_ips_for_tiny_budget(mandatory_items: Sequence[ClinicalItem]) -> Lis
         sec_items = grouped_by_sec.get(sec, [])
         if not sec_items:
             continue
-        if len(sec_items) <= 4:
-            for it in sec_items:
-                short = re.sub(r",\s*(?:RxNorm|SNOMED|CVX):\s*[^,)]+", "", it.text)
-                out.append(
-                    ClinicalItem(
-                        resource_type=it.resource_type,
-                        resource_uuid=it.resource_uuid,
-                        date=it.date,
-                        clinical_date=it.clinical_date,
-                        date_kind=it.date_kind,
-                        section=it.section,
-                        code=it.code,
-                        display=it.display,
-                        text=short,
-                        mandatory=True,
-                        status=it.status,
-                        source_org=it.source_org,
-                        member_uuids=it.member_uuids,
-                    )
-                )
+        if len(sec_items) == 1:
+            out.append(sec_items[0])
             continue
         latest_d, _ = _span_phrase([x.date for x in sec_items])
         labels = "; ".join(
@@ -368,13 +343,18 @@ def _compact_ips_for_tiny_budget(mandatory_items: Sequence[ClinicalItem]) -> Lis
     return out
 
 
-def _head_excerpt_note(note: ClinicalItem, max_chars: int = _NOTE_EXCERPT_HEAD_CHARS) -> Tuple[ClinicalItem, bool]:
-    full = str(note.metadata.get("full_text") or note.text or "")
+def _render_note_at_horizon(note: ClinicalItem, char_cap: int) -> Tuple[ClinicalItem, bool]:
+    """Render a clinical note up to `char_cap` characters without any fixed static cutoff."""
+    full = str(note.metadata.get("full_text") or note.text or "").strip()
     title = str(note.metadata.get("title") or note.display or "Clinical Note")
-    if len(full) <= max_chars:
+    if char_cap >= len(full):
         return note, False
-    head = full[:max_chars].rstrip()
-    excerpt_txt = f"Note ({title}): {head} [... excerpted; {len(full)} chars total]"
+    stub_suffix = f"[... excerpted; {len(full)} chars total]"
+    head = full[: max(0, char_cap)].rstrip()
+    body = f"{head} {stub_suffix}" if head else stub_suffix
+    excerpt_txt = f"Note ({title}): {body}"
+    if len(excerpt_txt) >= len(note.text):
+        return note, False
     return (
         ClinicalItem(
             resource_type=note.resource_type,
@@ -590,13 +570,14 @@ def _make_result(
     *,
     extracted: ExtractedChart,
     tier: int,
-    target_tokens: int,
+    target_tokens: Optional[int],
     actual_tokens: int,
     chart_text: str,
     recs: List[Dict[str, Any]],
     mappings: List[Dict[str, Any]],
     manifest: Dict[str, Any],
 ) -> CondensedChartResult:
+    util = round(actual_tokens / target_tokens, 3) if target_tokens else 1.0
     return CondensedChartResult(
         tier=tier,
         tier_name=manifest["tier_name"],
@@ -612,7 +593,7 @@ def _make_result(
             "rendered_records": len(recs),
             "target_tokens": target_tokens,
             "actual_tokens": actual_tokens,
-            "budget_utilization": round(actual_tokens / target_tokens, 3),
+            "budget_utilization": util,
         },
     )
 
@@ -620,12 +601,14 @@ def _make_result(
 def condense_bundle_to_budget(
     bundle: Mapping[str, Any] | ExtractedChart,
     *,
-    target_tokens: int = 16384,
+    target_tokens: Optional[int] = None,
     token_counter: Optional[Callable[[str], int]] = None,
 ) -> CondensedChartResult:
     """Condense a FHIR R4 Bundle (or `ExtractedChart`) via 3-tier verbatim-first condensation."""
-    if not isinstance(target_tokens, int) or isinstance(target_tokens, bool) or target_tokens <= 0:
-        raise ValueError("target_tokens must be a positive integer")
+    if target_tokens is not None and (
+        not isinstance(target_tokens, int) or isinstance(target_tokens, bool) or target_tokens <= 0
+    ):
+        raise ValueError("target_tokens must be a positive integer or None")
 
     counter = token_counter or estimate_tokens_local
     extracted = bundle if isinstance(bundle, ExtractedChart) else extract_bundle(bundle)
@@ -647,13 +630,13 @@ def condense_bundle_to_budget(
         excerpted_notes_count=0,
         counter=counter,
     )
-    if toks0 <= target_tokens:
+    if target_tokens is None or toks0 <= target_tokens:
         return _make_result(
             extracted=extracted, tier=0, target_tokens=target_tokens, actual_tokens=toks0,
             chart_text=text0, recs=recs0, mappings=maps0, manifest=man0,
         )
 
-    # Tier 1: Ontology-Free RLE Folded Ledger (full notes + IPS core preserved verbatim)
+    # Tier 1: Uniform Ontology-Free RLE Folded Ledger (full notes + IPS core preserved verbatim)
     mandatory_ips, optional_rle, folded_count = _build_tier1_items(extracted)
     opt_sorted_t1 = sorted(optional_rle, key=lambda x: (_date_sort_key(x.date), x.resource_uuid), reverse=True)
     recs1, man1, text1, maps1, toks1 = _assemble_render(
@@ -671,53 +654,61 @@ def condense_bundle_to_budget(
             chart_text=text1, recs=recs1, mappings=maps1, manifest=man1,
         )
 
-    # Tier 2: Budget-Packed Ledger with monotonic prefix & clean head-only note excerpts
+    # Tier 2: Budget-Packed Ledger with monotonic UUID prefix & continuous note water-filling
     active_ips = list(mandatory_ips)
     _, _, _, _, ips_toks = _assemble_render(
         extracted, active_ips, tier=2, tier_name="Budget-Packed Ledger",
         folded_items_count=folded_count, excerpted_notes_count=0, counter=counter,
     )
     if ips_toks > target_tokens:
-        active_ips = _compact_ips_for_tiny_budget(mandatory_ips)
-        recs_u, man_u, text_u, maps_u, toks_u = _assemble_render(
-            extracted, active_ips, tier=2, tier_name="Budget-Packed Ledger",
+        cand_ips = _strip_ips_code_qualifiers(mandatory_ips)
+        _, _, _, _, toks_a = _assemble_render(
+            extracted, cand_ips, tier=2, tier_name="Budget-Packed Ledger",
             folded_items_count=folded_count, excerpted_notes_count=0, counter=counter,
         )
-        if toks_u > target_tokens:
-            raise ValueError(
-                f"target_tokens ({target_tokens}) cannot fit mandatory IPS safety core ({toks_u} tokens required)"
+        if toks_a <= target_tokens:
+            active_ips = cand_ips
+        else:
+            collapsed_ips = _collapse_ips_by_section(cand_ips)
+            recs_b, man_b, text_b, maps_b, toks_b = _assemble_render(
+                extracted, collapsed_ips, tier=2, tier_name="Budget-Packed Ledger",
+                folded_items_count=folded_count, excerpted_notes_count=0, counter=counter,
             )
-        return _make_result(
-            extracted=extracted, tier=2, target_tokens=target_tokens, actual_tokens=toks_u,
-            chart_text=text_u, recs=recs_u, mappings=maps_u, manifest=man_u,
-        )
+            if toks_b > target_tokens:
+                raise ValueError(
+                    f"target_tokens ({target_tokens}) cannot fit mandatory IPS safety core ({toks_b} tokens required)"
+                )
+            return _make_result(
+                extracted=extracted, tier=2, target_tokens=target_tokens, actual_tokens=toks_b,
+                chart_text=text_b, recs=recs_b, mappings=maps_b, manifest=man_b,
+            )
 
     full_note_by_uuid = {
         it.resource_uuid: it
         for it in optional_rle
         if it.section == "clinical_note" and it.resource_uuid
     }
-    optional_ex: List[ClinicalItem] = []
-    excerpted_uuids: Set[str] = set()
+    optional_stubs: List[ClinicalItem] = []
+    stub_excerpted_uuids: Set[str] = set()
     for it in optional_rle:
         if it.section == "clinical_note":
-            ex_it, did_ex = _head_excerpt_note(it)
-            optional_ex.append(ex_it)
+            stub_it, did_ex = _render_note_at_horizon(it, 0)
+            optional_stubs.append(stub_it)
             if did_ex and it.resource_uuid:
-                excerpted_uuids.add(it.resource_uuid)
+                stub_excerpted_uuids.add(it.resource_uuid)
         else:
-            optional_ex.append(it)
+            optional_stubs.append(it)
 
-    ranked_optional = _rank_optional_balanced(optional_ex)
+    ranked_optional = _rank_optional_balanced(optional_stubs)
 
-    def _fit_prefix(k: int) -> Tuple[List[ClinicalItem], Dict[str, Any], str, List[Dict[str, Any]], int, int]:
+    def _fit_prefix(k: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any], str, List[Dict[str, Any]], int]:
         chosen = sorted(
             ranked_optional[:k],
             key=lambda x: (_date_sort_key(x.date), x.resource_uuid),
             reverse=True,
         )
-        ex_cnt = sum(1 for x in chosen if x.resource_uuid in excerpted_uuids)
-        recs, man, txt, maps, toks = _assemble_render(
+        ex_cnt = sum(1 for x in chosen if x.resource_uuid in stub_excerpted_uuids)
+        return _assemble_render(
             extracted,
             active_ips + chosen,
             tier=2,
@@ -726,7 +717,6 @@ def condense_bundle_to_budget(
             excerpted_notes_count=ex_cnt,
             counter=counter,
         )
-        return recs, man, txt, maps, toks, ex_cnt
 
     lo, hi = 0, len(ranked_optional)
     best_k = 0
@@ -743,35 +733,65 @@ def condense_bundle_to_budget(
         best_k -= 1
 
     accepted_opt = list(ranked_optional[:best_k])
-    remaining_ex = {it.resource_uuid for it in accepted_opt if it.resource_uuid in excerpted_uuids}
+    included_note_positions = [
+        idx for idx, x in enumerate(accepted_opt) if x.resource_uuid and x.resource_uuid in full_note_by_uuid
+    ]
 
-    # If all optional items fit as excerpts, greedily expand newest notes back to full text.
-    if best_k == len(ranked_optional) and remaining_ex:
-        note_positions = sorted(
-            (i for i, x in enumerate(accepted_opt) if x.resource_uuid in remaining_ex),
-            key=lambda i: (_date_sort_key(accepted_opt[i].date), accepted_opt[i].resource_uuid),
-            reverse=True,
+    if included_note_positions:
+        max_note_chars = max(
+            len(
+                str(
+                    full_note_by_uuid[accepted_opt[idx].resource_uuid].metadata.get("full_text")
+                    or full_note_by_uuid[accepted_opt[idx].resource_uuid].text
+                    or ""
+                ).strip()
+            )
+            for idx in included_note_positions
         )
-        for pos in note_positions:
-            uid = accepted_opt[pos].resource_uuid
-            full_item = full_note_by_uuid.get(uid)
-            if full_item is None:
-                continue
+
+        def _render_notes_at_cap(cap_chars: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any], str, List[Dict[str, Any]], int]:
             cand = list(accepted_opt)
-            cand[pos] = full_item
+            ex_cnt = 0
+            for idx in included_note_positions:
+                uid = accepted_opt[idx].resource_uuid
+                rendered_note, did_ex = _render_note_at_horizon(full_note_by_uuid[uid], cap_chars)
+                cand[idx] = rendered_note
+                if did_ex:
+                    ex_cnt += 1
             cand_sorted = sorted(cand, key=lambda x: (_date_sort_key(x.date), x.resource_uuid), reverse=True)
-            _, _, _, _, cand_toks = _assemble_render(
+            return _assemble_render(
                 extracted,
                 active_ips + cand_sorted,
                 tier=2,
                 tier_name="Budget-Packed Ledger",
                 folded_items_count=folded_count,
-                excerpted_notes_count=len(remaining_ex) - 1,
+                excerpted_notes_count=ex_cnt,
                 counter=counter,
             )
-            if cand_toks <= target_tokens:
-                accepted_opt = cand
-                remaining_ex.discard(uid)
+
+        recs_full, man_full, text_full, maps_full, toks_full = _render_notes_at_cap(max_note_chars)
+        if toks_full <= target_tokens:
+            return _make_result(
+                extracted=extracted, tier=2, target_tokens=target_tokens, actual_tokens=toks_full,
+                chart_text=text_full, recs=recs_full, mappings=maps_full, manifest=man_full,
+            )
+
+        lo_c, hi_c = 0, max(0, max_note_chars - 1)
+        best_c = 0
+        while lo_c <= hi_c:
+            mid_c = (lo_c + hi_c) // 2
+            if _render_notes_at_cap(mid_c)[4] <= target_tokens:
+                best_c = mid_c
+                lo_c = mid_c + 1
+            else:
+                hi_c = mid_c - 1
+        while best_c > 0 and _render_notes_at_cap(best_c)[4] > target_tokens:
+            best_c -= 1
+        recs2, man2, text2, maps2, toks2 = _render_notes_at_cap(best_c)
+        return _make_result(
+            extracted=extracted, tier=2, target_tokens=target_tokens, actual_tokens=toks2,
+            chart_text=text2, recs=recs2, mappings=maps2, manifest=man2,
+        )
 
     final_opt = sorted(accepted_opt, key=lambda x: (_date_sort_key(x.date), x.resource_uuid), reverse=True)
     recs2, man2, text2, maps2, toks2 = _assemble_render(
@@ -780,7 +800,7 @@ def condense_bundle_to_budget(
         tier=2,
         tier_name="Budget-Packed Ledger",
         folded_items_count=folded_count,
-        excerpted_notes_count=len(remaining_ex),
+        excerpted_notes_count=0,
         counter=counter,
     )
     return _make_result(

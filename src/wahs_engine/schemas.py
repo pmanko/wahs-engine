@@ -34,7 +34,7 @@ class WahsRequestOptions(BaseModel):
     fhir_bundle: Optional[Dict[str, Any]] = None
     chart_scope: ChartScope = Field(default_factory=ChartScope)
     overlay_resources: List[Dict[str, Any]] = Field(default_factory=list)
-    target_budget_tokens: Optional[int] = Field(default=None, ge=512, le=262144)
+    target_budget_tokens: Optional[int] = Field(default=None, gt=0)
     refresh: bool = False
     emit_stream_events: bool = True
 
@@ -67,7 +67,7 @@ class OpenAIChatCompletionRequest(BaseModel):
     messages: List[ChatMessage] = Field(..., min_length=1)
     stream: bool = False
     temperature: float = Field(default=0.1, ge=0.0, le=2.0)
-    max_tokens: Optional[int] = Field(default=None, ge=1, le=16384)
+    max_tokens: Optional[int] = Field(default=None, gt=0)
     top_p: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     presence_penalty: Optional[float] = Field(default=None, ge=-2.0, le=2.0)
     frequency_penalty: Optional[float] = Field(default=None, ge=-2.0, le=2.0)

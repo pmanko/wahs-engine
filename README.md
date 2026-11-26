@@ -11,7 +11,7 @@ flowchart LR
   subgraph Engine["wahs-engine Core Baseline (Default)"]
     direction TB
     S1["1. Fetch & Scope<br/>Reads patient records via fhir-auth<br/>Applies explicit UI chart_scope"]
-    S2["2. Verbatim-First Condense<br/>Verbatim [1]..[N] lines when <= 16k budget<br/>Ontology-free RLE folding only if > budget<br/>Emits [2] Completeness Manifest"]
+    S2["2. Verbatim-First Condense<br/>Verbatim [1]..[N] lines when chart <= budget<br/>Uniform RLE + water-filled notes if > budget<br/>Emits [2] Completeness Manifest"]
     S3["3. Extension Port (OFF by default)<br/>ContextEnricher Protocol hook<br/>Pass-through when WAHS_ENABLED_ENRICHERS=''"]
     S1 --> S2 --> S3
   end
@@ -47,5 +47,5 @@ flowchart LR
 ## Wire Contract (`/v1/models`, `/v1/chat/completions`, `/v1/wahs/context/preview`)
 
 - **Clean Model IDs:** `wahs-26b` (`ollama/gemma4:26b`, default), `wahs-12b` (`ollama/gemma4:12b`), `wahs-e4b` (`ollama/gemma4:e4b`).
-- **Explicit Scoping (`wahs`):** `master_patient_id`, `chart_scope`, `overlay_resources`, `target_budget_tokens` (default ceiling `16,384`), `refresh`, `emit_stream_events`.
+- **Dynamic Budget Policy (`wahs`):** `master_patient_id`, `chart_scope`, `overlay_resources`, optional un-clamped `target_budget_tokens` (up to `context_window - exact_turn_overhead`; `Auto` uses remaining context or optional `WAHS_PREFERRED_CHART_TOKENS`), `refresh`, `emit_stream_events`.
 - **Non-Goals by Design:** Middleware privacy redaction/segmentation is intentionally unbuilt here pending UW CIRG selective-disclosure design; access isolation is enforced by `fhir-auth` and explicit UI `chart_scope` / `ips_bundle_id`.

@@ -23,7 +23,7 @@ from wahs_core import CondensedChartResult, ExtractedChart, condense_bundle_to_b
 from .config import ModelSpec, WahsEngineSettings
 from .jwt_claims import VerifiedCallerIdentity
 from .schemas import ChartScope, WahsRequestOptions
-from .tokenizers_registry import get_exact_token_counter
+from .tokenizers_registry import count_chat_messages_tokens, get_exact_token_counter
 
 WAHS_SYSTEM_PROMPT = """You are the Washington Health Summary (WAHS) AI Assistant, a plain-language clinical record companion.
 
@@ -52,6 +52,9 @@ K, V = TypeVar("K"), TypeVar("V")
 def _estimate_cache_bytes(value: Any) -> int:
     if isinstance(value, AssembledWahsContext):
         return max(256, len(value.system_prompt.encode("utf-8")) + len(json.dumps(value.citation_map, default=str).encode("utf-8")) + sum(len(it.text.encode("utf-8")) + 192 for it in value.extracted.items))
+    if isinstance(value, tuple) and value and isinstance(value[0], ExtractedChart):
+        ext = value[0]
+        return max(256, sum(len(it.text.encode("utf-8")) + 192 for it in ext.items))
     try:
         return max(64, len(json.dumps(value, separators=(",", ":"), default=str).encode("utf-8")))
     except Exception:
@@ -106,21 +109,65 @@ def _parse_fhir_instant(ts: str) -> Tuple[int, float, str]:
         return (0, 0.0, raw)
 
 
-def derive_effective_chart_budget(spec: ModelSpec, options: WahsRequestOptions, *, has_enabled_enrichers: bool = False, system_prompt_header: str = WAHS_SYSTEM_PROMPT) -> Tuple[int, str]:
-    counter = get_exact_token_counter(spec.tokenizer_family)
-    base_framing = counter(system_prompt_header) + 96 + (384 if has_enabled_enrichers else 0)
-    out_res = max(spec.default_max_output_tokens, min(4096, int(spec.context_window * 0.125)))
-    conv_res = max(256, min(16384, int(spec.context_window * 0.15)))
-    win_derived = spec.context_window - base_framing - out_res - conv_res
-    if win_derived < 512:
-        raise HTTPException(status_code=422, detail=f"Configured model context_window={spec.context_window} cannot fit required framing.")
-    cap, reason = (spec.chart_budget_ceiling, "chart_budget_ceiling") if (spec.chart_budget_ceiling is not None and spec.chart_budget_ceiling < win_derived) else (win_derived, "context_window_derived")
-    if options.target_budget_tokens is None:
-        return cap, reason
-    req_b = int(options.target_budget_tokens)
-    if req_b <= cap:
-        return req_b, "caller_target_budget_tokens"
-    return cap, ("clamped_to_chart_budget_ceiling" if (spec.chart_budget_ceiling is not None and cap == spec.chart_budget_ceiling and cap < win_derived) else "clamped_to_context_window")
+def normalize_conversation_turns(conversation_messages: Sequence[Any]) -> List[Dict[str, str]]:
+    """Extract normalized non-empty user/assistant chat turns from OpenAI message objects."""
+    turns: List[Dict[str, str]] = []
+    for m in conversation_messages or ():
+        role_raw = m.get("role") if isinstance(m, Mapping) else getattr(m, "role", "")
+        content_raw = m.get("content") if isinstance(m, Mapping) else getattr(m, "content", "")
+        role = str(role_raw or "").strip().lower()
+        if role not in {"user", "assistant"}:
+            continue
+        if isinstance(content_raw, list):
+            parts = [str(p.get("text") or "") for p in content_raw if isinstance(p, Mapping) and p.get("type") in {"text", "input_text", None}]
+            text_val = "\n".join(p for p in parts if p)
+        else:
+            text_val = str(content_raw or "")
+        if text_val.strip():
+            turns.append({"role": role, "content": text_val})
+    return turns
+
+
+def resolve_chart_budget(
+    spec: ModelSpec,
+    options: WahsRequestOptions,
+    *,
+    system_framing_text: str = WAHS_SYSTEM_PROMPT,
+    conversation_messages: Sequence[Any] = (),
+    requested_max_tokens: Optional[int] = None,
+) -> Tuple[int, str]:
+    """Compute physical remaining chart budget from exact turn overhead and resolve policy."""
+    effective_max_tokens = int(requested_max_tokens) if requested_max_tokens is not None else int(spec.default_max_output_tokens)
+    if effective_max_tokens >= spec.context_window:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Requested max_tokens ({effective_max_tokens}) equals or exceeds model context_window ({spec.context_window}).",
+        )
+    turns = normalize_conversation_turns(conversation_messages)
+    probe_messages: List[Dict[str, str]] = [{"role": "system", "content": system_framing_text}, *turns]
+    while len(probe_messages) > 2:
+        toks = count_chat_messages_tokens(probe_messages, tokenizer_family=spec.tokenizer_family)
+        if toks + effective_max_tokens < spec.context_window:
+            break
+        probe_messages.pop(1)
+        while len(probe_messages) > 2 and probe_messages[1].get("role") != "user":
+            probe_messages.pop(1)
+    # 4-token BPE boundary allowance for joining chart_text into system framing
+    non_chart_tokens = count_chat_messages_tokens(probe_messages, tokenizer_family=spec.tokenizer_family) + effective_max_tokens + 4
+    physical_chart_capacity = spec.context_window - non_chart_tokens
+    if physical_chart_capacity <= 0:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Configured model context_window={spec.context_window} cannot fit required system framing, latest turn, and max_tokens={effective_max_tokens}.",
+        )
+    if options.target_budget_tokens is not None:
+        req_b = int(options.target_budget_tokens)
+        if req_b <= physical_chart_capacity:
+            return req_b, "caller_target_budget_tokens"
+        return physical_chart_capacity, "clamped_to_context_window"
+    if spec.preferred_chart_tokens is not None and spec.preferred_chart_tokens < physical_chart_capacity:
+        return int(spec.preferred_chart_tokens), "model_preferred_chart_tokens"
+    return physical_chart_capacity, "context_window_available"
 
 
 @dataclass(frozen=True)
@@ -158,7 +205,7 @@ class AssembledWahsContext:
     budget_requested: Optional[int] = None
     budget_effective: int = 0
     context_window: int = 32768
-    chart_budget_ceiling: Optional[int] = 16384
+    preferred_chart_tokens: Optional[int] = None
     clamp_reason: Optional[str] = None
     tokenizer_family: str = "gemma4"
     partial_fetch: bool = False
@@ -325,15 +372,38 @@ def _extract_ips_referenced_keys(ips_bundle: Mapping[str, Any]) -> Set[str]:
     return keys
 
 
-def _clone_context(ctx: AssembledWahsContext, *, cache_hit: bool, budget_requested: Any = _SENTINEL, clamp_reason: Any = _SENTINEL) -> AssembledWahsContext:
+def _clone_context(ctx: AssembledWahsContext, *, cache_hit: bool, budget_requested: Any = _SENTINEL, budget_effective: Any = _SENTINEL, clamp_reason: Any = _SENTINEL, dataset_cache_hits: Any = _SENTINEL, dataset_fetches: Any = _SENTINEL) -> AssembledWahsContext:
     cloned = copy.copy(ctx)
     cloned.citation_map = copy.deepcopy(ctx.citation_map)
     cloned.notices, cloned.partial_datasets, cloned.cache_hit = list(ctx.notices), [dict(d) for d in ctx.partial_datasets], cache_hit
     if budget_requested is not _SENTINEL:
         cloned.budget_requested = budget_requested
+    if budget_effective is not _SENTINEL:
+        cloned.budget_effective = budget_effective
     if clamp_reason is not _SENTINEL:
         cloned.clamp_reason = clamp_reason
+    if dataset_cache_hits is not _SENTINEL:
+        cloned.dataset_cache_hits = dataset_cache_hits
+    if dataset_fetches is not _SENTINEL:
+        cloned.dataset_fetches = dataset_fetches
     return cloned
+
+
+def _trimmed_turns_for_window(
+    turns: Sequence[Dict[str, str]],
+    *,
+    system_text: str,
+    spec: ModelSpec,
+    effective_max_tokens: int,
+) -> List[Dict[str, str]]:
+    probe: List[Dict[str, str]] = [{"role": "system", "content": system_text}, *turns]
+    while len(probe) > 2:
+        if count_chat_messages_tokens(probe, tokenizer_family=spec.tokenizer_family) + effective_max_tokens < spec.context_window:
+            break
+        probe.pop(1)
+        while len(probe) > 2 and probe[1].get("role") != "user":
+            probe.pop(1)
+    return probe[1:]
 
 
 class WAHSBundleAssembler:
@@ -342,7 +412,8 @@ class WAHSBundleAssembler:
     def __init__(self, settings: WahsEngineSettings, http_client: Optional[httpx.AsyncClient] = None) -> None:
         self.settings, self._external_client, self._shared_client = settings, http_client, None
         self._dataset_cache: _BoundedLRUCache[Tuple[str, str, str], List[Dict[str, Any]]] = _BoundedLRUCache(settings.dataset_cache_max_entries, ttl_seconds=settings.cache_ttl_seconds, max_bytes=settings.dataset_cache_max_bytes)
-        self._prefix_cache: _BoundedLRUCache[Tuple[str, str, str], AssembledWahsContext] = _BoundedLRUCache(settings.prefix_cache_max_entries, ttl_seconds=settings.cache_ttl_seconds, max_bytes=settings.prefix_cache_max_bytes)
+        self._extracted_cache: _BoundedLRUCache[Tuple[str, str, str], Tuple[ExtractedChart, Dict[str, Any], str, Dict[str, Dict[str, Any]], str]] = _BoundedLRUCache(settings.prefix_cache_max_entries, ttl_seconds=settings.cache_ttl_seconds, max_bytes=settings.prefix_cache_max_bytes)
+        self._prefix_cache: _BoundedLRUCache[Tuple[str, str, str, str, str], AssembledWahsContext] = _BoundedLRUCache(settings.prefix_cache_max_entries, ttl_seconds=settings.cache_ttl_seconds, max_bytes=settings.prefix_cache_max_bytes)
         self._inflight_datasets: Dict[Tuple[str, str, str], asyncio.Task[Tuple[List[Dict[str, Any]], bool, Optional[str]]]] = {}
 
     def _get_http_client(self) -> httpx.AsyncClient:
@@ -396,14 +467,31 @@ class WAHSBundleAssembler:
             url, params = _rewrite_next_link_to_fhir_auth(base_url, next_url), None
         return collected, bool(next_url), "max_everything_pages" if next_url else reason
 
-    async def assemble(self, *, options: WahsRequestOptions, identity: Optional[VerifiedCallerIdentity], requested_model: Optional[str] = None, force_refresh: bool = False) -> AssembledWahsContext:
+    async def assemble(
+        self,
+        *,
+        options: WahsRequestOptions,
+        identity: Optional[VerifiedCallerIdentity],
+        requested_model: Optional[str] = None,
+        conversation_messages: Sequence[Any] = (),
+        requested_max_tokens: Optional[int] = None,
+        force_refresh: bool = False,
+    ) -> AssembledWahsContext:
         if options.overlay_resources:
             rb = len(json.dumps(list(options.overlay_resources), separators=(",", ":"), default=str).encode("utf-8"))
             if rb > self.settings.max_overlay_bytes:
                 raise HTTPException(status_code=413, detail=f"wahs.overlay_resources exceeds {self.settings.max_overlay_bytes} bytes.")
         scope, spec = options.chart_scope, self.settings.resolve_model_spec(requested_model)
-        budget_eff, clamp_reason = derive_effective_chart_budget(spec, options, has_enabled_enrichers=bool(self.settings.enabled_enrichers))
+        # Fail fast if framing + max_tokens alone cannot fit configured context_window
+        resolve_chart_budget(
+            spec,
+            options,
+            system_framing_text=WAHS_SYSTEM_PROMPT,
+            conversation_messages=conversation_messages,
+            requested_max_tokens=requested_max_tokens,
+        )
         refresh = bool(options.refresh or force_refresh)
+        scope_only_hash = _canonical_sha256({"scope": scope.model_dump(), "overlays": options.overlay_resources})
 
         if options.fhir_bundle is not None:
             if not self.settings.allow_local_bundle_mode:
@@ -414,8 +502,9 @@ class WAHSBundleAssembler:
             return await asyncio.to_thread(
                 self._scope_and_condense_bundle, raw_bundle=options.fhir_bundle, verified_sub=identity.sub if identity else "local-harness",
                 authorized_patient_id=pat_id, allowed_patient_refs={pat_id}, datasets_included=[{"dataset_id": pat_id, "source": "Inline Bundle", "category": "local"}],
-                datasets_fingerprint=_canonical_sha256(options.fhir_bundle), options=options, spec=spec, budget_effective=budget_eff,
-                clamp_reason=clamp_reason, dataset_cache_hits=0, dataset_fetches=0, cacheable=True, force_refresh=refresh, partial_fetch=False, partial_datasets=[],
+                datasets_fingerprint=_canonical_sha256(options.fhir_bundle), scope_only_hash=scope_only_hash, options=options, spec=spec,
+                conversation_messages=conversation_messages, requested_max_tokens=requested_max_tokens,
+                dataset_cache_hits=0, dataset_fetches=0, cacheable=True, force_refresh=refresh, partial_fetch=False, partial_datasets=[],
             )
         if identity is None:
             raise HTTPException(status_code=401, detail="Missing Authorization: Bearer <keycloak_jwt> header.")
@@ -475,12 +564,20 @@ class WAHSBundleAssembler:
             m_ver = str((master_pat.get("meta") or {}).get("lastUpdated") or (master_pat.get("meta") or {}).get("versionId") or "").strip()
             cacheable = bool(m_ver) and ips_stamp and all(d.has_version_stamp for d in included)
             ds_fp = _canonical_sha256({"master": (master_id, m_ver or "ephemeral"), "datasets": [(d.dataset_id, d.last_updated) for d in included], "ips": ips_ver})
-            s_hash = _canonical_sha256({"scope": scope.model_dump(), "overlays": options.overlay_resources, "budget": budget_eff, "tokenizer_family": spec.tokenizer_family})
+            datasets_inc_meta = [{"dataset_id": d.dataset_id, "source": d.source_name, "category": d.category, "method": d.method, "last_updated": d.last_updated} for d in included]
 
             if cacheable and not refresh:
-                cached = self._prefix_cache.get((identity.sub, ds_fp, s_hash))
-                if cached is not None:
-                    return _clone_context(cached, cache_hit=True, budget_requested=options.target_budget_tokens, clamp_reason=clamp_reason)
+                ext_cached = self._extracted_cache.get((identity.sub, ds_fp, scope_only_hash))
+                if ext_cached is not None:
+                    extracted_obj, sec_audit, draft_blk, draft_cits, auth_pat = ext_cached
+                    return await asyncio.to_thread(
+                        self._condense_from_extracted,
+                        extracted=extracted_obj, security_audit=sec_audit, draft_block=draft_blk, draft_cits=draft_cits,
+                        verified_sub=identity.sub, authorized_patient_id=auth_pat,
+                        datasets_included=datasets_inc_meta, datasets_fingerprint=ds_fp, scope_only_hash=scope_only_hash,
+                        options=options, spec=spec, conversation_messages=conversation_messages, requested_max_tokens=requested_max_tokens,
+                        dataset_cache_hits=len(included), dataset_fetches=0, cacheable=True, force_refresh=False, partial_fetch=False, partial_datasets=[],
+                    )
 
             pooled, seen_keys, allowed_refs = [{"resource": master_pat}], {f"Patient/{master_id}"}, {master_id, *(d.dataset_id for d in deduped)}
             fsem = asyncio.Semaphore(max(1, int(self.settings.everything_concurrency)))
@@ -502,8 +599,8 @@ class WAHSBundleAssembler:
                 self._scope_and_condense_bundle,
                 raw_bundle={"resourceType": "Bundle", "id": f"wahs-pooled-{master_id}", "type": "collection", "entry": pooled},
                 verified_sub=identity.sub, authorized_patient_id=master_id, allowed_patient_refs=allowed_refs,
-                datasets_included=[{"dataset_id": d.dataset_id, "source": d.source_name, "category": d.category, "method": d.method, "last_updated": d.last_updated} for d in included],
-                datasets_fingerprint=ds_fp, options=options, spec=spec, budget_effective=budget_eff, clamp_reason=clamp_reason,
+                datasets_included=datasets_inc_meta, datasets_fingerprint=ds_fp, scope_only_hash=scope_only_hash,
+                options=options, spec=spec, conversation_messages=conversation_messages, requested_max_tokens=requested_max_tokens,
                 dataset_cache_hits=sum(x[4] for x in ds_results), dataset_fetches=sum(x[5] for x in ds_results),
                 cacheable=(cacheable and not partial_ds), force_refresh=refresh, partial_fetch=bool(partial_ds), partial_datasets=partial_ds,
             )
@@ -547,60 +644,162 @@ class WAHSBundleAssembler:
             self._dataset_cache.put(ckey, st)
         return desc, st, isp, pr, 0, 1
 
-    def _scope_and_condense_bundle(self, *, raw_bundle: Dict[str, Any], verified_sub: str, authorized_patient_id: str, allowed_patient_refs: Set[str], datasets_included: List[Dict[str, str]], datasets_fingerprint: str, options: WahsRequestOptions, spec: ModelSpec, budget_effective: int, clamp_reason: Optional[str], dataset_cache_hits: int, dataset_fetches: int, cacheable: bool = True, force_refresh: bool = False, partial_fetch: bool = False, partial_datasets: Optional[List[Dict[str, Any]]] = None) -> AssembledWahsContext:
+    def _scope_and_condense_bundle(
+        self,
+        *,
+        raw_bundle: Dict[str, Any],
+        verified_sub: str,
+        authorized_patient_id: str,
+        allowed_patient_refs: Set[str],
+        datasets_included: List[Dict[str, str]],
+        datasets_fingerprint: str,
+        scope_only_hash: str,
+        options: WahsRequestOptions,
+        spec: ModelSpec,
+        conversation_messages: Sequence[Any],
+        requested_max_tokens: Optional[int],
+        dataset_cache_hits: int,
+        dataset_fetches: int,
+        cacheable: bool = True,
+        force_refresh: bool = False,
+        partial_fetch: bool = False,
+        partial_datasets: Optional[List[Dict[str, Any]]] = None,
+    ) -> AssembledWahsContext:
         scope = options.chart_scope
-        s_hash = _canonical_sha256({"scope": scope.model_dump(), "overlays": options.overlay_resources, "budget": budget_effective, "tokenizer_family": spec.tokenizer_family})
-        pkey = (verified_sub, datasets_fingerprint, s_hash)
-        if cacheable and not force_refresh and not partial_fetch:
-            cached = self._prefix_cache.get(pkey)
-            if cached is not None:
-                return _clone_context(cached, cache_hit=True, budget_requested=options.target_budget_tokens, clamp_reason=clamp_reason)
+        ext_key = (verified_sub, datasets_fingerprint, scope_only_hash)
+        ext_cached = self._extracted_cache.get(ext_key) if (cacheable and not force_refresh and not partial_fetch) else None
+        if ext_cached is not None:
+            extracted, security_audit, draft_block, draft_cits, authorized_patient_id = ext_cached
+        else:
+            ov_entries, draft_block, draft_cits = _format_overlay_items(options.overlay_resources, authorized_patient_id)
+            inc_t, exc_t = {t.strip() for t in scope.include_resource_types if t.strip()}, {t.strip() for t in scope.exclude_resource_types if t.strip()}
+            inc_i, exc_i = {i.strip() for i in scope.include_resource_ids if i.strip()}, {i.strip() for i in scope.exclude_resource_ids if i.strip()}
+            inc_s, exc_s = {s.strip().lower() for s in scope.include_sources if s.strip()}, {s.strip().lower() for s in scope.exclude_sources if s.strip()}
+            inc_c, exc_c = {c.strip().lower() for c in scope.include_categories if c.strip()}, {c.strip().lower() for c in scope.exclude_categories if c.strip()}
 
-        ov_entries, draft_block, draft_cits = _format_overlay_items(options.overlay_resources, authorized_patient_id)
-        inc_t, exc_t = {t.strip() for t in scope.include_resource_types if t.strip()}, {t.strip() for t in scope.exclude_resource_types if t.strip()}
-        inc_i, exc_i = {i.strip() for i in scope.include_resource_ids if i.strip()}, {i.strip() for i in scope.exclude_resource_ids if i.strip()}
-        inc_s, exc_s = {s.strip().lower() for s in scope.include_sources if s.strip()}, {s.strip().lower() for s in scope.exclude_sources if s.strip()}
-        inc_c, exc_c = {c.strip().lower() for c in scope.include_categories if c.strip()}, {c.strip().lower() for c in scope.exclude_categories if c.strip()}
-
-        scoped: List[Dict[str, Any]] = []
-        for entry in list(raw_bundle.get("entry") or []) + ov_entries:
-            res = entry.get("resource") if isinstance(entry, Mapping) else None
-            if not isinstance(res, dict):
-                continue
-            rt, rid = str(res.get("resourceType") or ""), str(res.get("id") or "")
-            fid = f"{rt}/{rid}"
-            if rt == "Patient":
+            scoped: List[Dict[str, Any]] = []
+            for entry in list(raw_bundle.get("entry") or []) + ov_entries:
+                res = entry.get("resource") if isinstance(entry, Mapping) else None
+                if not isinstance(res, dict):
+                    continue
+                rt, rid = str(res.get("resourceType") or ""), str(res.get("id") or "")
+                fid = f"{rt}/{rid}"
+                if rt == "Patient":
+                    scoped.append({"resource": res})
+                    continue
+                if rid in exc_i or fid in exc_i or rt in exc_t or (inc_i and rid not in inc_i and fid not in inc_i and rt not in _INFRASTRUCTURE_TYPES) or (inc_t and rt not in inc_t and rt not in _INFRASTRUCTURE_TYPES):
+                    continue
+                if (inc_s or exc_s) and rt not in _INFRASTRUCTURE_TYPES:
+                    meta = res.get("meta") if isinstance(res.get("meta"), Mapping) else {}
+                    rsrc = next((str(t.get("code") or "").strip().lower() for t in (meta.get("tag") or []) if isinstance(t, Mapping) and str(t.get("system") or "").endswith("/wahealthsummary-source-name")), "") or str(meta.get("source") or "").strip().lower() or str((res.get("serviceProvider") or {}).get("display") or "").strip().lower()
+                    if (exc_s and rsrc and any(e in rsrc for e in exc_s)) or (inc_s and (not rsrc or not any(i in rsrc for i in inc_s))):
+                        continue
+                if (inc_c or exc_c) and rt not in _INFRASTRUCTURE_TYPES:
+                    rcats = {str(c.get("code")).strip().lower() for co in (res.get("category") if isinstance(res.get("category"), list) else ([res.get("category")] if isinstance(res.get("category"), Mapping) else [])) if isinstance(co, Mapping) for c in (co.get("coding") or []) if isinstance(c, Mapping) and c.get("code")} or {"provider-health-record"}
+                    if (exc_c and (rcats & exc_c)) or (inc_c and not (rcats & inc_c)):
+                        continue
+                if (scope.date_from or scope.date_to) and rt not in _INFRASTRUCTURE_TYPES:
+                    rd = _extract_resource_iso_date(res)
+                    if rd and ((scope.date_from and rd < scope.date_from) or (scope.date_to and rd > scope.date_to)):
+                        continue
                 scoped.append({"resource": res})
-                continue
-            if rid in exc_i or fid in exc_i or rt in exc_t or (inc_i and rid not in inc_i and fid not in inc_i and rt not in _INFRASTRUCTURE_TYPES) or (inc_t and rt not in inc_t and rt not in _INFRASTRUCTURE_TYPES):
-                continue
-            if (inc_s or exc_s) and rt not in _INFRASTRUCTURE_TYPES:
-                meta = res.get("meta") if isinstance(res.get("meta"), Mapping) else {}
-                rsrc = next((str(t.get("code") or "").strip().lower() for t in (meta.get("tag") or []) if isinstance(t, Mapping) and str(t.get("system") or "").endswith("/wahealthsummary-source-name")), "") or str(meta.get("source") or "").strip().lower() or str((res.get("serviceProvider") or {}).get("display") or "").strip().lower()
-                if (exc_s and rsrc and any(e in rsrc for e in exc_s)) or (inc_s and (not rsrc or not any(i in rsrc for i in inc_s))):
-                    continue
-            if (inc_c or exc_c) and rt not in _INFRASTRUCTURE_TYPES:
-                rcats = {str(c.get("code")).strip().lower() for co in (res.get("category") if isinstance(res.get("category"), list) else ([res.get("category")] if isinstance(res.get("category"), Mapping) else [])) if isinstance(co, Mapping) for c in (co.get("coding") or []) if isinstance(c, Mapping) and c.get("code")} or {"provider-health-record"}
-                if (exc_c and (rcats & exc_c)) or (inc_c and not (rcats & inc_c)):
-                    continue
-            if (scope.date_from or scope.date_to) and rt not in _INFRASTRUCTURE_TYPES:
-                rd = _extract_resource_iso_date(res)
-                if rd and ((scope.date_from and rd < scope.date_from) or (scope.date_to and rd > scope.date_to)):
-                    continue
-            scoped.append({"resource": res})
 
-        guarded, security_audit = enforce_single_patient_scope({"resourceType": "Bundle", "id": raw_bundle.get("id") or f"scoped-{authorized_patient_id}", "type": "collection", "entry": scoped}, authorized_patient_id=authorized_patient_id, allowed_patient_refs=allowed_patient_refs)
-        counter, partial_list = get_exact_token_counter(spec.tokenizer_family), list(partial_datasets or [])
+            guarded, security_audit = enforce_single_patient_scope({"resourceType": "Bundle", "id": raw_bundle.get("id") or f"scoped-{authorized_patient_id}", "type": "collection", "entry": scoped}, authorized_patient_id=authorized_patient_id, allowed_patient_refs=allowed_patient_refs)
+            extracted = extract_bundle(guarded)
+            if cacheable and not partial_fetch:
+                self._extracted_cache.put(ext_key, (extracted, security_audit, draft_block, draft_cits, authorized_patient_id))
+
+        return self._condense_from_extracted(
+            extracted=extracted, security_audit=security_audit, draft_block=draft_block, draft_cits=draft_cits,
+            verified_sub=verified_sub, authorized_patient_id=authorized_patient_id,
+            datasets_included=datasets_included, datasets_fingerprint=datasets_fingerprint, scope_only_hash=scope_only_hash,
+            options=options, spec=spec, conversation_messages=conversation_messages, requested_max_tokens=requested_max_tokens,
+            dataset_cache_hits=dataset_cache_hits, dataset_fetches=dataset_fetches,
+            cacheable=cacheable, force_refresh=force_refresh, partial_fetch=partial_fetch, partial_datasets=partial_datasets,
+        )
+
+    def _condense_from_extracted(
+        self,
+        *,
+        extracted: ExtractedChart,
+        security_audit: Dict[str, Any],
+        draft_block: str,
+        draft_cits: Dict[str, Dict[str, Any]],
+        verified_sub: str,
+        authorized_patient_id: str,
+        datasets_included: List[Dict[str, str]],
+        datasets_fingerprint: str,
+        scope_only_hash: str,
+        options: WahsRequestOptions,
+        spec: ModelSpec,
+        conversation_messages: Sequence[Any],
+        requested_max_tokens: Optional[int],
+        dataset_cache_hits: int,
+        dataset_fetches: int,
+        cacheable: bool,
+        force_refresh: bool,
+        partial_fetch: bool,
+        partial_datasets: Optional[List[Dict[str, Any]]],
+    ) -> AssembledWahsContext:
+        counter = get_exact_token_counter(spec.tokenizer_family)
+        partial_list = list(partial_datasets or [])
         partial_warn = "[PARTIAL RECORD WARNING: Dataset pagination/resource ceiling reached before full retrieval; record may be incomplete.]" if partial_fetch else ""
-        extracted = extract_bundle(guarded)
+        framing_without_chart = (
+            f"{WAHS_SYSTEM_PROMPT}\n\n=== ACTIVE PATIENT: {extracted.patient_name} (DOB: {extracted.birth_date or 'unknown'}) ===\n"
+            "=== CONDENSED CLINICAL RECORD ([1]..[N]) ===\n"
+            + (f"\n\n{draft_block}" if draft_block else "")
+            + (f"\n{partial_warn}" if partial_fetch else "")
+        )
+        budget_effective, clamp_reason = resolve_chart_budget(
+            spec,
+            options,
+            system_framing_text=framing_without_chart,
+            conversation_messages=conversation_messages,
+            requested_max_tokens=requested_max_tokens,
+        )
+        t0_key = (verified_sub, datasets_fingerprint, scope_only_hash, spec.tokenizer_family, "tier0")
+        b_key = (verified_sub, datasets_fingerprint, scope_only_hash, spec.tokenizer_family, str(budget_effective))
+        if cacheable and not force_refresh and not partial_fetch:
+            cached_t0 = self._prefix_cache.get(t0_key)
+            if cached_t0 is not None and cached_t0.condensed.actual_tokens <= budget_effective:
+                return _clone_context(cached_t0, cache_hit=True, budget_requested=options.target_budget_tokens, budget_effective=budget_effective, clamp_reason=clamp_reason, dataset_cache_hits=len(datasets_included), dataset_fetches=0)
+            cached_exact = self._prefix_cache.get(b_key)
+            if cached_exact is not None:
+                return _clone_context(cached_exact, cache_hit=True, budget_requested=options.target_budget_tokens, budget_effective=budget_effective, clamp_reason=clamp_reason, dataset_cache_hits=len(datasets_included), dataset_fetches=0)
+
+        chart_target = max(1, budget_effective - ((counter(partial_warn) + 4) if partial_fetch else 0))
         try:
-            condensed = condense_bundle_to_budget(extracted, target_tokens=max(512, budget_effective - ((counter(partial_warn) + 4) if partial_fetch else 0)), token_counter=counter)
+            condensed = condense_bundle_to_budget(extracted, target_tokens=chart_target, token_counter=counter)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+        def _render_sys(ct_text: str) -> str:
+            return f"{WAHS_SYSTEM_PROMPT}\n\n=== ACTIVE PATIENT: {extracted.patient_name} (DOB: {extracted.birth_date or 'unknown'}) ===\n=== CONDENSED CLINICAL RECORD ([1]..[N]) ===\n{ct_text}" + (f"\n\n{draft_block}" if draft_block else "")
+
+        upd_text = f"{condensed.chart_text.rstrip()}\n{partial_warn}" if partial_fetch else condensed.chart_text
+        sys_prompt = _render_sys(upd_text)
+
+        eff_max_toks = int(requested_max_tokens) if requested_max_tokens is not None else int(spec.default_max_output_tokens)
+        trimmed_turns = _trimmed_turns_for_window(
+            normalize_conversation_turns(conversation_messages),
+            system_text=framing_without_chart,
+            spec=spec,
+            effective_max_tokens=eff_max_toks,
+        )
+        total_with_turns = count_chat_messages_tokens([{"role": "system", "content": sys_prompt}, *trimmed_turns], tokenizer_family=spec.tokenizer_family)
+        limit_with_turns = spec.context_window - eff_max_toks
+        if total_with_turns > limit_with_turns and chart_target > 1:
+            over = total_with_turns - limit_with_turns
+            tighter_target = max(1, chart_target - over - 4)
+            try:
+                condensed = condense_bundle_to_budget(extracted, target_tokens=tighter_target, token_counter=counter)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            upd_text = f"{condensed.chart_text.rstrip()}\n{partial_warn}" if partial_fetch else condensed.chart_text
+            sys_prompt = _render_sys(upd_text)
+
         manifest = {**condensed.completeness_manifest, "partial_fetch": partial_fetch, **({"partial_datasets": partial_list} if partial_fetch else {})}
         if partial_fetch:
-            upd_text = f"{condensed.chart_text.rstrip()}\n{partial_warn}"
             upd_toks = counter(upd_text)
             condensed = replace(condensed, target_tokens=budget_effective, actual_tokens=upd_toks, chart_text=upd_text, completeness_manifest=manifest, compression_stats={**condensed.compression_stats, "actual_tokens": upd_toks, "target_tokens": budget_effective, "budget_utilization": round(upd_toks / budget_effective, 3)})
         else:
@@ -613,9 +812,18 @@ class WAHSBundleAssembler:
         }
         citation_map.update(draft_cits)
         notices = [f"Partial record warning: FHIR fetch reached configured limit on {', '.join(str(p.get('source') or p.get('dataset_id') or '') for p in partial_list) or 'one or more datasets'}; completeness cannot be guaranteed."] if partial_fetch else []
-        sys_prompt = f"{WAHS_SYSTEM_PROMPT}\n\n=== ACTIVE PATIENT: {extracted.patient_name} (DOB: {extracted.birth_date or 'unknown'}) ===\n=== CONDENSED CLINICAL RECORD ([1]..[N]) ===\n{condensed.chart_text}" + (f"\n\n{draft_block}" if draft_block else "")
 
-        ctx = AssembledWahsContext(verified_sub, authorized_patient_id, extracted.patient_name, extracted.birth_date or "", sys_prompt, hashlib.sha256(f"{verified_sub}:{datasets_fingerprint}:{s_hash}".encode("utf-8")).hexdigest()[:20], datasets_fingerprint, s_hash, datasets_included, scope.model_dump(exclude_defaults=False), security_audit, extracted, condensed, citation_map, notices, False, dataset_cache_hits, dataset_fetches, options.target_budget_tokens, budget_effective, spec.context_window, spec.chart_budget_ceiling, clamp_reason, spec.tokenizer_family, partial_fetch, partial_list)
+        s_hash = _canonical_sha256({"scope": scope_only_hash, "budget": budget_effective, "tokenizer_family": spec.tokenizer_family})
+        prefix_hash = hashlib.sha256(f"{verified_sub}:{sys_prompt}".encode("utf-8")).hexdigest()[:20]
+        ctx = AssembledWahsContext(
+            verified_sub, authorized_patient_id, extracted.patient_name, extracted.birth_date or "",
+            sys_prompt, prefix_hash, datasets_fingerprint, s_hash, datasets_included,
+            options.chart_scope.model_dump(exclude_defaults=False), security_audit, extracted, condensed, citation_map,
+            notices, False, dataset_cache_hits, dataset_fetches, options.target_budget_tokens, budget_effective,
+            spec.context_window, spec.preferred_chart_tokens, clamp_reason, spec.tokenizer_family, partial_fetch, partial_list,
+        )
         if cacheable and not partial_fetch:
-            self._prefix_cache.put(pkey, _clone_context(ctx, cache_hit=False))
+            self._prefix_cache.put(b_key, _clone_context(ctx, cache_hit=False))
+            if condensed.tier == 0:
+                self._prefix_cache.put(t0_key, _clone_context(ctx, cache_hit=False))
         return _clone_context(ctx, cache_hit=False)

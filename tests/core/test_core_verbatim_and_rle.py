@@ -86,26 +86,51 @@ def test_pure_stdlib_no_site_or_extensions() -> None:
     assert proc.returncode == 0, proc.stderr
 
 
-def test_tier0_verbatim_fidelity_under_16k() -> None:
+def test_tier0_unbounded_default_and_verbatim_fidelity() -> None:
     bundle = _sample_outpatient_bundle()
     extracted = extract_bundle(bundle)
     assert extracted.deduplicated_note_count == 1
     assert len(extracted.notes) == 1
     assert "Erroneous diagnosis" not in " ".join(i.text for i in extracted.items)
 
-    res = condense_bundle_to_budget(bundle, target_tokens=16384)
+    res = condense_bundle_to_budget(bundle)
     man = res.completeness_manifest
     assert res.tier == 0
+    assert res.target_tokens is None
+    assert res.compression_stats["budget_utilization"] == 1.0
     assert man["folded_items_count"] == 0
     assert man["omitted_clinical_items_count"] == 0
     assert man["excerpted_notes_count"] == 0
     assert "Continue lisinopril 10 mg daily and follow low-sodium diet." in res.chart_text
-    assert res.actual_tokens <= 16384
+
+
+def test_tier2_continuous_note_waterfilling_fills_available_budget() -> None:
+    # Single large note should dynamically expand to fill arbitrary budgets rather than chopping at 400 chars
+    clauses = [f"Clinical hospital course detail #{idx:03d}: stable electrolytes and telemetry without arrhythmia." for idx in range(220)]
+    long_note = " ".join(clauses)
+    bundle = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "pat-wf", "name": [{"given": ["Nora"], "family": "Vance"}], "birthDate": "1968-02-11"}},
+            {"resource": {"resourceType": "Condition", "id": "cond-wf", "clinicalStatus": {"coding": [{"code": "active"}]}, "code": {"text": "Atrial fibrillation"}}},
+            {"resource": {"resourceType": "DocumentReference", "id": "doc-wf", "status": "current", "date": "2026-10-01", "type": {"text": "Discharge Summary"}, "content": [{"attachment": {"data": _b64(long_note)}}]}},
+        ],
+    }
+    prev_len = 0
+    for b in (900, 1800, 3600):
+        res = condense_bundle_to_budget(bundle, target_tokens=b)
+        assert res.tier == 2
+        assert res.actual_tokens <= b
+        # Water-filling should use nearly all of each budget (>= 80%) rather than a fixed ~400-char excerpt
+        assert res.actual_tokens >= int(b * 0.80)
+        assert len(res.chart_text) > prev_len
+        prev_len = len(res.chart_text)
 
 
 def test_monotonic_rle_and_budget_packing_across_budgets() -> None:
     bundle = _large_longitudinal_bundle()
-    budgets = (2048, 4096, 8192, 16384, 32768)
+    budgets = (1500, 3000, 6000, 12000, 24000)
     covered_sets: List[set[str]] = []
 
     for b in budgets:
@@ -125,9 +150,9 @@ def test_monotonic_rle_and_budget_packing_across_budgets() -> None:
     for i in range(len(covered_sets) - 1):
         assert covered_sets[i].issubset(covered_sets[i + 1])
 
-    res_2k = condense_bundle_to_budget(bundle, target_tokens=2048)
-    assert "[... excerpted;" in res_2k.chart_text
-    res_16k = condense_bundle_to_budget(bundle, target_tokens=16384)
-    assert res_16k.tier in {0, 1}
-    assert res_16k.completeness_manifest["omitted_clinical_items_count"] == 0
-    assert estimate_tokens_local(res_16k.chart_text) > 0
+    res_tight = condense_bundle_to_budget(bundle, target_tokens=1500)
+    assert "[... excerpted;" in res_tight.chart_text
+    res_wide = condense_bundle_to_budget(bundle, target_tokens=12000)
+    assert res_wide.tier in {0, 1}
+    assert res_wide.completeness_manifest["omitted_clinical_items_count"] == 0
+    assert estimate_tokens_local(res_wide.chart_text) > 0

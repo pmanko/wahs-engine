@@ -13,7 +13,7 @@ import uuid
 from fastapi import HTTPException
 import httpx
 
-from .assembler import AssembledWahsContext
+from .assembler import AssembledWahsContext, normalize_conversation_turns
 from .config import ModelSpec, WahsEngineSettings
 from .pipeline import EnricherPipeline
 from .schemas import OpenAIChatCompletionRequest, WahsRequestOptions
@@ -98,8 +98,8 @@ def build_x_wahs_envelope(
             "tier": ctx.condensed.tier, "tier_name": ctx.condensed.tier_name,
             "budget_tokens": ctx.condensed.target_tokens, "budget_effective": ctx.budget_effective or ctx.condensed.target_tokens,
             "budget_requested": ctx.budget_requested, "requested_budget_tokens": options.target_budget_tokens,
-            "context_window": ctx.context_window, "chart_budget_ceiling": ctx.chart_budget_ceiling,
-            "clamp_reason": ctx.clamp_reason, "tokenizer_family": ctx.tokenizer_family,
+            "context_window": ctx.context_window, "preferred_chart_tokens": ctx.preferred_chart_tokens,
+            "resolution_reason": ctx.clamp_reason, "clamp_reason": ctx.clamp_reason, "tokenizer_family": ctx.tokenizer_family,
             "actual_tokens": ctx.condensed.actual_tokens, "omitted_clinical_items": int(manifest.get("omitted_clinical_items_count") or 0),
             "omitted_by_section": dict(manifest.get("omitted_by_section") or {}), "datasets_included": len(ctx.datasets_included),
             "prefix_cache_key_hash": ctx.prefix_cache_key_hash, "cache_hit": ctx.cache_hit,
@@ -161,18 +161,7 @@ def prepare_upstream_messages(
     effective_max_tokens: int,
     pipeline: Optional[EnricherPipeline] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]], int, int]:
-    turns: List[Dict[str, Any]] = []
-    for m in req.messages:
-        role = (m.role or "").strip().lower()
-        if role not in {"user", "assistant"}:
-            continue
-        if isinstance(m.content, list):
-            parts = [str(p.get("text") or "") for p in m.content if isinstance(p, Mapping) and p.get("type") in {"text", "input_text", None}]
-            text_val = "\n".join(p for p in parts if p)
-        else:
-            text_val = str(m.content or "")
-        if text_val.strip():
-            turns.append({"role": role, "content": text_val})
+    turns = normalize_conversation_turns(req.messages)
 
     if not turns or not any(t["role"] == "user" for t in turns):
         raise HTTPException(status_code=400, detail="messages must contain at least one non-empty user message.")
@@ -183,7 +172,7 @@ def prepare_upstream_messages(
     if pipeline and pipeline.enabled_ids:
         counter = get_exact_token_counter(spec.tokenizer_family)
         min_toks = count_chat_messages_tokens([messages[0], messages[-1]], tokenizer_family=spec.tokenizer_family)
-        headroom = min(1024, max(0, spec.context_window - effective_max_tokens - min_toks - 64))
+        headroom = max(0, spec.context_window - effective_max_tokens - min_toks)
         last_q = next((t["content"] for t in reversed(turns) if t["role"] == "user"), "")
         p_res = pipeline.run(
             extracted=ctx.extracted, condensed=ctx.condensed, citation_map=ctx.citation_map,

@@ -4,7 +4,7 @@ Optional, unplugged R&D modules implementing [`ContextEnricher`](../wahs_core/po
 
 ## Why Core `wahs-engine` Keeps These Unplugged by Default
 
-The production baseline of `wahs-engine` performs **strictly faithful FHIR R4 structural projection, verbatim-first condensation (`Tier 0` when chart <= `16,384` tokens, ontology-free RLE folding only when > budget), and `[1]..[N]` provenance citations** with zero embedded clinical rule packs and zero speculative middleware heuristics.
+The production baseline of `wahs-engine` performs **strictly faithful FHIR R4 structural projection, verbatim-first condensation (`Tier 0` when chart fits available tokens, uniform RLE and note water-filling only when > budget), and `[1]..[N]` provenance citations** with zero embedded clinical rule packs and zero speculative middleware heuristics.
 
 All enrichment modules below are opt-in via `WAHS_ENABLED_ENRICHERS` (comma-separated, empty `""` by default so `wahs_extensions` is never imported at startup or request time).
 
