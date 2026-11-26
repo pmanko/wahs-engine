@@ -485,8 +485,8 @@ def test_terminology_kb_temporal_rag_overflow_and_guideline_kb_clinical_accuracy
         assert "lorazepam" in enr_low and "zolpidem" in enr_low
         assert "shingrix" in enr_low and "2-dose" in enr_low
         assert "4.0-5.6" in enr_txt and "below normal reference range" in enr_low
-        # Potassium had inline Observation.referenceRange -> must NOT be backfilled in Missing-Range Lab Reference
-        assert "Missing-Range Lab Reference (Potassium" not in enr_txt
+        # Potassium had inline Observation.referenceRange -> must NOT be backfilled in Missing-Range Lab
+        assert "Missing-Range Lab (Potassium" not in enr_txt
         assert "CIEL:119481" in enr_txt or "CIEL:79651" in enr_txt
 
         # Guideline KB: [K1] KnowledgeReference registered in citation_map

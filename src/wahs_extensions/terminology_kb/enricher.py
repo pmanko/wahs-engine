@@ -307,37 +307,21 @@ class TerminologyConceptEnricher:
         by_ingredient: Dict[str, List[Tuple[ClinicalItem, Dict[str, Any], str]]] = {}
         by_atc_class: Dict[str, List[Tuple[ClinicalItem, Dict[str, Any], str]]] = {}
         by_pharm_group: Dict[str, List[Tuple[ClinicalItem, Dict[str, Any], str]]] = {}
+        overlap_covered_uuids: Set[str] = set()
 
         for entry in active_meds:
-            it, drow, cit = entry
-            ing = drow["ingredient"]
-            by_ingredient.setdefault(ing, []).append(entry)
+            it, drow, _cit = entry
+            by_ingredient.setdefault(drow["ingredient"], []).append(entry)
             if drow["atc_class_code"]:
                 by_atc_class.setdefault(drow["atc_class_code"], []).append(entry)
             if drow["pharm_group"]:
                 by_pharm_group.setdefault(drow["pharm_group"], []).append(entry)
 
-            disp_low = (it.display or "").lower()
-            is_brand_or_ciel = (ing not in disp_low) or any(c["system"] == "ciel" for c in _item_codings(it))
-            matches_q = any(t in disp_low or t in ing or t in (drow["atc_class_name"] or "").lower() for t in q_tokens)
-            if is_brand_or_ciel or med_query or matches_q or len(active_meds) <= 8:
-                codes_bits = []
-                if drow["rxcui_in"]:
-                    codes_bits.append(f"RxNorm:{drow['rxcui_in']}")
-                if drow["ciel_id"]:
-                    codes_bits.append(f"CIEL:{drow['ciel_id']}")
-                if drow["atc_code"]:
-                    codes_bits.append(f"ATC:{drow['atc_code']}")
-                cls_lbl = f" - {drow['atc_class_name']}" if drow["atc_class_name"] else ""
-                cite_sp = f" {cit}" if cit else ""
-                med_lines.append(
-                    f"- Active Medication: {it.display}{cite_sp} -> ingredient: {ing} "
-                    f"({', '.join(codes_bits)}{cls_lbl})"
-                )
-
         for ing, grp in by_ingredient.items():
             if len(grp) >= 2:
                 d0 = grp[0][1]
+                for x in grp:
+                    overlap_covered_uuids.add(x[0].resource_uuid)
                 refs = ", ".join(f"{x[0].display}{(' ' + x[2]) if x[2] else ''}" for x in grp)
                 overlap_lines.append(
                     f"- Same Active Ingredient ({ing}, RxNorm:{d0['rxcui_in']}, ATC:{d0['atc_code']}): "
@@ -347,26 +331,30 @@ class TerminologyConceptEnricher:
         for atc_cls, grp in by_atc_class.items():
             distinct_ings = list(dict.fromkeys(x[1]["ingredient"] for x in grp))
             if len(distinct_ings) >= 2:
+                for x in grp:
+                    overlap_covered_uuids.add(x[0].resource_uuid)
                 cls_name = next((x[1]["atc_class_name"] for x in grp if x[1]["atc_class_name"]), f"ATC {atc_cls}")
                 desc_items = " and ".join(
                     f"{x[0].display}{(' ' + x[2]) if x[2] else ''} "
-                    f"(ingredient: {x[1]['ingredient']}, RxNorm:{x[1]['rxcui_in']}, ATC:{x[1]['atc_code']})"
+                    f"({x[1]['ingredient']}, RxNorm:{x[1]['rxcui_in']}, ATC:{x[1]['atc_code']})"
                     for x in grp
                 )
                 overlap_lines.append(
-                    f"- Shared Pharmacologic Class (ATC {atc_cls} - {cls_name}): "
-                    f"{len(grp)} active distinct drugs in same therapeutic class: {desc_items}."
+                    f"- Shared Class (ATC {atc_cls} - {cls_name}): "
+                    f"{len(grp)} active distinct drugs: {desc_items}."
                 )
 
         cns_grp = by_pharm_group.get("cns_sedative_hypnotic", [])
         if len(cns_grp) >= 2 and len({x[1]["atc_class_code"] for x in cns_grp}) >= 2:
+            for x in cns_grp:
+                overlap_covered_uuids.add(x[0].resource_uuid)
             desc_cns = " and ".join(
                 f"{x[0].display}{(' ' + x[2]) if x[2] else ''} "
-                f"(ingredient: {x[1]['ingredient']}, {x[1]['atc_class_name'] or x[1]['atc_code']}, ATC:{x[1]['atc_code']})"
+                f"({x[1]['ingredient']}, {x[1]['atc_class_name'] or x[1]['atc_code']}, ATC:{x[1]['atc_code']})"
                 for x in cns_grp
             )
             overlap_lines.append(
-                f"- Concurrent Active CNS Sedative-Hypnotics: {len(cns_grp)} active sedative-hypnotic agents across classes: {desc_cns}."
+                f"- Concurrent CNS Sedative-Hypnotics ({len(cns_grp)} active): {desc_cns}."
             )
 
         antithrombotics = by_pharm_group.get("anticoagulant", []) + by_pharm_group.get("antiplatelet", [])
@@ -377,6 +365,25 @@ class TerminologyConceptEnricher:
             overlap_lines.append(
                 f"- Concurrent Active Antithrombotic + NSAID Classes: antithrombotic [{at_s}] co-listed with systemic NSAID [{ns_s}]."
             )
+
+        for it, drow, cit in active_meds:
+            if it.resource_uuid in overlap_covered_uuids:
+                continue
+            ing = drow["ingredient"]
+            disp_low = (it.display or "").lower()
+            is_brand_or_ciel = (ing not in disp_low) or any(c["system"] == "ciel" for c in _item_codings(it))
+            matches_q = any(t in disp_low or t in ing or t in (drow["atc_class_name"] or "").lower() for t in q_tokens)
+            if is_brand_or_ciel or med_query or matches_q or len(active_meds) <= 8:
+                codes_bits = [
+                    *(f"RxNorm:{drow['rxcui_in']}" for _ in (1,) if drow["rxcui_in"]),
+                    *(f"CIEL:{drow['ciel_id']}" for _ in (1,) if drow["ciel_id"]),
+                    *(f"ATC:{drow['atc_code']}" for _ in (1,) if drow["atc_code"]),
+                ]
+                cls_lbl = f" - {drow['atc_class_name']}" if drow["atc_class_name"] else ""
+                cite_sp = f" {cit}" if cit else ""
+                med_lines.append(
+                    f"- Active Medication: {it.display}{cite_sp} -> {ing} ({', '.join(codes_bits)}{cls_lbl})"
+                )
 
         # 2. CDC CVX / ACIP Immunization Series & Dose Counts
         imm_groups: Dict[str, Dict[str, Any]] = {}
@@ -416,12 +423,12 @@ class TerminologyConceptEnricher:
             q_match = vac_query or any(t in vgrp.lower() for t in q_tokens)
             if q_match or incomplete_multidose:
                 cites = "".join(f"[{i}]" for i in sorted(set(info["cits"]))[:3])
-                dt_str = f" on {', '.join(dose_dates)}" if dose_dates else ""
+                dt_str = f" ({', '.join(dose_dates)})" if dose_dates else ""
                 cvx_tag = f"CVX:{','.join(info['codes'])}"
+                inc_note = f"; series incomplete ({admin_cnt}/{sdoses} doses)" if incomplete_multidose else ""
                 vac_lines.append(
-                    f"- Vaccine Series ({vgrp}, {cvx_tag}): chart documents {admin_cnt} administered dose(s){dt_str}"
-                    f"{(' ' + cites) if cites else ''} vs standard {sdoses}-dose adult schedule "
-                    f"({vrow['interval_summary']}). {vrow['recency_guidance']}"
+                    f"- Vaccine ({vgrp}, {cvx_tag}): {admin_cnt} administered{dt_str}"
+                    f"{(' ' + cites) if cites else ''} vs {sdoses}-dose adult schedule ({vrow['interval_summary']}){inc_note}."
                 )
 
         # 3. Missing-Range Numeric Labs (STRICTLY only when Observation.referenceRange is absent)
@@ -472,10 +479,12 @@ class TerminologyConceptEnricher:
             elif is_high:
                 crit_tag = f" and above critical threshold ({_fmt_num(hi_c)}{u_sp})" if (hi_c is not None and pt.value > hi_c) else ""
                 status_phrase = f"above normal reference range{crit_tag}"
-            note_sfx = f" Note: {lrow['clinical_note']}" if (out_of_range and lrow["clinical_note"]) else ""
+            short_ref = lrow["reference_text"].split("(")[0].strip() or lrow["reference_text"]
+            short_note = lrow["clinical_note"].split(";")[0].strip() if (out_of_range and lrow["clinical_note"]) else ""
+            note_sfx = f" ({short_note})" if short_note else ""
             lab_lines.append(
-                f"- Missing-Range Lab Reference ({lrow['analyte_name']}, {pt.date or 'undated'}): "
-                f"{_fmt_num(pt.value)}{u_sp}{cit} | standard reference {lrow['reference_text']} -> {status_phrase}.{note_sfx}"
+                f"- Missing-Range Lab ({lrow['analyte_name']}, {pt.date or 'undated'}): "
+                f"{_fmt_num(pt.value)}{u_sp}{cit} | standard reference {short_ref} -> {status_phrase}{note_sfx}."
             )
 
         # 4. CIEL / SNOMED Concept Definitions & Cross-Walks
@@ -512,19 +521,17 @@ class TerminologyConceptEnricher:
             if not has_explicit_ciel and not crow["synonyms"] and not crow["description"]:
                 continue
             m_rows = conn.execute(
-                "SELECT system, code FROM code_mappings WHERE ciel_id = ? AND map_type = 'S' LIMIT 4",
+                "SELECT system, code FROM code_mappings WHERE ciel_id = ? AND map_type = 'S' LIMIT 2",
                 (cid_val,),
             ).fetchall()
             xwalk = ", ".join(f"{r['system'].upper()}:{r['code']}" for r in m_rows)
-            syns = ", ".join(s for s in str(crow["synonyms"] or "").split("|") if s)[:90]
+            syns = ", ".join(s for s in str(crow["synonyms"] or "").split("|") if s)[:60]
             cit = f" [{cit_lookup[it.resource_uuid]}]" if it.resource_uuid in cit_lookup else ""
             parts = [f"CIEL:{cid_val} {crow['preferred_name']}{cit}"]
             if syns:
-                parts.append(f"synonyms: {syns}")
+                parts.append(f"aka {syns}")
             if xwalk:
-                parts.append(f"mappings: {xwalk}")
-            if crow["description"]:
-                parts.append(crow["description"])
+                parts.append(xwalk)
             concept_lines.append(f"- Concept ({crow['concept_class']}): {' | '.join(parts)}")
             if len(concept_lines) >= 4:
                 break
