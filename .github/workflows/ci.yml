@@ -78,6 +78,46 @@ jobs:
           print("air-gapped --network none tokenizer smoke OK")
           PY
 
+          docker run --rm -i --network none --user 65532:65532 \
+            -e WAHS_ALLOW_LOCAL_BUNDLE_MODE=true \
+            wahs-engine-ci \
+            python - <<'PY'
+          from fastapi.testclient import TestClient
+          from wahs_engine.app import create_app
+
+          bundle = {
+              "resourceType": "Bundle",
+              "type": "collection",
+              "entry": [
+                  {"resource": {"resourceType": "Patient", "id": "p-enr", "name": [{"given": ["Aria"], "family": "Ng"}], "birthDate": "1964-08-21"}},
+                  {"resource": {"resourceType": "MedicationRequest", "id": "m-lip", "status": "active", "authoredOn": "2026-10-01", "medicationCodeableConcept": {"coding": [{"system": "http://www.nlm.nih.gov/research/umls/rxnorm", "code": "617311", "display": "Lipitor 40 MG Oral Tablet"}]}}},
+                  {"resource": {"resourceType": "MedicationRequest", "id": "m-sim", "status": "active", "authoredOn": "2026-10-02", "medicationCodeableConcept": {"coding": [{"system": "http://www.nlm.nih.gov/research/umls/rxnorm", "code": "312961", "display": "Simvastatin 20 MG Oral Tablet"}]}}},
+                  {"resource": {"resourceType": "Immunization", "id": "imm-rzv", "status": "completed", "occurrenceDateTime": "2026-09-15", "vaccineCode": {"coding": [{"system": "http://hl7.org/fhir/sid/cvx", "code": "187", "display": "Zoster vaccine recombinant (Shingrix)"}]}}},
+                  {"resource": {"resourceType": "Observation", "id": "obs-a1c", "status": "final", "category": [{"coding": [{"code": "laboratory"}]}], "effectiveDateTime": "2026-10-10", "code": {"coding": [{"system": "http://loinc.org", "code": "4548-4", "display": "Hemoglobin A1c"}]}, "valueQuantity": {"value": 3.0, "unit": "%"}}},
+              ],
+          }
+          with TestClient(create_app()) as client:
+              profs = client.get("/v1/wahs/profiles")
+              assert profs.status_code == 200, profs.text
+              pdata = profs.json()
+              assert pdata["default_profile"] == "baseline"
+              assert "full-enriched" in pdata["profiles"]
+              prev = client.post(
+                  "/v1/wahs/context/preview",
+                  json={
+                      "model": "wahs-26b",
+                      "messages": [{"role": "user", "content": "Check my statin medications, Shingrix vaccine series, and HbA1c 3.0% result."}],
+                      "wahs": {"fhir_bundle": bundle, "profile": "full-enriched"},
+                  },
+              )
+              assert prev.status_code == 200, prev.text
+              xw = prev.json()["x_wahs"]
+              assert xw["condensation"]["profile_id"] == "full-enriched"
+              assert "atorvastatin" in xw["enrichment_text"].lower()
+              assert "K1" in xw["citation_map"]
+          print("air-gapped --network none full-enriched KB smoke OK")
+          PY
+
   live-hapi-jwt-proxy-integration:
     runs-on: ubuntu-latest
     steps:

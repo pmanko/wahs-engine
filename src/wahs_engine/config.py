@@ -79,7 +79,12 @@ class WahsEngineSettings:
     default_context_window: int = 32768
     default_preferred_chart_tokens: Optional[int] = None
     default_provider_flavor: str = "litellm"
+    default_profile: str = ""
+    profiles_path: str = ""
+    prompts_dir: str = ""
     enabled_enrichers: Tuple[str, ...] = ()
+    allow_experimental_enrichers: bool = False
+    max_enrichment_tokens: int = 2048
     allow_local_bundle_mode: bool = False
     jwt_hs256_secret: str = ""
     jwt_jwks_url: str = ""
@@ -198,7 +203,13 @@ class WahsEngineSettings:
             fhir_auth_base_url=fhir_url, llm_base_url=llm_url, llm_api_key=llm_key,
             default_model=default_model, available_models=avail, model_map=parsed_map, model_specs=parsed_specs,
             default_context_window=default_ctx, default_preferred_chart_tokens=default_pref,
-            default_provider_flavor=default_flavor, enabled_enrichers=enabled_enrichers,
+            default_provider_flavor=default_flavor,
+            default_profile=_env_str("WAHS_DEFAULT_PROFILE"),
+            profiles_path=_env_str("WAHS_PROFILES_PATH"),
+            prompts_dir=_env_str("WAHS_PROMPTS_DIR"),
+            enabled_enrichers=enabled_enrichers,
+            allow_experimental_enrichers=_env_bool("WAHS_ALLOW_EXPERIMENTAL_ENRICHERS", False),
+            max_enrichment_tokens=max(64, int(os.environ.get("WAHS_MAX_ENRICHMENT_TOKENS", "2048"))),
             allow_local_bundle_mode=_env_bool("WAHS_ALLOW_LOCAL_BUNDLE_MODE", False),
             jwt_hs256_secret=_env_str("WAHS_JWT_HS256_SECRET"), jwt_jwks_url=_env_str("WAHS_JWT_JWKS_URL"),
             jwt_jwks_json=_env_str("WAHS_JWT_JWKS_JSON"), jwt_issuer=_env_str("WAHS_JWT_ISSUER"),

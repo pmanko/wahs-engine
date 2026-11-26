@@ -86,9 +86,9 @@ def clean_model_text(content: str) -> str:
 
 def build_x_wahs_envelope(
     *, ctx: AssembledWahsContext, requested_model: str, upstream_model: str, options: WahsRequestOptions,
-    engine_version: str, enrichers: Sequence[Mapping[str, str]] = (), timings: Optional[Dict[str, Any]] = None,
+    engine_version: str, enrichers: Sequence[Mapping[str, Any]] = (), timings: Optional[Dict[str, Any]] = None,
     exact_prompt_tokens: int = 0, upstream_prompt_tokens: int = 0, suspected_upstream_truncation: bool = False,
-    history_trimmed_turns: int = 0,
+    history_trimmed_turns: int = 0, enrichment_tokens: int = 0, enrichment_text: str = "",
 ) -> Dict[str, Any]:
     manifest, enricher_list = ctx.condensed.completeness_manifest or {}, [dict(e) for e in enrichers]
     env: Dict[str, Any] = {
@@ -96,6 +96,8 @@ def build_x_wahs_envelope(
         "scope_applied": {**ctx.scope_applied, "datasets_included": ctx.datasets_included},
         "condensation": {
             "tier": ctx.condensed.tier, "tier_name": ctx.condensed.tier_name,
+            "profile_id": ctx.profile_id, "prompt_id": ctx.prompt_id, "prompt_sha256": ctx.prompt_sha256[:12],
+            "enrichment_tokens": int(enrichment_tokens),
             "budget_tokens": ctx.condensed.target_tokens, "budget_effective": ctx.budget_effective or ctx.condensed.target_tokens,
             "budget_requested": ctx.budget_requested, "requested_budget_tokens": options.target_budget_tokens,
             "context_window": ctx.context_window, "preferred_chart_tokens": ctx.preferred_chart_tokens,
@@ -109,10 +111,14 @@ def build_x_wahs_envelope(
             "suspected_upstream_truncation": suspected_upstream_truncation, "history_trimmed_turns": history_trimmed_turns,
         },
         "completeness_manifest": manifest, "notices": list(ctx.notices), "enrichers": enricher_list,
+        "enrichment_text": enrichment_text,
         "ai_provenance": {
             "resourceType": "Provenance", "profile": "http://hl7.org/fhir/uv/aitransparency/StructureDefinition/AI-Provenance",
             "recorded_model": upstream_model, "requested_model": requested_model,
-            "engine": f"wahs-engine/{engine_version}", "enrichers": enricher_list, "human_review_required": True,
+            "engine": f"wahs-engine/{engine_version}",
+            "profile_id": ctx.profile_id, "prompt_id": ctx.prompt_id, "prompt_sha256": ctx.prompt_sha256,
+            "enrichment_tokens": int(enrichment_tokens),
+            "enrichers": enricher_list, "human_review_required": True,
         },
     }
     if timings is not None:
@@ -160,16 +166,20 @@ def prepare_upstream_messages(
     spec: ModelSpec,
     effective_max_tokens: int,
     pipeline: Optional[EnricherPipeline] = None,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]], int, int]:
+    max_enrichment_tokens: Optional[int] = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int, int, int, str]:
     turns = normalize_conversation_turns(req.messages)
 
     if not turns or not any(t["role"] == "user" for t in turns):
         raise HTTPException(status_code=400, detail="messages must contain at least one non-empty user message.")
 
     messages: List[Dict[str, Any]] = [{"role": "system", "content": ctx.system_prompt}, *turns]
-    disclosures: List[Dict[str, str]] = []
+    disclosures: List[Dict[str, Any]] = []
+    enrichment_tokens = 0
+    enrichment_text = ""
 
-    if pipeline and pipeline.enabled_ids:
+    active_ids = ctx.active_enrichers or (pipeline.enabled_ids if pipeline is not None else ())
+    if pipeline is not None and active_ids:
         counter = get_exact_token_counter(spec.tokenizer_family)
         min_toks = count_chat_messages_tokens([messages[0], messages[-1]], tokenizer_family=spec.tokenizer_family)
         headroom = max(0, spec.context_window - effective_max_tokens - min_toks)
@@ -177,16 +187,19 @@ def prepare_upstream_messages(
         p_res = pipeline.run(
             extracted=ctx.extracted, condensed=ctx.condensed, citation_map=ctx.citation_map,
             question=last_q, conversation=turns, headroom_tokens=headroom, token_counter=counter,
+            active_ids=active_ids, max_enrichment_tokens=max_enrichment_tokens,
         )
+        disclosures = p_res.disclosures
+        enrichment_tokens = p_res.used_tokens
         block = p_res.combined_block()
         if block:
+            enrichment_text = block
             messages[-1] = {"role": messages[-1]["role"], "content": f"{messages[-1]['content']}\n\n{block}"}
-            disclosures = p_res.disclosures
 
     exact_toks, trimmed = _trim_history_to_fit(
         messages, tokenizer_family=spec.tokenizer_family, context_window=spec.context_window, max_output_tokens=effective_max_tokens
     )
-    return messages, disclosures, exact_toks, trimmed
+    return messages, disclosures, exact_toks, trimmed, enrichment_tokens, enrichment_text
 
 
 def _build_southbound_payload(*, upstream_model: str, messages: Sequence[Mapping[str, Any]], req: OpenAIChatCompletionRequest, spec: ModelSpec, effective_max_tokens: int, stream: bool) -> Dict[str, Any]:
@@ -208,7 +221,7 @@ class SouthboundOpenAIClient:
         self.settings = settings
         self._external_client = http_client
         self._shared_client: Optional[httpx.AsyncClient] = None
-        self.pipeline = pipeline if pipeline is not None else EnricherPipeline(settings.enabled_enrichers)
+        self.pipeline = pipeline if pipeline is not None else EnricherPipeline(settings.enabled_enrichers, max_enrichment_tokens=settings.max_enrichment_tokens)
 
     def _get_http_client(self) -> httpx.AsyncClient:
         if self._external_client is not None:
@@ -243,22 +256,23 @@ class SouthboundOpenAIClient:
             pass
         return {"object": "list", "data": models_out}
 
-    async def _prepare_turn(self, ctx: AssembledWahsContext, req: OpenAIChatCompletionRequest, *, stream: bool, assemble_ms: float) -> Tuple[AssembledWahsContext, str, ModelSpec, List[Dict[str, str]], int, int, float, Dict[str, Any]]:
+    async def _prepare_turn(self, ctx: AssembledWahsContext, req: OpenAIChatCompletionRequest, *, stream: bool, assemble_ms: float) -> Tuple[AssembledWahsContext, str, ModelSpec, List[Dict[str, Any]], int, int, int, str, float, Dict[str, Any]]:
         prep_t0 = time.perf_counter()
         ctx_copy = copy.copy(ctx)
         ctx_copy.citation_map = copy.deepcopy(ctx.citation_map)
         requested_model = (req.model or self.settings.default_model).strip()
         spec = self.settings.resolve_model_spec(requested_model)
         eff_max = int(req.max_tokens) if req.max_tokens is not None else int(spec.default_max_output_tokens)
-        messages, disclosures, exact_toks, trimmed = await asyncio.to_thread(
-            prepare_upstream_messages, ctx=ctx_copy, req=req, spec=spec, effective_max_tokens=eff_max, pipeline=self.pipeline
+        messages, disclosures, exact_toks, trimmed, enr_toks, enr_text = await asyncio.to_thread(
+            prepare_upstream_messages, ctx=ctx_copy, req=req, spec=spec, effective_max_tokens=eff_max,
+            pipeline=self.pipeline, max_enrichment_tokens=self.settings.max_enrichment_tokens,
         )
         prep_ms = round(assemble_ms + (time.perf_counter() - prep_t0) * 1000.0, 2)
         payload = _build_southbound_payload(upstream_model=spec.upstream_model, messages=messages, req=req, spec=spec, effective_max_tokens=eff_max, stream=stream)
-        return ctx_copy, requested_model, spec, disclosures, exact_toks, trimmed, prep_ms, payload
+        return ctx_copy, requested_model, spec, disclosures, exact_toks, trimmed, enr_toks, enr_text, prep_ms, payload
 
     async def complete(self, *, ctx: AssembledWahsContext, req: OpenAIChatCompletionRequest, options: WahsRequestOptions, assemble_ms: float = 0.0) -> Dict[str, Any]:
-        ctx, requested_model, spec, disclosures, exact_toks, trimmed, prep_ms, payload = await self._prepare_turn(ctx, req, stream=False, assemble_ms=assemble_ms)
+        ctx, requested_model, spec, disclosures, exact_toks, trimmed, enr_toks, enr_text, prep_ms, payload = await self._prepare_turn(ctx, req, stream=False, assemble_ms=assemble_ms)
 
         llm_t0 = time.perf_counter()
         try:
@@ -289,7 +303,7 @@ class SouthboundOpenAIClient:
             },
             exact_prompt_tokens=exact_toks, upstream_prompt_tokens=up_ptoks,
             suspected_upstream_truncation=bool(up_ptoks > 0 and exact_toks >= 1024 and up_ptoks < int(exact_toks * 0.85)),
-            history_trimmed_turns=trimmed,
+            history_trimmed_turns=trimmed, enrichment_tokens=enr_toks, enrichment_text=enr_text,
         )
         return {
             "id": body.get("id") or f"chatcmpl-wahs-{uuid.uuid4().hex[:12]}",
@@ -302,7 +316,7 @@ class SouthboundOpenAIClient:
         }
 
     async def start_stream(self, *, ctx: AssembledWahsContext, req: OpenAIChatCompletionRequest, options: WahsRequestOptions, assemble_ms: float = 0.0) -> AsyncIterator[str]:
-        ctx, requested_model, spec, disclosures, exact_toks, trimmed, prep_ms, payload = await self._prepare_turn(ctx, req, stream=True, assemble_ms=assemble_ms)
+        ctx, requested_model, spec, disclosures, exact_toks, trimmed, enr_toks, enr_text, prep_ms, payload = await self._prepare_turn(ctx, req, stream=True, assemble_ms=assemble_ms)
 
         client = self._get_http_client()
         llm_t0 = time.perf_counter()
@@ -356,7 +370,7 @@ class SouthboundOpenAIClient:
                 timings={"engine_prep_ms": prep_ms, "upstream_llm_ms": llm_ms, "total_latency_ms": round(prep_ms + llm_ms, 2)},
                 exact_prompt_tokens=exact_toks, upstream_prompt_tokens=up_ptoks,
                 suspected_upstream_truncation=bool(up_ptoks > 0 and exact_toks >= 1024 and up_ptoks < int(exact_toks * 0.85)),
-                history_trimmed_turns=trimmed,
+                history_trimmed_turns=trimmed, enrichment_tokens=enr_toks, enrichment_text=enr_text,
             )
             fchunk: Dict[str, Any] = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": requested_model, "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}], "x_wahs": x_wahs}
             if up_usage:

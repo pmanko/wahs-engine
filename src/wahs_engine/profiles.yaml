@@ -1,0 +1,52 @@
+default_profile: baseline
+profiles:
+  baseline:
+    label: "WAHS Verbatim Condensation"
+    prompt: wahs-default
+    enrichers: []
+    preferred_chart_tokens: null
+  temporal:
+    label: "WAHS + Temporal Anchor & Trends"
+    prompt: wahs-default
+    enrichers:
+      - temporal
+    preferred_chart_tokens: 32768
+  terminology:
+    label: "WAHS + CIEL & Public Standards Terminology KB"
+    prompt: wahs-default
+    enrichers:
+      - terminology_kb
+    preferred_chart_tokens: 32768
+  temporal-terminology:
+    label: "WAHS + Temporal & Terminology KB"
+    prompt: wahs-default
+    enrichers:
+      - temporal
+      - terminology_kb
+    preferred_chart_tokens: 32768
+  rag-overflow:
+    label: "WAHS + Tier-2 Note RAG & Overflow Recovery"
+    prompt: wahs-default
+    enrichers:
+      - note_rag
+      - overflow_lookup
+    preferred_chart_tokens: 16384
+  core-enriched:
+    label: "WAHS + Core Enrichers (Temporal, Terminology, RAG, Overflow)"
+    prompt: wahs-default
+    enrichers:
+      - temporal
+      - terminology_kb
+      - note_rag
+      - overflow_lookup
+    preferred_chart_tokens: 32768
+  full-enriched:
+    label: "WAHS + Core Enrichers + Public Guideline Snippets"
+    prompt: wahs-default
+    enrichers:
+      - temporal
+      - terminology_kb
+      - note_rag
+      - overflow_lookup
+      - guideline_kb
+    preferred_chart_tokens: 32768

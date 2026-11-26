@@ -1,0 +1,94 @@
+{
+  "source": "CDC CVX Public Domain + CDC ACIP Adult Immunization Schedule",
+  "version": "2026-11",
+  "vaccines": [
+    {
+      "vaccine_group": "Zoster Recombinant (Shingrix, RZV)",
+      "cvx_codes": ["187"],
+      "display_patterns": ["shingrix", "zoster vaccine recombinant", "rzv"],
+      "series_doses": 2,
+      "interval_summary": "2-dose adult series administered 2 to 6 months apart (adults >=50y or >=19y immunodeficient/immunosuppressed)",
+      "recency_guidance": "1 administered dose represents 1 of 2 required doses (incomplete series until dose 2); prior live Zostavax (CVX 121) does not count toward the 2-dose RZV series."
+    },
+    {
+      "vaccine_group": "Zoster Live (Zostavax, ZVL - historical)",
+      "cvx_codes": ["121"],
+      "display_patterns": ["zostavax", "zoster vaccine, live"],
+      "series_doses": 1,
+      "interval_summary": "Historical 1-dose live zoster vaccine (discontinued in US)",
+      "recency_guidance": "CDC ACIP recommends the 2-dose recombinant zoster series (Shingrix, CVX 187) even for adults who previously received live Zostavax."
+    },
+    {
+      "vaccine_group": "COVID-19",
+      "cvx_codes": ["207", "208", "210", "211", "212", "213", "221", "228", "229", "230", "300", "301", "302", "308", "309", "310", "311", "312", "313"],
+      "display_patterns": ["covid-19", "sars-cov-2"],
+      "series_doses": 1,
+      "interval_summary": "Updated seasonal COVID-19 formulation recommended",
+      "recency_guidance": "Doses administered >12 months before the chart anchor date reflect historical formulations rather than current-season COVID-19 vaccination."
+    },
+    {
+      "vaccine_group": "Tetanus/Diphtheria/Pertussis (Tdap/Td)",
+      "cvx_codes": ["115", "09", "9", "113", "138", "139"],
+      "display_patterns": ["tdap", "tetanus toxoid", "td (adult)"],
+      "series_doses": 1,
+      "interval_summary": "1 adult Tdap dose (plus 1 Tdap during each pregnancy at 27-36 weeks gestation), followed by Td or Tdap booster every 10 years",
+      "recency_guidance": "Booster due if >=10 years have elapsed since the most recent tetanus-containing dose (or >=5 years for contaminated wound management)."
+    },
+    {
+      "vaccine_group": "Pneumococcal Conjugate/Polysaccharide",
+      "cvx_codes": ["216", "327", "215", "133", "33", "109"],
+      "display_patterns": ["pneumococcal", "pcv20", "pcv21", "pcv15", "pcv13", "ppsv23", "prevnar", "pneumovax"],
+      "series_doses": 1,
+      "interval_summary": "Single dose of PCV20 (CVX 216) or PCV21 (CVX 327), or PCV15 followed by PPSV23, for adults >=50y (or 19-49y with qualifying risk conditions)",
+      "recency_guidance": "Adults who received only older PCV13 (CVX 133) or PPSV23 (CVX 33) may require completion per ACIP pneumococcal risk/age rules."
+    },
+    {
+      "vaccine_group": "Seasonal Influenza",
+      "cvx_codes": ["140", "141", "150", "158", "161", "166", "171", "185", "186", "197", "205", "88"],
+      "display_patterns": ["influenza", "flu vaccine"],
+      "series_doses": 1,
+      "interval_summary": "1 dose annually each respiratory virus season",
+      "recency_guidance": "Doses >12 months before the chart anchor date reflect a prior influenza season."
+    },
+    {
+      "vaccine_group": "Respiratory Syncytial Virus (RSV)",
+      "cvx_codes": ["303", "305", "314", "326"],
+      "display_patterns": ["rsv", "respiratory syncytial virus", "arexvy", "abrysvo", "mresvia"],
+      "series_doses": 1,
+      "interval_summary": "Single adult dose for adults >=75y, adults 60-74y at increased risk of severe RSV, or pregnant patients at 32-36 weeks seasonal window",
+      "recency_guidance": "Currently recommended as a single dose rather than an annual revaccination for older adults."
+    },
+    {
+      "vaccine_group": "Hepatitis B",
+      "cvx_codes": ["08", "8", "43", "44", "45", "189"],
+      "display_patterns": ["hepatitis b", "hepb", "heplisav", "engerix", "recombivax"],
+      "series_doses": 2,
+      "interval_summary": "2-dose series (Heplisav-B CVX 189, 1 month apart) or 3-dose series (Engerix-B/Recombivax HB at 0, 1, 6 months)",
+      "recency_guidance": "Verify full 2- or 3-dose series completion depending on product."
+    },
+    {
+      "vaccine_group": "Human Papillomavirus (HPV)",
+      "cvx_codes": ["62", "118", "165"],
+      "display_patterns": ["hpv", "papillomavirus", "gardasil"],
+      "series_doses": 2,
+      "interval_summary": "2-dose series (if initiated before age 15) or 3-dose series (if initiated at >=15y or immunocompromised)",
+      "recency_guidance": "Routine vaccination through age 26y; shared clinical decision-making ages 27-45y."
+    },
+    {
+      "vaccine_group": "Measles, Mumps, Rubella (MMR)",
+      "cvx_codes": ["03", "3", "94"],
+      "display_patterns": ["mmr", "measles, mumps and rubella"],
+      "series_doses": 1,
+      "interval_summary": "1 or 2 lifetime doses for adults born in 1957 or later without evidence of immunity",
+      "recency_guidance": "Contraindicated during pregnancy (live attenuated vaccine)."
+    },
+    {
+      "vaccine_group": "Meningococcal Conjugate (MenACWY)",
+      "cvx_codes": ["114", "136", "147", "203"],
+      "display_patterns": ["meningococcal", "mcv4", "menacwy"],
+      "series_doses": 1,
+      "interval_summary": "Adolescent primary/booster schedule or adult risk-based dosing",
+      "recency_guidance": "Boosters every 5 years only if ongoing increased risk persists."
+    }
+  ]
+}

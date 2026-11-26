@@ -201,7 +201,7 @@ def _build_tier1_items(extracted: ExtractedChart) -> Tuple[List[ClinicalItem], L
     f_imms, fc = _fold_group_by_key(
         imms,
         key_fn=lambda x: ((x.code or x.display).lower(), x.status),
-        text_fn=lambda lat, grp, sp: f"Immunization: {lat.display} ({len(grp)} doses{', ' + sp if sp else ''}, status: {lat.status})",
+        text_fn=lambda lat, grp, sp: f"Immunization: {lat.display} ({len(grp)} doses{', ' + sp if sp else ''}, dose_status: {'administered' if lat.status == 'completed' else lat.status})",
     )
     folded_total += fc
     f_med_hist, fc = _fold_group_by_key(
@@ -566,6 +566,10 @@ def _assemble_render(
     return recs, manifest_dict, chart_text, mappings, counter(chart_text)
 
 
+def _note_full_len(it: ClinicalItem) -> int:
+    return len(str(it.metadata.get("full_text") or it.text or "").strip())
+
+
 def _make_result(
     *,
     extracted: ExtractedChart,
@@ -576,6 +580,7 @@ def _make_result(
     recs: List[Dict[str, Any]],
     mappings: List[Dict[str, Any]],
     manifest: Dict[str, Any],
+    rendered_note_horizons: Optional[Dict[str, int]] = None,
 ) -> CondensedChartResult:
     util = round(actual_tokens / target_tokens, 3) if target_tokens else 1.0
     return CondensedChartResult(
@@ -594,6 +599,7 @@ def _make_result(
             "target_tokens": target_tokens,
             "actual_tokens": actual_tokens,
             "budget_utilization": util,
+            "rendered_note_horizons": dict(rendered_note_horizons or {}),
         },
     )
 
@@ -631,9 +637,10 @@ def condense_bundle_to_budget(
         counter=counter,
     )
     if target_tokens is None or toks0 <= target_tokens:
+        h0 = {x.resource_uuid: _note_full_len(x) for x in (t0_patient + t0_ips + t0_other) if x.section == "clinical_note" and x.resource_uuid}
         return _make_result(
             extracted=extracted, tier=0, target_tokens=target_tokens, actual_tokens=toks0,
-            chart_text=text0, recs=recs0, mappings=maps0, manifest=man0,
+            chart_text=text0, recs=recs0, mappings=maps0, manifest=man0, rendered_note_horizons=h0,
         )
 
     # Tier 1: Uniform Ontology-Free RLE Folded Ledger (full notes + IPS core preserved verbatim)
@@ -649,9 +656,10 @@ def condense_bundle_to_budget(
         counter=counter,
     )
     if toks1 <= target_tokens:
+        h1 = {x.resource_uuid: _note_full_len(x) for x in opt_sorted_t1 if x.section == "clinical_note" and x.resource_uuid}
         return _make_result(
             extracted=extracted, tier=1, target_tokens=target_tokens, actual_tokens=toks1,
-            chart_text=text1, recs=recs1, mappings=maps1, manifest=man1,
+            chart_text=text1, recs=recs1, mappings=maps1, manifest=man1, rendered_note_horizons=h1,
         )
 
     # Tier 2: Budget-Packed Ledger with monotonic UUID prefix & continuous note water-filling
@@ -749,17 +757,23 @@ def condense_bundle_to_budget(
             for idx in included_note_positions
         )
 
-        def _render_notes_at_cap(cap_chars: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any], str, List[Dict[str, Any]], int]:
+        def _render_notes_at_cap(cap_chars: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any], str, List[Dict[str, Any]], int, Dict[str, int]]:
             cand = list(accepted_opt)
             ex_cnt = 0
+            horizons: Dict[str, int] = {}
             for idx in included_note_positions:
                 uid = accepted_opt[idx].resource_uuid
-                rendered_note, did_ex = _render_note_at_horizon(full_note_by_uuid[uid], cap_chars)
+                full_note = full_note_by_uuid[uid]
+                flen = _note_full_len(full_note)
+                rendered_note, did_ex = _render_note_at_horizon(full_note, cap_chars)
                 cand[idx] = rendered_note
                 if did_ex:
                     ex_cnt += 1
+                    horizons[uid] = min(flen, max(0, cap_chars))
+                else:
+                    horizons[uid] = flen
             cand_sorted = sorted(cand, key=lambda x: (_date_sort_key(x.date), x.resource_uuid), reverse=True)
-            return _assemble_render(
+            recs_c, man_c, text_c, maps_c, toks_c = _assemble_render(
                 extracted,
                 active_ips + cand_sorted,
                 tier=2,
@@ -768,12 +782,14 @@ def condense_bundle_to_budget(
                 excerpted_notes_count=ex_cnt,
                 counter=counter,
             )
+            return recs_c, man_c, text_c, maps_c, toks_c, horizons
 
-        recs_full, man_full, text_full, maps_full, toks_full = _render_notes_at_cap(max_note_chars)
+        recs_full, man_full, text_full, maps_full, toks_full, h_full = _render_notes_at_cap(max_note_chars)
         if toks_full <= target_tokens:
             return _make_result(
                 extracted=extracted, tier=2, target_tokens=target_tokens, actual_tokens=toks_full,
                 chart_text=text_full, recs=recs_full, mappings=maps_full, manifest=man_full,
+                rendered_note_horizons=h_full,
             )
 
         lo_c, hi_c = 0, max(0, max_note_chars - 1)
@@ -787,10 +803,11 @@ def condense_bundle_to_budget(
                 hi_c = mid_c - 1
         while best_c > 0 and _render_notes_at_cap(best_c)[4] > target_tokens:
             best_c -= 1
-        recs2, man2, text2, maps2, toks2 = _render_notes_at_cap(best_c)
+        recs2, man2, text2, maps2, toks2, h2 = _render_notes_at_cap(best_c)
         return _make_result(
             extracted=extracted, tier=2, target_tokens=target_tokens, actual_tokens=toks2,
             chart_text=text2, recs=recs2, mappings=maps2, manifest=man2,
+            rendered_note_horizons=h2,
         )
 
     final_opt = sorted(accepted_opt, key=lambda x: (_date_sort_key(x.date), x.resource_uuid), reverse=True)

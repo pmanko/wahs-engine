@@ -26,7 +26,7 @@ class ChartScope(BaseModel):
 
 
 class WahsRequestOptions(BaseModel):
-    """Pure baseline `wahs` request options (zero enricher/pathway/privacy toggles on wire)."""
+    """Declarative `wahs` request options for chart scoping, budgets, profiles, prompts, and enrichers."""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -35,6 +35,9 @@ class WahsRequestOptions(BaseModel):
     chart_scope: ChartScope = Field(default_factory=ChartScope)
     overlay_resources: List[Dict[str, Any]] = Field(default_factory=list)
     target_budget_tokens: Optional[int] = Field(default=None, gt=0)
+    profile: Optional[str] = None
+    prompt: Optional[str] = None
+    enrichers: Optional[List[str]] = None
     refresh: bool = False
     emit_stream_events: bool = True
 
