@@ -39,7 +39,7 @@ profiles:
       - terminology_kb
       - note_rag
       - overflow_lookup
-    preferred_chart_tokens: 32768
+    preferred_chart_tokens: 16384
   full-enriched:
     label: "WAHS + Core Enrichers + Public Guideline Snippets"
     prompt: wahs-default

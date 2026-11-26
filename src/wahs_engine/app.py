@@ -89,10 +89,20 @@ def create_app(
     async def healthcheck() -> Dict[str, Any]:
         reg = load_profile_registry(cfg.profiles_path or None)
         default_prof = (cfg.default_profile or reg.default_profile).strip() or reg.default_profile
+        if default_prof not in reg.profiles:
+            default_prof = reg.default_profile
+        prof_obj = reg.profiles[default_prof]
+        default_budget = (
+            cfg.default_preferred_chart_tokens
+            if cfg.default_preferred_chart_tokens is not None
+            else prof_obj.preferred_chart_tokens
+        )
         return {
             "status": "ok", "service": "wahs-engine", "version": cfg.engine_version,
             "fhir_auth_base_url": cfg.fhir_auth_base_url, "llm_base_url": cfg.llm_base_url,
             "default_model": cfg.default_model, "default_profile": default_prof,
+            "default_target_budget_tokens": default_budget,
+            "context_window": cfg.default_context_window,
             "enabled_enrichers": list(cfg.enabled_enrichers),
             "allow_local_bundle_mode": cfg.allow_local_bundle_mode,
         }
@@ -115,7 +125,7 @@ def create_app(
         enrichers_meta = []
         enrichment_tokens = 0
         enrichment_text = ""
-        active_ids = ctx.active_enrichers or pipeline.enabled_ids
+        active_ids = ctx.active_enrichers if ctx.enrichment_resolved else (ctx.active_enrichers or pipeline.enabled_ids)
         if active_ids:
             ctx = copy.copy(ctx)
             ctx.citation_map = copy.deepcopy(ctx.citation_map)

@@ -29,6 +29,14 @@ ALL_GENERALIZABLE_ENRICHERS: Tuple[str, ...] = (
     "overflow_lookup",
     "guideline_kb",
 )
+ENRICHER_CATALOG: Tuple[Dict[str, str], ...] = (
+    {"id": "temporal", "label": "Temporal Anchor & Lab Trends", "short_label": "Temporal"},
+    {"id": "terminology_kb", "label": "CIEL & Public Standards Terminology KB", "short_label": "CIEL/Standards KB"},
+    {"id": "note_rag", "label": "Tier-2 Unseen-Span Note RAG", "short_label": "Note RAG"},
+    {"id": "overflow_lookup", "label": "Tier-2 Overflow Item Recovery", "short_label": "Overflow"},
+    {"id": "guideline_kb", "label": "Public Clinical Guideline Snippets [K1]", "short_label": "Guidelines [K1]"},
+)
+TARGET_CONTEXT_OPTIONS: Tuple[int, ...] = (2048, 4096, 8192, 16384, 32768, 65536, 131072)
 KNOWN_GENERALIZABLE_ENRICHERS = frozenset(
     (*ALL_GENERALIZABLE_ENRICHERS, "temporal_trends")
 )
@@ -231,7 +239,18 @@ def serialize_profiles_catalog(settings: WahsEngineSettings) -> Dict[str, Any]:
             "enrichers": list(prof.enrichers),
             "preferred_chart_tokens": prof.preferred_chart_tokens,
         }
+    default_prof = reg.profiles[default_pid]
+    default_target_budget = (
+        settings.default_preferred_chart_tokens
+        if settings.default_preferred_chart_tokens is not None
+        else default_prof.preferred_chart_tokens
+    )
     return {
+        "default_model": settings.default_model,
         "default_profile": default_pid,
+        "default_target_budget_tokens": default_target_budget,
+        "context_window": settings.default_context_window,
+        "target_context_options": list(TARGET_CONTEXT_OPTIONS),
+        "available_enrichers": [dict(item) for item in ENRICHER_CATALOG],
         "profiles": out_profiles,
     }

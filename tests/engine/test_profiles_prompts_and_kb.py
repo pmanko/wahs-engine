@@ -436,6 +436,72 @@ def test_profiles_endpoint_live_prompt_reload_prefix_invariance_and_422_gates(tm
         assert enr_ids == ["temporal", "terminology_kb", "note_rag", "overflow_lookup", "guideline_kb"]
 
 
+def test_cloud_three_part_defaults_26b_16k_core_enriched_and_explicit_baseline_override() -> None:
+    bundle = _clinical_safety_bundle()
+    settings = WahsEngineSettings(
+        allow_local_bundle_mode=True,
+        default_model="wahs-26b",
+        default_profile="core-enriched",
+        default_context_window=131072,
+        enabled_enrichers=("temporal", "terminology_kb"),
+    )
+    app = create_app(settings)
+    with TestClient(app) as client:
+        hz = client.get("/healthz").json()
+        assert hz["default_model"] == "wahs-26b"
+        assert hz["default_profile"] == "core-enriched"
+        assert hz["default_target_budget_tokens"] == 16384
+        assert hz["context_window"] == 131072
+
+        cat = client.get("/v1/wahs/profiles").json()
+        assert cat["default_model"] == "wahs-26b"
+        assert cat["default_profile"] == "core-enriched"
+        assert cat["default_target_budget_tokens"] == 16384
+        assert 16384 in cat["target_context_options"]
+        assert [e["id"] for e in cat["available_enrichers"]] == [
+            "temporal",
+            "terminology_kb",
+            "note_rag",
+            "overflow_lookup",
+            "guideline_kb",
+        ]
+
+        # Implicit call resolves 26b + 16k + core-enriched
+        prev_default = client.post(
+            "/v1/wahs/context/preview",
+            json={
+                "messages": [{"role": "user", "content": "Review my Lipitor and Simvastatin prescriptions."}],
+                "wahs": {"fhir_bundle": bundle},
+            },
+        )
+        assert prev_default.status_code == 200
+        xw_def = prev_default.json()["x_wahs"]
+        assert xw_def["ai_provenance"]["requested_model"] == "wahs-26b"
+        assert xw_def["condensation"]["profile_id"] == "core-enriched"
+        assert xw_def["condensation"]["budget_effective"] == 16384
+        assert [e["enricher_id"] for e in xw_def["enrichers"]] == [
+            "temporal",
+            "terminology_kb",
+            "note_rag",
+            "overflow_lookup",
+        ]
+
+        # Explicit baseline / empty enrichers override must run zero enrichers even when server default is core-enriched
+        prev_base = client.post(
+            "/v1/wahs/context/preview",
+            json={
+                "model": "wahs-12b",
+                "messages": [{"role": "user", "content": "Review my medications."}],
+                "wahs": {"fhir_bundle": bundle, "profile": "baseline", "target_budget_tokens": 32768},
+            },
+        )
+        assert prev_base.status_code == 200
+        xw_base = prev_base.json()["x_wahs"]
+        assert xw_base["condensation"]["profile_id"] == "baseline"
+        assert xw_base["condensation"]["budget_effective"] == 32768
+        assert xw_base["enrichers"] == []
+
+
 def test_terminology_kb_temporal_rag_overflow_and_guideline_kb_clinical_accuracy() -> None:
     bundle = _clinical_safety_bundle()
     settings = WahsEngineSettings(allow_local_bundle_mode=True, default_context_window=131072)

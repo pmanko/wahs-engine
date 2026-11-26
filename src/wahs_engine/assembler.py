@@ -225,6 +225,7 @@ class AssembledWahsContext:
     prompt_id: str = "wahs-default"
     prompt_sha256: str = ""
     active_enrichers: Tuple[str, ...] = ()
+    enrichment_resolved: bool = False
 
 
 def _canonical_sha256(obj: Any) -> str:
@@ -387,7 +388,7 @@ def _extract_ips_referenced_keys(ips_bundle: Mapping[str, Any]) -> Set[str]:
     return keys
 
 
-def _clone_context(ctx: AssembledWahsContext, *, cache_hit: bool, budget_requested: Any = _SENTINEL, budget_effective: Any = _SENTINEL, clamp_reason: Any = _SENTINEL, dataset_cache_hits: Any = _SENTINEL, dataset_fetches: Any = _SENTINEL, profile_cfg: Optional[ResolvedProfileConfig] = None) -> AssembledWahsContext:
+def _clone_context(ctx: AssembledWahsContext, *, cache_hit: bool, budget_requested: Any = _SENTINEL, budget_effective: Any = _SENTINEL, clamp_reason: Any = _SENTINEL, dataset_cache_hits: Any = _SENTINEL, dataset_fetches: Any = _SENTINEL, profile_cfg: Optional[ResolvedProfileConfig] = None, spec_preferred_tokens: Any = _SENTINEL) -> AssembledWahsContext:
     cloned = copy.copy(ctx)
     cloned.citation_map = copy.deepcopy(ctx.citation_map)
     cloned.notices, cloned.partial_datasets, cloned.cache_hit = list(ctx.notices), [dict(d) for d in ctx.partial_datasets], cache_hit
@@ -406,8 +407,11 @@ def _clone_context(ctx: AssembledWahsContext, *, cache_hit: bool, budget_request
         cloned.prompt_id = profile_cfg.prompt_id
         cloned.prompt_sha256 = profile_cfg.prompt_sha256
         cloned.active_enrichers = profile_cfg.active_enrichers
+        cloned.enrichment_resolved = True
         if profile_cfg.preferred_chart_tokens is not None:
             cloned.preferred_chart_tokens = profile_cfg.preferred_chart_tokens
+        elif spec_preferred_tokens is not _SENTINEL:
+            cloned.preferred_chart_tokens = spec_preferred_tokens
     return cloned
 
 
@@ -798,10 +802,10 @@ class WAHSBundleAssembler:
         if cacheable and not force_refresh and not partial_fetch:
             cached_t0 = self._prefix_cache.get(t0_key)
             if cached_t0 is not None and cached_t0.condensed.actual_tokens <= budget_effective:
-                return _clone_context(cached_t0, cache_hit=True, budget_requested=options.target_budget_tokens, budget_effective=budget_effective, clamp_reason=clamp_reason, dataset_cache_hits=len(datasets_included), dataset_fetches=0, profile_cfg=profile_cfg)
+                return _clone_context(cached_t0, cache_hit=True, budget_requested=options.target_budget_tokens, budget_effective=budget_effective, clamp_reason=clamp_reason, dataset_cache_hits=len(datasets_included), dataset_fetches=0, profile_cfg=profile_cfg, spec_preferred_tokens=spec.preferred_chart_tokens)
             cached_exact = self._prefix_cache.get(b_key)
             if cached_exact is not None:
-                return _clone_context(cached_exact, cache_hit=True, budget_requested=options.target_budget_tokens, budget_effective=budget_effective, clamp_reason=clamp_reason, dataset_cache_hits=len(datasets_included), dataset_fetches=0, profile_cfg=profile_cfg)
+                return _clone_context(cached_exact, cache_hit=True, budget_requested=options.target_budget_tokens, budget_effective=budget_effective, clamp_reason=clamp_reason, dataset_cache_hits=len(datasets_included), dataset_fetches=0, profile_cfg=profile_cfg, spec_preferred_tokens=spec.preferred_chart_tokens)
 
         chart_target = max(1, budget_effective - ((counter(partial_warn) + 4) if partial_fetch else 0))
         try:
@@ -858,7 +862,7 @@ class WAHSBundleAssembler:
             options.chart_scope.model_dump(exclude_defaults=False), security_audit, extracted, condensed, citation_map,
             notices, False, dataset_cache_hits, dataset_fetches, options.target_budget_tokens, budget_effective,
             spec.context_window, eff_pref, clamp_reason, spec.tokenizer_family, partial_fetch, partial_list,
-            profile_cfg.profile_id, profile_cfg.prompt_id, profile_cfg.prompt_sha256, profile_cfg.active_enrichers,
+            profile_cfg.profile_id, profile_cfg.prompt_id, profile_cfg.prompt_sha256, profile_cfg.active_enrichers, True,
         )
         if cacheable and not partial_fetch:
             self._prefix_cache.put(b_key, _clone_context(ctx, cache_hit=False))
