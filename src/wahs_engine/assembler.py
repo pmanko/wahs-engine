@@ -595,17 +595,17 @@ class WAHSBundleAssembler:
 
             if cacheable and not refresh:
                 ext_cached = self._extracted_cache.get((identity.sub, ds_fp, scope_only_hash))
-                    if ext_cached is not None:
-                        extracted_obj, sec_audit, draft_blk, draft_cits, auth_pat = ext_cached
-                        return await asyncio.to_thread(
-                            self._condense_from_extracted,
-                            extracted=extracted_obj, security_audit=sec_audit, draft_block=draft_blk, draft_cits=draft_cits,
-                            verified_sub=identity.sub, authorized_patient_id=auth_pat,
-                            datasets_included=datasets_inc_meta, datasets_fingerprint=ds_fp, scope_only_hash=scope_only_hash,
-                            options=options, spec=spec, profile_cfg=profile_cfg,
-                            conversation_messages=conversation_messages, requested_max_tokens=requested_max_tokens,
-                            dataset_cache_hits=len(included), dataset_fetches=0, cacheable=True, force_refresh=False, partial_fetch=False, partial_datasets=[],
-                        )
+                if ext_cached is not None:
+                    extracted_obj, sec_audit, draft_blk, draft_cits, auth_pat = ext_cached
+                    return await asyncio.to_thread(
+                        self._condense_from_extracted,
+                        extracted=extracted_obj, security_audit=sec_audit, draft_block=draft_blk, draft_cits=draft_cits,
+                        verified_sub=identity.sub, authorized_patient_id=auth_pat,
+                        datasets_included=datasets_inc_meta, datasets_fingerprint=ds_fp, scope_only_hash=scope_only_hash,
+                        options=options, spec=spec, profile_cfg=profile_cfg,
+                        conversation_messages=conversation_messages, requested_max_tokens=requested_max_tokens,
+                        dataset_cache_hits=len(included), dataset_fetches=0, cacheable=True, force_refresh=False, partial_fetch=False, partial_datasets=[],
+                    )
 
             pooled, seen_keys, allowed_refs = [{"resource": master_pat}], {f"Patient/{master_id}"}, {master_id, *(d.dataset_id for d in deduped)}
             fsem = asyncio.Semaphore(max(1, int(self.settings.everything_concurrency)))
