@@ -22,16 +22,12 @@ from wahs_core import CondensedChartResult, ExtractedChart, condense_bundle_to_b
 
 from .config import ModelSpec, WahsEngineSettings
 from .jwt_claims import VerifiedCallerIdentity
+from .profile_registry import ResolvedProfileConfig, resolve_effective_profile
+from .prompt_loader import load_prompt
 from .schemas import ChartScope, WahsRequestOptions
 from .tokenizers_registry import count_chat_messages_tokens, get_exact_token_counter
 
-WAHS_SYSTEM_PROMPT = """You are the Washington Health Summary (WAHS) AI Assistant, a plain-language clinical record companion.
-
-GROUNDING & PROVENANCE RULES:
-1. RECORD GROUNDING & INLINE [N] CITATIONS: Answer strictly from the Condensed Clinical Record (`[1]..[N]`) and any Patient-Authored Drafts/Flags (`[P1]..[PM]`). Cite supporting facts inline as `[1]`, `[2]`, or `[P1]` so the UI renders interactive source links, and note which care organization or patient draft reported each item when multiple sources appear.
-2. COMPLETENESS & SCOPE HONESTY: Never fabricate diagnoses, medications, lab values, or dates. Check the `[Completeness Manifest]` before concluding a historical absence: if items were omitted or notes excerpted due to token budget, or if the chart is explicitly scoped, state what is visible in the current view rather than asserting absence across omitted history.
-3. EXACT QUANTITATIVE & TEMPORAL FIDELITY: Copy numeric values, units, comparators (`<`, `>`), and ISO `YYYY-MM-DD` clinical event dates verbatim without rounding or inferring trends from a single measurement. Do not treat administrative, coverage, or device manufacture dates as clinical visits.
-4. SUPPORTIVE, NON-PRESCRIPTIVE CLINICAL FRAMING: Use clear, accessible language tailored to the user's question and suggest 1-2 concrete follow-up questions for the patient's care team when helpful."""
+WAHS_SYSTEM_PROMPT = load_prompt("wahs-default")[0]
 
 WAHS_SYSTEM_BASE = "http://fhir.wahealthsummary.cirg.uw.edu"
 IDENTIFIER_SYSTEM = "http://keycloak.cirg.uw.edu"
@@ -135,6 +131,9 @@ def resolve_chart_budget(
     system_framing_text: str = WAHS_SYSTEM_PROMPT,
     conversation_messages: Sequence[Any] = (),
     requested_max_tokens: Optional[int] = None,
+    profile_preferred_chart_tokens: Optional[int] = None,
+    active_enrichers: Sequence[str] = (),
+    max_enrichment_tokens: int = 2048,
 ) -> Tuple[int, str]:
     """Compute physical remaining chart budget from exact turn overhead and resolve policy."""
     effective_max_tokens = int(requested_max_tokens) if requested_max_tokens is not None else int(spec.default_max_output_tokens)
@@ -163,11 +162,23 @@ def resolve_chart_budget(
     if options.target_budget_tokens is not None:
         req_b = int(options.target_budget_tokens)
         if req_b <= physical_chart_capacity:
-            return req_b, "caller_target_budget_tokens"
-        return physical_chart_capacity, "clamped_to_context_window"
-    if spec.preferred_chart_tokens is not None and spec.preferred_chart_tokens < physical_chart_capacity:
-        return int(spec.preferred_chart_tokens), "model_preferred_chart_tokens"
-    return physical_chart_capacity, "context_window_available"
+            cand, reason = req_b, "caller_target_budget_tokens"
+        else:
+            cand, reason = physical_chart_capacity, "clamped_to_context_window"
+    elif profile_preferred_chart_tokens is not None and profile_preferred_chart_tokens < physical_chart_capacity:
+        cand, reason = int(profile_preferred_chart_tokens), "profile_preferred_chart_tokens"
+    elif spec.preferred_chart_tokens is not None and spec.preferred_chart_tokens < physical_chart_capacity:
+        cand, reason = int(spec.preferred_chart_tokens), "model_preferred_chart_tokens"
+    else:
+        cand, reason = physical_chart_capacity, "context_window_available"
+
+    if active_enrichers:
+        min_headroom = min(int(max_enrichment_tokens), int(spec.context_window) // 10)
+        if (physical_chart_capacity - cand) < min_headroom and physical_chart_capacity > (min_headroom + 256):
+            cand = min(cand, physical_chart_capacity - min_headroom)
+            if reason == "caller_target_budget_tokens":
+                reason = "clamped_for_enrichment_headroom"
+    return cand, reason
 
 
 @dataclass(frozen=True)
@@ -210,6 +221,10 @@ class AssembledWahsContext:
     tokenizer_family: str = "gemma4"
     partial_fetch: bool = False
     partial_datasets: List[Dict[str, Any]] = field(default_factory=list)
+    profile_id: str = "baseline"
+    prompt_id: str = "wahs-default"
+    prompt_sha256: str = ""
+    active_enrichers: Tuple[str, ...] = ()
 
 
 def _canonical_sha256(obj: Any) -> str:
@@ -372,7 +387,7 @@ def _extract_ips_referenced_keys(ips_bundle: Mapping[str, Any]) -> Set[str]:
     return keys
 
 
-def _clone_context(ctx: AssembledWahsContext, *, cache_hit: bool, budget_requested: Any = _SENTINEL, budget_effective: Any = _SENTINEL, clamp_reason: Any = _SENTINEL, dataset_cache_hits: Any = _SENTINEL, dataset_fetches: Any = _SENTINEL) -> AssembledWahsContext:
+def _clone_context(ctx: AssembledWahsContext, *, cache_hit: bool, budget_requested: Any = _SENTINEL, budget_effective: Any = _SENTINEL, clamp_reason: Any = _SENTINEL, dataset_cache_hits: Any = _SENTINEL, dataset_fetches: Any = _SENTINEL, profile_cfg: Optional[ResolvedProfileConfig] = None) -> AssembledWahsContext:
     cloned = copy.copy(ctx)
     cloned.citation_map = copy.deepcopy(ctx.citation_map)
     cloned.notices, cloned.partial_datasets, cloned.cache_hit = list(ctx.notices), [dict(d) for d in ctx.partial_datasets], cache_hit
@@ -386,6 +401,13 @@ def _clone_context(ctx: AssembledWahsContext, *, cache_hit: bool, budget_request
         cloned.dataset_cache_hits = dataset_cache_hits
     if dataset_fetches is not _SENTINEL:
         cloned.dataset_fetches = dataset_fetches
+    if profile_cfg is not None:
+        cloned.profile_id = profile_cfg.profile_id
+        cloned.prompt_id = profile_cfg.prompt_id
+        cloned.prompt_sha256 = profile_cfg.prompt_sha256
+        cloned.active_enrichers = profile_cfg.active_enrichers
+        if profile_cfg.preferred_chart_tokens is not None:
+            cloned.preferred_chart_tokens = profile_cfg.preferred_chart_tokens
     return cloned
 
 
@@ -413,7 +435,7 @@ class WAHSBundleAssembler:
         self.settings, self._external_client, self._shared_client = settings, http_client, None
         self._dataset_cache: _BoundedLRUCache[Tuple[str, str, str], List[Dict[str, Any]]] = _BoundedLRUCache(settings.dataset_cache_max_entries, ttl_seconds=settings.cache_ttl_seconds, max_bytes=settings.dataset_cache_max_bytes)
         self._extracted_cache: _BoundedLRUCache[Tuple[str, str, str], Tuple[ExtractedChart, Dict[str, Any], str, Dict[str, Dict[str, Any]], str]] = _BoundedLRUCache(settings.prefix_cache_max_entries, ttl_seconds=settings.cache_ttl_seconds, max_bytes=settings.prefix_cache_max_bytes)
-        self._prefix_cache: _BoundedLRUCache[Tuple[str, str, str, str, str], AssembledWahsContext] = _BoundedLRUCache(settings.prefix_cache_max_entries, ttl_seconds=settings.cache_ttl_seconds, max_bytes=settings.prefix_cache_max_bytes)
+        self._prefix_cache: _BoundedLRUCache[Tuple[str, str, str, str, str, str], AssembledWahsContext] = _BoundedLRUCache(settings.prefix_cache_max_entries, ttl_seconds=settings.cache_ttl_seconds, max_bytes=settings.prefix_cache_max_bytes)
         self._inflight_datasets: Dict[Tuple[str, str, str], asyncio.Task[Tuple[List[Dict[str, Any]], bool, Optional[str]]]] = {}
 
     def _get_http_client(self) -> httpx.AsyncClient:
@@ -482,13 +504,17 @@ class WAHSBundleAssembler:
             if rb > self.settings.max_overlay_bytes:
                 raise HTTPException(status_code=413, detail=f"wahs.overlay_resources exceeds {self.settings.max_overlay_bytes} bytes.")
         scope, spec = options.chart_scope, self.settings.resolve_model_spec(requested_model)
+        profile_cfg = resolve_effective_profile(options, self.settings)
         # Fail fast if framing + max_tokens alone cannot fit configured context_window
         resolve_chart_budget(
             spec,
             options,
-            system_framing_text=WAHS_SYSTEM_PROMPT,
+            system_framing_text=profile_cfg.prompt_text,
             conversation_messages=conversation_messages,
             requested_max_tokens=requested_max_tokens,
+            profile_preferred_chart_tokens=profile_cfg.preferred_chart_tokens,
+            active_enrichers=profile_cfg.active_enrichers,
+            max_enrichment_tokens=self.settings.max_enrichment_tokens,
         )
         refresh = bool(options.refresh or force_refresh)
         scope_only_hash = _canonical_sha256({"scope": scope.model_dump(), "overlays": options.overlay_resources})
@@ -503,6 +529,7 @@ class WAHSBundleAssembler:
                 self._scope_and_condense_bundle, raw_bundle=options.fhir_bundle, verified_sub=identity.sub if identity else "local-harness",
                 authorized_patient_id=pat_id, allowed_patient_refs={pat_id}, datasets_included=[{"dataset_id": pat_id, "source": "Inline Bundle", "category": "local"}],
                 datasets_fingerprint=_canonical_sha256(options.fhir_bundle), scope_only_hash=scope_only_hash, options=options, spec=spec,
+                profile_cfg=profile_cfg,
                 conversation_messages=conversation_messages, requested_max_tokens=requested_max_tokens,
                 dataset_cache_hits=0, dataset_fetches=0, cacheable=True, force_refresh=refresh, partial_fetch=False, partial_datasets=[],
             )
@@ -575,7 +602,8 @@ class WAHSBundleAssembler:
                         extracted=extracted_obj, security_audit=sec_audit, draft_block=draft_blk, draft_cits=draft_cits,
                         verified_sub=identity.sub, authorized_patient_id=auth_pat,
                         datasets_included=datasets_inc_meta, datasets_fingerprint=ds_fp, scope_only_hash=scope_only_hash,
-                        options=options, spec=spec, conversation_messages=conversation_messages, requested_max_tokens=requested_max_tokens,
+                        options=options, spec=spec, profile_cfg=profile_cfg,
+                        conversation_messages=conversation_messages, requested_max_tokens=requested_max_tokens,
                         dataset_cache_hits=len(included), dataset_fetches=0, cacheable=True, force_refresh=False, partial_fetch=False, partial_datasets=[],
                     )
 
@@ -600,7 +628,8 @@ class WAHSBundleAssembler:
                 raw_bundle={"resourceType": "Bundle", "id": f"wahs-pooled-{master_id}", "type": "collection", "entry": pooled},
                 verified_sub=identity.sub, authorized_patient_id=master_id, allowed_patient_refs=allowed_refs,
                 datasets_included=datasets_inc_meta, datasets_fingerprint=ds_fp, scope_only_hash=scope_only_hash,
-                options=options, spec=spec, conversation_messages=conversation_messages, requested_max_tokens=requested_max_tokens,
+                options=options, spec=spec, profile_cfg=profile_cfg,
+                conversation_messages=conversation_messages, requested_max_tokens=requested_max_tokens,
                 dataset_cache_hits=sum(x[4] for x in ds_results), dataset_fetches=sum(x[5] for x in ds_results),
                 cacheable=(cacheable and not partial_ds), force_refresh=refresh, partial_fetch=bool(partial_ds), partial_datasets=partial_ds,
             )
@@ -656,6 +685,7 @@ class WAHSBundleAssembler:
         scope_only_hash: str,
         options: WahsRequestOptions,
         spec: ModelSpec,
+        profile_cfg: ResolvedProfileConfig,
         conversation_messages: Sequence[Any],
         requested_max_tokens: Optional[int],
         dataset_cache_hits: int,
@@ -713,7 +743,8 @@ class WAHSBundleAssembler:
             extracted=extracted, security_audit=security_audit, draft_block=draft_block, draft_cits=draft_cits,
             verified_sub=verified_sub, authorized_patient_id=authorized_patient_id,
             datasets_included=datasets_included, datasets_fingerprint=datasets_fingerprint, scope_only_hash=scope_only_hash,
-            options=options, spec=spec, conversation_messages=conversation_messages, requested_max_tokens=requested_max_tokens,
+            options=options, spec=spec, profile_cfg=profile_cfg,
+            conversation_messages=conversation_messages, requested_max_tokens=requested_max_tokens,
             dataset_cache_hits=dataset_cache_hits, dataset_fetches=dataset_fetches,
             cacheable=cacheable, force_refresh=force_refresh, partial_fetch=partial_fetch, partial_datasets=partial_datasets,
         )
@@ -732,6 +763,7 @@ class WAHSBundleAssembler:
         scope_only_hash: str,
         options: WahsRequestOptions,
         spec: ModelSpec,
+        profile_cfg: ResolvedProfileConfig,
         conversation_messages: Sequence[Any],
         requested_max_tokens: Optional[int],
         dataset_cache_hits: int,
@@ -744,8 +776,9 @@ class WAHSBundleAssembler:
         counter = get_exact_token_counter(spec.tokenizer_family)
         partial_list = list(partial_datasets or [])
         partial_warn = "[PARTIAL RECORD WARNING: Dataset pagination/resource ceiling reached before full retrieval; record may be incomplete.]" if partial_fetch else ""
+        base_prompt = profile_cfg.prompt_text
         framing_without_chart = (
-            f"{WAHS_SYSTEM_PROMPT}\n\n=== ACTIVE PATIENT: {extracted.patient_name} (DOB: {extracted.birth_date or 'unknown'}) ===\n"
+            f"{base_prompt}\n\n=== ACTIVE PATIENT: {extracted.patient_name} (DOB: {extracted.birth_date or 'unknown'}) ===\n"
             "=== CONDENSED CLINICAL RECORD ([1]..[N]) ===\n"
             + (f"\n\n{draft_block}" if draft_block else "")
             + (f"\n{partial_warn}" if partial_fetch else "")
@@ -756,16 +789,19 @@ class WAHSBundleAssembler:
             system_framing_text=framing_without_chart,
             conversation_messages=conversation_messages,
             requested_max_tokens=requested_max_tokens,
+            profile_preferred_chart_tokens=profile_cfg.preferred_chart_tokens,
+            active_enrichers=profile_cfg.active_enrichers,
+            max_enrichment_tokens=self.settings.max_enrichment_tokens,
         )
-        t0_key = (verified_sub, datasets_fingerprint, scope_only_hash, spec.tokenizer_family, "tier0")
-        b_key = (verified_sub, datasets_fingerprint, scope_only_hash, spec.tokenizer_family, str(budget_effective))
+        t0_key = (verified_sub, datasets_fingerprint, scope_only_hash, spec.tokenizer_family, profile_cfg.prompt_sha256, "tier0")
+        b_key = (verified_sub, datasets_fingerprint, scope_only_hash, spec.tokenizer_family, profile_cfg.prompt_sha256, str(budget_effective))
         if cacheable and not force_refresh and not partial_fetch:
             cached_t0 = self._prefix_cache.get(t0_key)
             if cached_t0 is not None and cached_t0.condensed.actual_tokens <= budget_effective:
-                return _clone_context(cached_t0, cache_hit=True, budget_requested=options.target_budget_tokens, budget_effective=budget_effective, clamp_reason=clamp_reason, dataset_cache_hits=len(datasets_included), dataset_fetches=0)
+                return _clone_context(cached_t0, cache_hit=True, budget_requested=options.target_budget_tokens, budget_effective=budget_effective, clamp_reason=clamp_reason, dataset_cache_hits=len(datasets_included), dataset_fetches=0, profile_cfg=profile_cfg)
             cached_exact = self._prefix_cache.get(b_key)
             if cached_exact is not None:
-                return _clone_context(cached_exact, cache_hit=True, budget_requested=options.target_budget_tokens, budget_effective=budget_effective, clamp_reason=clamp_reason, dataset_cache_hits=len(datasets_included), dataset_fetches=0)
+                return _clone_context(cached_exact, cache_hit=True, budget_requested=options.target_budget_tokens, budget_effective=budget_effective, clamp_reason=clamp_reason, dataset_cache_hits=len(datasets_included), dataset_fetches=0, profile_cfg=profile_cfg)
 
         chart_target = max(1, budget_effective - ((counter(partial_warn) + 4) if partial_fetch else 0))
         try:
@@ -774,7 +810,7 @@ class WAHSBundleAssembler:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
         def _render_sys(ct_text: str) -> str:
-            return f"{WAHS_SYSTEM_PROMPT}\n\n=== ACTIVE PATIENT: {extracted.patient_name} (DOB: {extracted.birth_date or 'unknown'}) ===\n=== CONDENSED CLINICAL RECORD ([1]..[N]) ===\n{ct_text}" + (f"\n\n{draft_block}" if draft_block else "")
+            return f"{base_prompt}\n\n=== ACTIVE PATIENT: {extracted.patient_name} (DOB: {extracted.birth_date or 'unknown'}) ===\n=== CONDENSED CLINICAL RECORD ([1]..[N]) ===\n{ct_text}" + (f"\n\n{draft_block}" if draft_block else "")
 
         upd_text = f"{condensed.chart_text.rstrip()}\n{partial_warn}" if partial_fetch else condensed.chart_text
         sys_prompt = _render_sys(upd_text)
@@ -815,12 +851,14 @@ class WAHSBundleAssembler:
 
         s_hash = _canonical_sha256({"scope": scope_only_hash, "budget": budget_effective, "tokenizer_family": spec.tokenizer_family})
         prefix_hash = hashlib.sha256(f"{verified_sub}:{sys_prompt}".encode("utf-8")).hexdigest()[:20]
+        eff_pref = profile_cfg.preferred_chart_tokens if profile_cfg.preferred_chart_tokens is not None else spec.preferred_chart_tokens
         ctx = AssembledWahsContext(
             verified_sub, authorized_patient_id, extracted.patient_name, extracted.birth_date or "",
             sys_prompt, prefix_hash, datasets_fingerprint, s_hash, datasets_included,
             options.chart_scope.model_dump(exclude_defaults=False), security_audit, extracted, condensed, citation_map,
             notices, False, dataset_cache_hits, dataset_fetches, options.target_budget_tokens, budget_effective,
-            spec.context_window, spec.preferred_chart_tokens, clamp_reason, spec.tokenizer_family, partial_fetch, partial_list,
+            spec.context_window, eff_pref, clamp_reason, spec.tokenizer_family, partial_fetch, partial_list,
+            profile_cfg.profile_id, profile_cfg.prompt_id, profile_cfg.prompt_sha256, profile_cfg.active_enrichers,
         )
         if cacheable and not partial_fetch:
             self._prefix_cache.put(b_key, _clone_context(ctx, cache_hit=False))

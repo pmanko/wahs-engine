@@ -1,7 +1,8 @@
-"""Read-only overflow lookup and omitted clinical item recovery (`ContextEnricher`)."""
+"""Read-only overflow lookup and BM25 + terminology-bridged omitted item recovery (`ContextEnricher`)."""
 
 from __future__ import annotations
 
+import math
 import re
 from typing import Any, Dict, List, Mapping, Optional, Set, Tuple, Union
 
@@ -9,6 +10,11 @@ from wahs_core.extractors import ClinicalItem, ExtractedChart, extract_bundle
 from wahs_core.ports import EnrichmentDisclosure, EnrichmentInput, EnrichmentOutput
 
 _INVALIDATED_STATUSES = {"entered-in-error", "cancelled", "noshow"}
+_OVERFLOW_STOPWORDS = {
+    "the", "and", "for", "with", "that", "this", "from", "what", "when", "where",
+    "which", "why", "how", "are", "was", "were", "have", "has", "had", "been",
+    "record", "records", "status", "patient", "chart", "please", "check",
+}
 
 
 def _ensure_extracted(bundle_or_extracted: Union[Mapping[str, Any], ExtractedChart]) -> ExtractedChart:
@@ -17,6 +23,14 @@ def _ensure_extracted(bundle_or_extracted: Union[Mapping[str, Any], ExtractedCha
         if isinstance(bundle_or_extracted, ExtractedChart)
         else extract_bundle(bundle_or_extracted)
     )
+
+
+def _tokenize_overflow(text: str) -> List[str]:
+    return [
+        tok
+        for tok in re.findall(r"[a-z0-9][a-z0-9.\-]*", (text or "").lower())
+        if len(tok) >= 2 and tok not in _OVERFLOW_STOPWORDS
+    ]
 
 
 def search_chart_entries(
@@ -45,7 +59,12 @@ def search_chart_entries(
             continue
         if date_to and item_date and item_date > date_to:
             continue
-        haystack = f"{item.display} {item.text} {item.code} {item.section} {item.source_org or ''}".lower()
+        codings_str = " ".join(
+            f"{c.get('system', '')}:{c.get('code', '')} {c.get('display', '')}"
+            for c in ((item.metadata or {}).get("codings") or ())
+            if isinstance(c, Mapping)
+        )
+        haystack = f"{item.display} {item.text} {item.code} {item.section} {item.source_org or ''} {codings_str}".lower()
         score = sum(1 for tok in q_tokens if tok in haystack) if q_tokens else 1
         if q_tokens and score == 0:
             continue
@@ -123,6 +142,7 @@ def get_lab_history(
     return {
         "tool": "get_lab_history",
         "analyte_or_loinc": analyte_or_loinc,
+        "total_measurements": len(pts),
         "total_matches": len(pts),
         "returned_count": len(series),
         "truncated": len(pts) > len(series),
@@ -170,7 +190,7 @@ def _covered_uuids(citation_map: Mapping[str, Dict[str, Any]]) -> Tuple[Set[str]
     for k_str, entry in citation_map.items():
         if str(k_str).isdigit():
             max_idx = max(max_idx, int(k_str))
-        if isinstance(entry, Mapping):
+        if isinstance(entry, Mapping) and entry.get("resourceType") != "KnowledgeReference":
             if entry.get("id"):
                 covered.add(str(entry["id"]))
             for m in entry.get("memberIds") or ():
@@ -180,47 +200,101 @@ def _covered_uuids(citation_map: Mapping[str, Dict[str, Any]]) -> Tuple[Set[str]
 
 
 class OmittedRecordRecoveryEnricher:
-    """Recovers omitted structured records matching query terms when a chart overflows budget."""
+    """Recovers omitted structured records via IDF-weighted Okapi BM25 + terminology synonym/code overlap."""
 
     enricher_id = "overflow_lookup"
     disclosure = EnrichmentDisclosure(
         enricher_id="overflow_lookup",
-        version="0.1.0",
+        version="0.2.0",
         kind="retrieval",
-        scope_summary="Recovers omitted FHIR items matching user query terms when Completeness Manifest shows omitted_clinical_items > 0.",
-        limitations="Token-overlap ranking over omitted items only; inactive when Tier 0/1 already covers 100% of records.",
+        scope_summary=(
+            "Recovers omitted FHIR items matching user query terms and CIEL/RxNorm/LOINC synonyms "
+            "using Okapi BM25 when Completeness Manifest shows omitted_clinical_items > 0."
+        ),
+        limitations="Self-gated to Tier 2 (inactive when Tier 0/1 already covers 100% of extracted clinical records).",
     )
 
     def enrich(self, inp: EnrichmentInput) -> EnrichmentOutput | None:
         omitted_count = int((inp.condensed.completeness_manifest or {}).get("omitted_clinical_items_count") or 0)
         if omitted_count <= 0 or inp.max_tokens < 48:
             return None
-        q_terms = [t for t in re.findall(r"[a-z0-9]{3,}", (inp.question or "").lower())]
-        if not q_terms:
+
+        literal_q = _tokenize_overflow(inp.question or "")
+        q_weights: Dict[str, float] = {t: 1.0 for t in literal_q}
+        if inp.question:
+            from wahs_extensions.terminology_kb import expand_query_with_terminology
+
+            for exp_t in expand_query_with_terminology(inp.question, inp.extracted):
+                for sub_t in _tokenize_overflow(exp_t):
+                    q_weights.setdefault(sub_t, 0.6)
+        if not q_weights:
             return None
 
         covered, max_idx = _covered_uuids(inp.citation_map)
-        scored: List[Tuple[Tuple[int, str], ClinicalItem]] = []
+        omitted_items: List[ClinicalItem] = []
+        doc_tfs: List[Dict[str, int]] = []
+        total_dl = 0
+
         for it in inp.extracted.items:
-            if it.section in {"patient", "manifest"}:
+            if it.section in {"patient", "manifest", "clinical_note"}:
                 continue
             item_uuids = {u for u in (it.resource_uuid, *it.member_uuids) if u}
             if not item_uuids or (item_uuids & covered):
                 continue
-            hay = f"{it.display} {it.text} {it.code} {it.source_org or ''}".lower()
-            hits = sum(1 for t in set(q_terms) if t in hay)
-            if hits > 0:
-                scored.append(((-hits, it.date or "0000-00-00"), it))
+            codings_txt = " ".join(
+                f"{c.get('code', '')} {c.get('display', '')}"
+                for c in ((it.metadata or {}).get("codings") or ())
+                if isinstance(c, Mapping)
+            )
+            toks = _tokenize_overflow(f"{it.display} {it.text} {it.code} {it.source_org or ''} {codings_txt}")
+            if not toks:
+                continue
+            tf: Dict[str, int] = {}
+            for t in toks:
+                tf[t] = tf.get(t, 0) + 1
+            tf["__dl__"] = len(toks)
+            total_dl += len(toks)
+            omitted_items.append(it)
+            doc_tfs.append(tf)
+
+        if not omitted_items:
+            return None
+
+        n_docs = len(doc_tfs)
+        avgdl = total_dl / max(1, n_docs)
+        df: Dict[str, int] = {qt: 0 for qt in q_weights}
+        for tf in doc_tfs:
+            for qt in q_weights:
+                if qt in tf:
+                    df[qt] += 1
+
+        k1, b = 1.5, 0.75
+        scored: List[Tuple[float, int, ClinicalItem]] = []
+        for idx, tf in enumerate(doc_tfs):
+            dl = tf.get("__dl__", 1)
+            score = 0.0
+            for qt, w in q_weights.items():
+                freq = tf.get(qt, 0)
+                if freq <= 0:
+                    continue
+                doc_f = df.get(qt, 0)
+                idf = math.log(1.0 + (n_docs - doc_f + 0.5) / (doc_f + 0.5))
+                denom = freq + k1 * (1.0 - b + b * (dl / max(1.0, avgdl)))
+                score += w * idf * ((freq * (k1 + 1.0)) / max(1e-9, denom))
+            if score > 0.0:
+                it = omitted_items[idx]
+                d_int = int(it.date[:10].replace("-", "")) if (it.date and re.match(r"^\d{4}-\d{2}-\d{2}", it.date)) else 0
+                scored.append((score, d_int, it))
 
         if not scored:
             return None
-        scored.sort(key=lambda pair: (pair[0][0], -(int(pair[0][1][:10].replace("-", "")) if re.match(r"^\d{4}-\d{2}-\d{2}", pair[0][1]) else 0)))
+        scored.sort(key=lambda tup: (tup[0], tup[1]), reverse=True)
 
         heading = f"=== RECOVERED OMITTED CHART ITEMS ({omitted_count} omitted overall; cite as [N]) ==="
         lines: List[str] = []
         new_cits: Dict[str, Dict[str, Any]] = {}
         next_idx = max_idx + 1
-        for _, it in scored[:8]:
+        for _, _dint, it in scored[:10]:
             ruuid = it.resource_uuid or (it.member_uuids[0] if it.member_uuids else "")
             if not ruuid:
                 continue

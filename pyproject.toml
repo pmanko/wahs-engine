@@ -17,6 +17,7 @@ dependencies = [
   "uvicorn>=0.30.0,<1.0.0",
   "httpx>=0.27.0,<1.0.0",
   "pydantic>=2.0.0,<3.0.0",
+  "pyyaml>=6.0,<7.0",
   "tokenizers>=0.20.0,<1.0.0",
   "tiktoken>=0.7.0,<1.0.0",
 ]
@@ -39,8 +40,15 @@ where = ["src"]
 include = ["wahs_core*", "wahs_engine*", "wahs_extensions*", "wahs_devtools*"]
 
 [tool.setuptools.package-data]
-wahs_engine = ["tokenizer_assets/*.gz"]
+wahs_engine = [
+  "tokenizer_assets/*.gz",
+  "prompts/*.txt",
+  "profiles.yaml",
+]
 wahs_extensions = [
+  "terminology_kb/assets/*.gz",
+  "terminology_kb/assets/*.json",
+  "guideline_kb/assets/*.jsonl",
   "experimental/clinical_reconciliation/sample_packs/*.json",
   "experimental/clinical_reconciliation/sample_packs/*.jsonl",
 ]

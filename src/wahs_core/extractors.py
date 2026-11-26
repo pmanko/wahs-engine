@@ -18,11 +18,17 @@ LOOKUP_ONLY_RESOURCE_TYPES: Set[str] = {
 }
 _INVALIDATED_STATUSES: Set[str] = {"entered-in-error", "cancelled"}
 _INVALIDATED_VERIFICATION: Set[str] = {"entered-in-error", "refuted"}
+_OPENMRS_CIEL_UUID_RE = re.compile(r"^(\d+)A{20,}$", re.IGNORECASE)
+_CIEL_PREFIX_RE = re.compile(r"^CIEL:(\d+)$", re.IGNORECASE)
 _PREFERRED_CODING_SYSTEMS: Tuple[str, ...] = (
     "nlm.nih.gov/research/umls/rxnorm",
     "snomed.info/sct",
     "loinc.org",
     "hl7.org/fhir/sid/cvx",
+    "ciel",
+    "openmrs",
+    "whocc.no/atc",
+    "hl7.org/fhir/sid/icd-10",
 )
 
 
@@ -120,6 +126,69 @@ def _sort_timestamp_key(val: Optional[str]) -> str:
     return f"N:{dt.strftime('%Y-%m-%dT%H:%M:%S')}.{dt.microsecond:06d}"
 
 
+def _ciel_from_raw(raw: Optional[str]) -> Optional[str]:
+    s = str(raw or "").strip()
+    if not s:
+        return None
+    m = _OPENMRS_CIEL_UUID_RE.match(s) or _CIEL_PREFIX_RE.match(s)
+    return m.group(1) if m else None
+
+
+def _normalize_coding_system(raw_system: str, raw_code: str) -> Tuple[str, str]:
+    sys_l = (raw_system or "").strip().lower()
+    code_s = (raw_code or "").strip()
+    ciel_id = _ciel_from_raw(code_s)
+    if ciel_id and (not sys_l or "ciel" in sys_l or "openmrs" in sys_l):
+        return "ciel", ciel_id
+    if "rxnorm" in sys_l:
+        return "rxnorm", code_s
+    if "snomed" in sys_l or "/sct" in sys_l:
+        return "snomed", code_s
+    if "loinc" in sys_l:
+        return "loinc", code_s
+    if "cvx" in sys_l:
+        return "cvx", code_s
+    if "ciel" in sys_l or ("openmrs" in sys_l and code_s.isdigit()):
+        return "ciel", ciel_id or code_s
+    if "whoatc" in sys_l or "/atc" in sys_l or sys_l in {"atc", "whoatc", "who-atc"}:
+        return "atc", code_s
+    if "icd-10" in sys_l or "icd10" in sys_l:
+        return "icd10", code_s
+    return "", code_s
+
+
+def _all_codings(
+    codeable: Optional[Mapping[str, Any]],
+    *,
+    extra_ids: Sequence[Optional[str]] = (),
+) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    seen: Set[Tuple[str, str]] = set()
+    fallback_disp = str(codeable.get("text") or "").strip() if isinstance(codeable, Mapping) else ""
+    raw_list = (codeable.get("coding") or []) if isinstance(codeable, Mapping) else ()
+    for c in raw_list:
+        if not isinstance(c, Mapping):
+            continue
+        disp = str(c.get("display") or fallback_disp).strip()
+        raw_c = str(c.get("code") or "").strip()
+        tag, norm_c = _normalize_coding_system(str(c.get("system") or ""), raw_c)
+        if tag and norm_c and (tag, norm_c) not in seen:
+            seen.add((tag, norm_c))
+            out.append({"system": tag, "code": norm_c, "display": disp})
+        for cand in (raw_c, c.get("id")):
+            cid = _ciel_from_raw(cand)
+            if cid and ("ciel", cid) not in seen:
+                seen.add(("ciel", cid))
+                out.append({"system": "ciel", "code": cid, "display": disp})
+    cand_extras = ([codeable.get("id")] if isinstance(codeable, Mapping) else []) + list(extra_ids)
+    for ext in cand_extras:
+        cid = _ciel_from_raw(ext)
+        if cid and ("ciel", cid) not in seen:
+            seen.add(("ciel", cid))
+            out.append({"system": "ciel", "code": cid, "display": fallback_disp})
+    return out
+
+
 def _coding_pair(codeable: Optional[Mapping[str, Any]]) -> Tuple[str, str]:
     if not isinstance(codeable, Mapping):
         return "", ""
@@ -128,14 +197,16 @@ def _coding_pair(codeable: Optional[Mapping[str, Any]]) -> Tuple[str, str]:
     for pref in _PREFERRED_CODING_SYSTEMS:
         for c in codings:
             if pref in str(c.get("system") or "").lower() and c.get("code") is not None:
-                code = str(c["code"]).strip()
+                raw_c = str(c["code"]).strip()
+                code = _ciel_from_raw(raw_c) or raw_c
                 display = display or str(c.get("display") or "").strip()
                 break
         if code:
             break
     for c in codings:
         if not code and c.get("code") is not None:
-            code = str(c["code"]).strip()
+            raw_c = str(c["code"]).strip()
+            code = _ciel_from_raw(raw_c) or raw_c
         if not display and c.get("display"):
             display = str(c["display"]).strip()
     return code, display
@@ -410,7 +481,7 @@ def extract_bundle(bundle: Mapping[str, Any], *, preserve_intraday_timestamps: b
                 pracs[rid] = f"{' '.join(nm.get('given') or [])} {nm.get('family') or ''}".strip()
             excluded[rt] = excluded.get(rt, 0) + 1
         elif rt == "Medication" and rid:
-            meds[rid] = _coding_pair(res.get("code"))
+            meds[rid] = (*_coding_pair(res.get("code")), _all_codings(res.get("code"), extra_ids=(rid,)))
             excluded[rt] = excluded.get(rt, 0) + 1
         elif rt == "Encounter" and rid:
             encs[rid] = res
@@ -542,30 +613,37 @@ def extract_bundle(bundle: Mapping[str, Any], *, preserve_intraday_timestamps: b
                 excluded["AllergyIntolerance(entered-in-error)"] = excluded.get("AllergyIntolerance(entered-in-error)", 0) + 1
                 continue
             c, d = _coding_pair(res.get("code"))
+            codings = _all_codings(res.get("code"), extra_ids=(rid,))
             rxns = [f"{md} ({rx.get('severity')})" if rx.get("severity") else md for rx in (res.get("reaction") or []) if isinstance(rx, Mapping) for mn in (rx.get("manifestation") or []) for _, md in [_coding_pair(mn)] if md]
             rd = _iso_date(res.get("recordedDate") or res.get("onsetDateTime"))
             quals = [f"status: {cs}"] + ([f"verification: {vs}"] if vs else []) + ([f"criticality: {res['criticality']}"] if res.get("criticality") else []) + ([f"reaction: {', '.join(rxns)}"] if rxns else [])
-            items.append(ClinicalItem(rt, rid, rd, rd if vs != "refuted" else None, "clinical_event" if (rd and vs != "refuted") else "unknown", "allergy", c or d, d or c or "Unspecified allergy", f"Allergy: {d or c} ({', '.join(quals)})", cs not in {"inactive", "resolved"} and vs != "refuted", cs, None, src_of(res), metadata={"verification_status": vs} if vs else {}))
+            items.append(ClinicalItem(rt, rid, rd, rd if vs != "refuted" else None, "clinical_event" if (rd and vs != "refuted") else "unknown", "allergy", c or d, d or c or "Unspecified allergy", f"Allergy: {d or c} ({', '.join(quals)})", cs not in {"inactive", "resolved"} and vs != "refuted", cs, None, src_of(res), metadata={"codings": codings, **({"verification_status": vs} if vs else {})}))
         elif rt == "Condition":
             cs, vs = _codeable_status(res.get("clinicalStatus")) or "active", _codeable_status(res.get("verificationStatus"))
             if cs == "entered-in-error" or vs == "entered-in-error":
                 excluded["Condition(entered-in-error)"] = excluded.get("Condition(entered-in-error)", 0) + 1
                 continue
             c, d = _coding_pair(res.get("code"))
+            codings = _all_codings(res.get("code"), extra_ids=(rid,))
             on, ab, so = _iso_date(res.get("onsetDateTime") or res.get("recordedDate")), _iso_date(res.get("abatementDateTime")), src_of(res)
             act = cs in {"active", "recurrence", "relapse"} and vs not in _INVALIDATED_VERIFICATION
             ev = on if act else (ab or on)
             det = [f"status: {cs}"] + ([f"verification: {vs}"] if vs else []) + ([f"onset: {on}"] if on else []) + ([f"resolved: {ab}"] if ab else []) + ([f"source: {so}"] if so else []) + ([f"SNOMED: {c}"] if c else [])
-            items.append(ClinicalItem(rt, rid, ev, ev if vs != "refuted" else None, "clinical_event" if (ev and vs != "refuted") else "unknown", "condition_active" if act else "condition_resolved", c or d, d or c or "Condition", f"Condition: {d or c} ({', '.join(det)})", act, cs, ab, so, metadata={"onset": on, "abatement": ab, **({"verification_status": vs} if vs else {})}))
+            items.append(ClinicalItem(rt, rid, ev, ev if vs != "refuted" else None, "clinical_event" if (ev and vs != "refuted") else "unknown", "condition_active" if act else "condition_resolved", c or d, d or c or "Condition", f"Condition: {d or c} ({', '.join(det)})", act, cs, ab, so, metadata={"onset": on, "abatement": ab, "codings": codings, **({"verification_status": vs} if vs else {})}))
         elif rt in {"MedicationRequest", "MedicationAdministration", "MedicationStatement", "MedicationDispense"}:
             st = str(res.get("status") or "unknown").strip().lower()
             if st == "entered-in-error":
                 excluded[f"{rt}(entered-in-error)"] = excluded.get(f"{rt}(entered-in-error)", 0) + 1
                 continue
             c, d = _coding_pair(res.get("medicationCodeableConcept"))
+            mr_id = _strip_urn(res["medicationReference"].get("reference")) if isinstance(res.get("medicationReference"), Mapping) else ""
+            codings = _all_codings(res.get("medicationCodeableConcept"), extra_ids=(rid, mr_id))
             if not d and isinstance(res.get("medicationReference"), Mapping):
-                mr = _strip_urn(res["medicationReference"].get("reference"))
-                c, d = meds.get(mr, (c, str(res["medicationReference"].get("display") or "")))
+                mc, md_ref, mcods = meds.get(mr_id, (c, str(res["medicationReference"].get("display") or ""), []))
+                c, d = mc, md_ref
+                for mc_entry in mcods:
+                    if not any(x["system"] == mc_entry["system"] and x["code"] == mc_entry["code"] for x in codings):
+                        codings.append(mc_entry)
             mts = str(res.get("authoredOn") or res.get("effectiveDateTime") or (res.get("effectivePeriod") or {}).get("start") or res.get("whenHandedOver") or res.get("whenPrepared") or res.get("dateAsserted") or "").strip()
             md_d, ed_d = _iso_date(mts), _iso_date((res.get("effectivePeriod") or {}).get("end"))
             raw_dos = res.get("dosageInstruction") or (res.get("dosage") if isinstance(res.get("dosage"), list) else ([res.get("dosage")] if isinstance(res.get("dosage"), Mapping) else []))
@@ -573,16 +651,17 @@ def extract_bundle(bundle: Mapping[str, Any], *, preserve_intraday_timestamps: b
             rsn, setting, so = reasons_of(res), ("inpatient/administered" if rt == "MedicationAdministration" else "prescribed"), src_of(res)
             act, mdisp = st in {"active", "in-progress", "on-hold"}, d or c or "Medication"
             qls = [f"status: {st}", f"type: {setting}"] + ([f"dosage: {'; '.join(doses[:2])}"] if doses else []) + ([f"reason: {', '.join(dict.fromkeys(rsn))}"] if rsn else []) + ([f"source: {so}"] if so else []) + ([f"RxNorm: {c}"] if c else [])
-            items.append(ClinicalItem(rt, rid, md_d, md_d, "clinical_event" if md_d else "unknown", "med_active" if act else "med_historical", c or mdisp.lower(), mdisp, f"Medication: {mdisp} ({', '.join(qls)})", act, st, ed_d, so, metadata={"reasons": rsn, "dosage": doses, "setting": setting}))
+            items.append(ClinicalItem(rt, rid, md_d, md_d, "clinical_event" if md_d else "unknown", "med_active" if act else "med_historical", c or mdisp.lower(), mdisp, f"Medication: {mdisp} ({', '.join(qls)})", act, st, ed_d, so, metadata={"reasons": rsn, "dosage": doses, "setting": setting, "codings": codings}))
         elif rt == "Immunization":
             st = str(res.get("status") or "completed").strip().lower()
             if st == "entered-in-error":
                 excluded["Immunization(entered-in-error)"] = excluded.get("Immunization(entered-in-error)", 0) + 1
                 continue
             c, d = _coding_pair(res.get("vaccineCode"))
+            codings = _all_codings(res.get("vaccineCode"), extra_ids=(rid,))
             od, so, comp = _iso_date(res.get("occurrenceDateTime")), src_of(res), (st == "completed")
-            qls = [f"status: {st}"] + ([f"CVX: {c}"] if c else []) + ([f"source: {so}"] if so else [])
-            items.append(ClinicalItem(rt, rid, od, od if comp else None, "clinical_event" if (od and comp) else "unknown", "immunization", c or (d or "vaccine"), d or c or "Vaccine", f"Immunization: {d or c or 'Vaccine'} ({', '.join(qls)})", comp, st, None, so))
+            qls = [f"dose_status: {'administered' if st == 'completed' else st}"] + ([f"CVX: {c}"] if c else []) + ([f"source: {so}"] if so else [])
+            items.append(ClinicalItem(rt, rid, od, od if comp else None, "clinical_event" if (od and comp) else "unknown", "immunization", c or (d or "vaccine"), d or c or "Vaccine", f"Immunization: {d or c or 'Vaccine'} ({', '.join(qls)})", comp, st, None, so, metadata={"codings": codings}))
         elif rt == "DocumentReference":
             if str(res.get("status") or "").lower() in _INVALIDATED_STATUSES or str(res.get("docStatus") or "").lower() == "entered-in-error":
                 excluded["DocumentReference(invalid)"] = excluded.get("DocumentReference(invalid)", 0) + 1
@@ -610,6 +689,7 @@ def extract_bundle(bundle: Mapping[str, Any], *, preserve_intraday_timestamps: b
             if not rrefs and not dr_conc and not ccs:
                 continue
             dr_cats, (code, disp) = _categories(res), _coding_pair(res.get("code"))
+            dr_codings = _all_codings(res.get("code"), extra_ids=(rid,))
             p_raw = res.get("effectiveDateTime") or res.get("issued")
             p_dt = _iso_date(p_raw)
             muuids, cparts, pabn = [rid], [], False
@@ -628,6 +708,9 @@ def extract_bundle(bundle: Mapping[str, Any], *, preserve_intraday_timestamps: b
                 if cst in _INVALIDATED_STATUSES:
                     continue
                 oc, od = _coding_pair(co.get("code"))
+                for oc_entry in _all_codings(co.get("code"), extra_ids=(oid,)):
+                    if not any(x["system"] == oc_entry["system"] and x["code"] == oc_entry["code"] for x in dr_codings):
+                        dr_codings.append(oc_entry)
                 vs_o, nv_o, un_o = _format_obs_value(co)
                 oi, orr, oa = _extract_obs_interp_range(co, nv_o)
                 ocats = _categories(co)
@@ -647,17 +730,18 @@ def extract_bundle(bundle: Mapping[str, Any], *, preserve_intraday_timestamps: b
             segs = (["; ".join(cparts)] if cparts else []) + ([f"Conclusion: {dr_conc}"] if dr_conc else ([f"Conclusion: {', '.join(dict.fromkeys(ccs))}"] if ccs else []))
             sec = "survey_panel" if "survey" in dr_cats else ("imaging" if "imaging" in dr_cats else "lab_panel")
             pfx = "Survey Panel" if sec == "survey_panel" else ("Imaging Report" if sec == "imaging" else "Diagnostic Panel")
-            items.append(ClinicalItem(rt, rid, p_dt, p_dt, "clinical_event" if p_dt else "unknown", sec, code or disp, disp or code or "Diagnostic Report", f"{pfx} ({disp or code}): {' | '.join(segs) if segs else 'completed'}", False, dr_st, None, src_of(res), tuple(dict.fromkeys(muuids)), {"is_abnormal": pabn, **({"conclusion": dr_conc} if dr_conc else {})}))
+            items.append(ClinicalItem(rt, rid, p_dt, p_dt, "clinical_event" if p_dt else "unknown", sec, code or disp, disp or code or "Diagnostic Report", f"{pfx} ({disp or code}): {' | '.join(segs) if segs else 'completed'}", False, dr_st, None, src_of(res), tuple(dict.fromkeys(muuids)), {"is_abnormal": pabn, "codings": dr_codings, **({"conclusion": dr_conc} if dr_conc else {})}))
         elif rt == "Procedure":
             st = str(res.get("status") or "completed").strip().lower()
             if st == "entered-in-error":
                 excluded["Procedure(entered-in-error)"] = excluded.get("Procedure(entered-in-error)", 0) + 1
                 continue
             c, d = _coding_pair(res.get("code"))
+            codings = _all_codings(res.get("code"), extra_ids=(rid,))
             pd = _iso_date(res.get("performedDateTime") or (res.get("performedPeriod") or {}).get("start") or (res.get("performedPeriod") or {}).get("end"))
             rsn, perf = reasons_of(res), st not in {"not-done", "stopped", "preparation"}
             qls = ([f"status: {st}"] if st != "completed" else []) + ([f"reason: {', '.join(dict.fromkeys(rsn))}"] if rsn else [])
-            items.append(ClinicalItem(rt, rid, pd, pd if perf else None, "clinical_event" if (pd and perf) else "unknown", "procedure", c or d, d or c or "Procedure", f"Procedure: {d or c}" + (f" ({', '.join(qls)})" if qls else ""), False, st, None, src_of(res)))
+            items.append(ClinicalItem(rt, rid, pd, pd if perf else None, "clinical_event" if (pd and perf) else "unknown", "procedure", c or d, d or c or "Procedure", f"Procedure: {d or c}" + (f" ({', '.join(qls)})" if qls else ""), False, st, None, src_of(res), metadata={"codings": codings}))
         elif rt == "CarePlan":
             st = str(res.get("status") or "active").strip().lower()
             if st in _INVALIDATED_STATUSES:
@@ -696,10 +780,11 @@ def extract_bundle(bundle: Mapping[str, Any], *, preserve_intraday_timestamps: b
             if st == "entered-in-error":
                 continue
             c, d = _coding_pair(res.get("type"))
+            codings = _all_codings(res.get("type"), extra_ids=(rid,))
             if not d and isinstance((res.get("deviceName") or [None])[0], Mapping):
                 d = str(res["deviceName"][0].get("name") or "")
             dd = _iso_date(res.get("manufactureDate"))
-            items.append(ClinicalItem(rt, rid, dd, None, "administrative" if dd else "unknown", "device", c or d, d or c or "Medical Device", f"Device: {d or c} (status: {st})", st == "active", st, None, src_of(res)))
+            items.append(ClinicalItem(rt, rid, dd, None, "administrative" if dd else "unknown", "device", c or d, d or c or "Medical Device", f"Device: {d or c} (status: {st})", st == "active", st, None, src_of(res), metadata={"codings": codings}))
         elif rt == "Encounter":
             st = str(res.get("status") or "finished").strip().lower()
             if st == "entered-in-error":
@@ -744,6 +829,12 @@ def extract_bundle(bundle: Mapping[str, Any], *, preserve_intraday_timestamps: b
             excluded[f"Observation({ost})"] = excluded.get(f"Observation({ost})", 0) + 1
             continue
         code, disp = _coding_pair(res.get("code"))
+        obs_codings = _all_codings(res.get("code"), extra_ids=(rid,))
+        for comp in res.get("component") or []:
+            if isinstance(comp, Mapping):
+                for cc_entry in _all_codings(comp.get("code")):
+                    if not any(x["system"] == cc_entry["system"] and x["code"] == cc_entry["code"] for x in obs_codings):
+                        obs_codings.append(cc_entry)
         raw_dt = res.get("effectiveDateTime") or res.get("issued")
         odate = _iso_date(raw_dt)
         ots = (_iso_timestamp(raw_dt) if preserve_intraday_timestamps else None) or odate
@@ -763,7 +854,7 @@ def extract_bundle(bundle: Mapping[str, Any], *, preserve_intraday_timestamps: b
         bval = f": {vstr}" + (f" [{'; '.join(ann)}]" if ann else "") if vstr else ""
         top_vq = res.get("valueQuantity")
         tcmp = str(top_vq.get("comparator") or "").strip() if isinstance(top_vq, Mapping) else ""
-        ometa = {"value": vstr, "numeric": nval, "unit": unit, "category": pcat, "is_abnormal": oa, **({"comparator": tcmp} if tcmp else {}), **({"interpretation": oi} if oi else {}), **({"reference_range": orr} if orr else {})}
+        ometa = {"value": vstr, "numeric": nval, "unit": unit, "category": pcat, "is_abnormal": oa, "codings": obs_codings, **({"comparator": tcmp} if tcmp else {}), **({"interpretation": oi} if oi else {}), **({"reference_range": orr} if orr else {})}
         items.append(ClinicalItem("Observation", rid, odate, odate, "clinical_event" if odate else "unknown", sec, code or disp, disp or code or "Observation", f"{clbl} ({disp or code}){bval}{ts_sfx}", False, ost, None, src_of(res), metadata=ometa))
 
     for ni in notes_by_hash.values():

@@ -156,3 +156,90 @@ def test_monotonic_rle_and_budget_packing_across_budgets() -> None:
     assert res_wide.tier in {0, 1}
     assert res_wide.completeness_manifest["omitted_clinical_items_count"] == 0
     assert estimate_tokens_local(res_wide.chart_text) > 0
+
+
+def test_codings_openmrs_ciel_immunization_dose_status_and_note_horizons() -> None:
+    long_note = "Cardiology follow-up visit summary. " + ("Stable blood pressure and electrolytes. " * 60)
+    bundle = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {"resourceType": "Patient", "id": "p-core-hooks", "name": [{"given": ["Lin"], "family": "Tran"}]}},
+            {
+                "resource": {
+                    "resourceType": "MedicationRequest",
+                    "id": "79651AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                    "status": "active",
+                    "authoredOn": "2026-09-10",
+                    "medicationCodeableConcept": {
+                        "coding": [
+                            {"system": "http://www.nlm.nih.gov/research/umls/rxnorm", "code": "860975", "display": "Metformin 500 MG Oral Tablet"},
+                            {"system": "http://www.whocc.no/atc", "code": "A10BA02", "display": "metformin"},
+                        ]
+                    },
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Condition",
+                    "id": "cond-ciel-explicit",
+                    "clinicalStatus": {"coding": [{"code": "active"}]},
+                    "code": {"coding": [{"system": "https://openconceptlab.org/orgs/CIEL/sources/CIEL", "code": "142473", "display": "Type 2 diabetes mellitus"}]},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Immunization",
+                    "id": "imm-1",
+                    "status": "completed",
+                    "occurrenceDateTime": "2026-04-01",
+                    "vaccineCode": {"coding": [{"system": "http://hl7.org/fhir/sid/cvx", "code": "187", "display": "Shingrix"}]},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Immunization",
+                    "id": "imm-2",
+                    "status": "completed",
+                    "occurrenceDateTime": "2026-08-01",
+                    "vaccineCode": {"coding": [{"system": "http://hl7.org/fhir/sid/cvx", "code": "187", "display": "Shingrix"}]},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "DocumentReference",
+                    "id": "note-h1",
+                    "status": "current",
+                    "date": "2026-10-01",
+                    "type": {"text": "Clinic Note"},
+                    "content": [{"attachment": {"data": _b64(long_note)}}],
+                }
+            },
+        ],
+    }
+    extracted = extract_bundle(bundle)
+    med_item = next(x for x in extracted.items if x.resource_type == "MedicationRequest")
+    med_systems = {(c["system"], c["code"]) for c in med_item.metadata["codings"]}
+    assert ("rxnorm", "860975") in med_systems
+    assert ("atc", "A10BA02") in med_systems
+    assert ("ciel", "79651") in med_systems
+
+    imm_items = [x for x in extracted.items if x.resource_type == "Immunization"]
+    assert all(x.status == "completed" for x in imm_items)
+    assert all("dose_status: administered" in x.text and "status: completed" not in x.text for x in imm_items)
+
+    t0 = condense_bundle_to_budget(extracted)
+    assert t0.tier == 0
+    assert "dose_status: administered" in t0.chart_text
+    assert "status: completed" not in t0.chart_text
+    full_note_len = len(extracted.notes[0].text)
+    assert t0.compression_stats["rendered_note_horizons"]["note-h1"] == full_note_len
+
+    # Tier 2 budget: note is excerpted and RLE folds the 2 Shingrix doses with dose_status: administered
+    t2 = condense_bundle_to_budget(extracted, target_tokens=320)
+    assert t2.tier == 2
+    assert "2 doses" in t2.chart_text
+    assert "dose_status: administered" in t2.chart_text
+    assert "status: completed" not in t2.chart_text
+    h2 = t2.compression_stats["rendered_note_horizons"]["note-h1"]
+    assert 0 <= h2 < full_note_len

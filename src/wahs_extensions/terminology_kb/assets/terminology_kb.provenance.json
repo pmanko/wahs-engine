@@ -1,0 +1,27 @@
+{
+  "artifact": "terminology_kb.sqlite.gz",
+  "sources": {
+    "ciel": {
+      "kept_concepts": 49716,
+      "kept_mappings": 103653,
+      "version": "v2026-04-28",
+      "zip_sha256": "c71dcaddc34f4d558ac44a7f72f0e86370e700e9f1be6dd5b482caf65fc55507"
+    },
+    "public_standards": {
+      "cdc_cvx_acip_version": "2026-11",
+      "loinc_ranges_version": "2026-11",
+      "rxnorm_atc_version": "2026-11"
+    }
+  },
+  "sqlite_gzip_bytes": 4730480,
+  "sqlite_gzip_sha256": "ff881a05c8e31b73fdecbdec9ad5c5a1c86306a7fa3bfb52edc639781a7e3b5b",
+  "sqlite_uncompressed_bytes": 12955648,
+  "table_counts": {
+    "code_mappings": 103653,
+    "concepts": 49716,
+    "cvx_vaccines": 65,
+    "lab_ranges": 168,
+    "rxnorm_drugs": 23657,
+    "term_lookup": 19709
+  }
+}

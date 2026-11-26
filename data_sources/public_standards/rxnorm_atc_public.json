@@ -1,0 +1,636 @@
+{
+  "source": "NLM RxNorm Public Domain + WHO ATC Classification",
+  "version": "2026-11",
+  "drugs": [
+    {
+      "ingredient": "atorvastatin",
+      "rxcui_in": "83367",
+      "rxcuis": ["617311", "617310", "617312", "617314", "617318", "617320", "259255", "153165"],
+      "brands": ["Lipitor"],
+      "atc_code": "C10AA05",
+      "atc_class_code": "C10AA",
+      "atc_class_name": "HMG-CoA reductase inhibitor (statin)",
+      "pharm_group": "statin"
+    },
+    {
+      "ingredient": "simvastatin",
+      "rxcui_in": "36567",
+      "rxcuis": ["312961", "312962", "198213", "200345", "152923", "562251"],
+      "brands": ["Zocor"],
+      "atc_code": "C10AA01",
+      "atc_class_code": "C10AA",
+      "atc_class_name": "HMG-CoA reductase inhibitor (statin)",
+      "pharm_group": "statin"
+    },
+    {
+      "ingredient": "rosuvastatin",
+      "rxcui_in": "301542",
+      "rxcuis": ["859747", "859751", "859753", "404011"],
+      "brands": ["Crestor"],
+      "atc_code": "C10AA07",
+      "atc_class_code": "C10AA",
+      "atc_class_name": "HMG-CoA reductase inhibitor (statin)",
+      "pharm_group": "statin"
+    },
+    {
+      "ingredient": "pravastatin",
+      "rxcui_in": "42463",
+      "rxcuis": ["904458", "904467", "312515"],
+      "brands": ["Pravachol"],
+      "atc_code": "C10AA03",
+      "atc_class_code": "C10AA",
+      "atc_class_name": "HMG-CoA reductase inhibitor (statin)",
+      "pharm_group": "statin"
+    },
+    {
+      "ingredient": "lovastatin",
+      "rxcui_in": "6472",
+      "rxcuis": ["197903", "197904"],
+      "brands": ["Mevacor", "Altoprev"],
+      "atc_code": "C10AA02",
+      "atc_class_code": "C10AA",
+      "atc_class_name": "HMG-CoA reductase inhibitor (statin)",
+      "pharm_group": "statin"
+    },
+    {
+      "ingredient": "clopidogrel",
+      "rxcui_in": "32968",
+      "rxcuis": ["309362", "213169", "174742"],
+      "brands": ["Plavix"],
+      "atc_code": "B01AC04",
+      "atc_class_code": "B01AC",
+      "atc_class_name": "Platelet aggregation inhibitor (P2Y12 antiplatelet)",
+      "pharm_group": "antiplatelet"
+    },
+    {
+      "ingredient": "aspirin",
+      "rxcui_in": "1191",
+      "rxcuis": ["243670", "198466", "318272", "212033"],
+      "brands": ["Ecotrin", "Bayer"],
+      "atc_code": "B01AC06",
+      "atc_class_code": "B01AC",
+      "atc_class_name": "Platelet aggregation inhibitor (salicylate antiplatelet)",
+      "pharm_group": "antiplatelet"
+    },
+    {
+      "ingredient": "ticagrelor",
+      "rxcui_in": "1116632",
+      "rxcuis": ["1116635", "1116639"],
+      "brands": ["Brilinta"],
+      "atc_code": "B01AC24",
+      "atc_class_code": "B01AC",
+      "atc_class_name": "Platelet aggregation inhibitor (P2Y12 antiplatelet)",
+      "pharm_group": "antiplatelet"
+    },
+    {
+      "ingredient": "apixaban",
+      "rxcui_in": "1364430",
+      "rxcuis": ["1364435", "1364441", "1364445", "1364447"],
+      "brands": ["Eliquis"],
+      "atc_code": "B01AF02",
+      "atc_class_code": "B01AF",
+      "atc_class_name": "Direct factor Xa inhibitor anticoagulant (DOAC)",
+      "pharm_group": "anticoagulant"
+    },
+    {
+      "ingredient": "rivaroxaban",
+      "rxcui_in": "1114195",
+      "rxcuis": ["1114200", "1114203", "1232082", "1232086"],
+      "brands": ["Xarelto"],
+      "atc_code": "B01AF01",
+      "atc_class_code": "B01AF",
+      "atc_class_name": "Direct factor Xa inhibitor anticoagulant (DOAC)",
+      "pharm_group": "anticoagulant"
+    },
+    {
+      "ingredient": "dabigatran",
+      "rxcui_in": "1037042",
+      "rxcuis": ["1037045", "1037049"],
+      "brands": ["Pradaxa"],
+      "atc_code": "B01AE07",
+      "atc_class_code": "B01AE",
+      "atc_class_name": "Direct thrombin inhibitor anticoagulant (DOAC)",
+      "pharm_group": "anticoagulant"
+    },
+    {
+      "ingredient": "warfarin",
+      "rxcui_in": "11289",
+      "rxcuis": ["855332", "855334", "855288", "855318", "202421"],
+      "brands": ["Coumadin", "Jantoven"],
+      "atc_code": "B01AA03",
+      "atc_class_code": "B01AA",
+      "atc_class_name": "Vitamin K antagonist anticoagulant",
+      "pharm_group": "anticoagulant"
+    },
+    {
+      "ingredient": "enoxaparin",
+      "rxcui_in": "67108",
+      "rxcuis": ["854228", "854235"],
+      "brands": ["Lovenox"],
+      "atc_code": "B01AB05",
+      "atc_class_code": "B01AB",
+      "atc_class_name": "Low-molecular-weight heparin anticoagulant",
+      "pharm_group": "anticoagulant"
+    },
+    {
+      "ingredient": "heparin",
+      "rxcui_in": "5224",
+      "rxcuis": ["1361615", "1361850"],
+      "brands": [],
+      "atc_code": "B01AB01",
+      "atc_class_code": "B01AB",
+      "atc_class_name": "Unfractionated heparin anticoagulant",
+      "pharm_group": "anticoagulant"
+    },
+    {
+      "ingredient": "sacubitril/valsartan",
+      "rxcui_in": "1656328",
+      "rxcuis": ["1656340", "1656349", "1656354"],
+      "brands": ["Entresto"],
+      "atc_code": "C09DX04",
+      "atc_class_code": "C09DX",
+      "atc_class_name": "Angiotensin receptor-neprilysin inhibitor (ARNI)",
+      "pharm_group": "raas_inhibitor"
+    },
+    {
+      "ingredient": "lisinopril",
+      "rxcui_in": "29046",
+      "rxcuis": ["314076", "314077", "197884", "206765", "206766", "104377"],
+      "brands": ["Prinivil", "Zestril"],
+      "atc_code": "C09AA03",
+      "atc_class_code": "C09AA",
+      "atc_class_name": "ACE inhibitor",
+      "pharm_group": "raas_inhibitor"
+    },
+    {
+      "ingredient": "enalapril",
+      "rxcui_in": "3827",
+      "rxcuis": ["197626", "197628"],
+      "brands": ["Vasotec"],
+      "atc_code": "C09AA02",
+      "atc_class_code": "C09AA",
+      "atc_class_name": "ACE inhibitor",
+      "pharm_group": "raas_inhibitor"
+    },
+    {
+      "ingredient": "ramipril",
+      "rxcui_in": "35296",
+      "rxcuis": ["261962", "199351"],
+      "brands": ["Altace"],
+      "atc_code": "C09AA05",
+      "atc_class_code": "C09AA",
+      "atc_class_name": "ACE inhibitor",
+      "pharm_group": "raas_inhibitor"
+    },
+    {
+      "ingredient": "losartan",
+      "rxcui_in": "52175",
+      "rxcuis": ["979467", "979480", "979492", "203160"],
+      "brands": ["Cozaar"],
+      "atc_code": "C09CA01",
+      "atc_class_code": "C09CA",
+      "atc_class_name": "Angiotensin II receptor blocker (ARB)",
+      "pharm_group": "raas_inhibitor"
+    },
+    {
+      "ingredient": "valsartan",
+      "rxcui_in": "69749",
+      "rxcuis": ["69749", "349199", "349200"],
+      "brands": ["Diovan"],
+      "atc_code": "C09CA03",
+      "atc_class_code": "C09CA",
+      "atc_class_name": "Angiotensin II receptor blocker (ARB)",
+      "pharm_group": "raas_inhibitor"
+    },
+    {
+      "ingredient": "spironolactone",
+      "rxcui_in": "9997",
+      "rxcuis": ["198211", "313096", "198212"],
+      "brands": ["Aldactone"],
+      "atc_code": "C03DA01",
+      "atc_class_code": "C03DA",
+      "atc_class_name": "Mineralocorticoid receptor antagonist (potassium-sparing diuretic)",
+      "pharm_group": "potassium_sparing_diuretic"
+    },
+    {
+      "ingredient": "eplerenone",
+      "rxcui_in": "298869",
+      "rxcuis": ["351256", "351257"],
+      "brands": ["Inspra"],
+      "atc_code": "C03DA04",
+      "atc_class_code": "C03DA",
+      "atc_class_name": "Mineralocorticoid receptor antagonist (potassium-sparing diuretic)",
+      "pharm_group": "potassium_sparing_diuretic"
+    },
+    {
+      "ingredient": "furosemide",
+      "rxcui_in": "4603",
+      "rxcuis": ["310429", "310430", "197730", "200801"],
+      "brands": ["Lasix"],
+      "atc_code": "C03CA01",
+      "atc_class_code": "C03CA",
+      "atc_class_name": "Loop diuretic",
+      "pharm_group": "loop_diuretic"
+    },
+    {
+      "ingredient": "torsemide",
+      "rxcui_in": "38413",
+      "rxcuis": ["198338", "198339", "198340"],
+      "brands": ["Demadex"],
+      "atc_code": "C03CA04",
+      "atc_class_code": "C03CA",
+      "atc_class_name": "Loop diuretic",
+      "pharm_group": "loop_diuretic"
+    },
+    {
+      "ingredient": "hydrochlorothiazide",
+      "rxcui_in": "5487",
+      "rxcuis": ["310798", "197770"],
+      "brands": ["Microzide", "HCTZ"],
+      "atc_code": "C03AA03",
+      "atc_class_code": "C03AA",
+      "atc_class_name": "Thiazide diuretic",
+      "pharm_group": "thiazide_diuretic"
+    },
+    {
+      "ingredient": "metoprolol",
+      "rxcui_in": "6918",
+      "rxcuis": ["866412", "866414", "866427", "866511", "866924", "221124"],
+      "brands": ["Lopressor", "Toprol-XL", "Toprol"],
+      "atc_code": "C07AB02",
+      "atc_class_code": "C07AB",
+      "atc_class_name": "Cardioselective beta-blocker",
+      "pharm_group": "beta_blocker"
+    },
+    {
+      "ingredient": "carvedilol",
+      "rxcui_in": "20352",
+      "rxcuis": ["200031", "200032", "200033"],
+      "brands": ["Coreg"],
+      "atc_code": "C07AG02",
+      "atc_class_code": "C07AG",
+      "atc_class_name": "Alpha- and beta-blocker",
+      "pharm_group": "beta_blocker"
+    },
+    {
+      "ingredient": "labetalol",
+      "rxcui_in": "6185",
+      "rxcuis": ["197848", "197849"],
+      "brands": ["Trandate"],
+      "atc_code": "C07AG01",
+      "atc_class_code": "C07AG",
+      "atc_class_name": "Alpha- and beta-blocker",
+      "pharm_group": "beta_blocker"
+    },
+    {
+      "ingredient": "amlodipine",
+      "rxcui_in": "17767",
+      "rxcuis": ["197361", "308135", "212549"],
+      "brands": ["Norvasc"],
+      "atc_code": "C08CA01",
+      "atc_class_code": "C08CA",
+      "atc_class_name": "Dihydropyridine calcium channel blocker",
+      "pharm_group": "calcium_channel_blocker"
+    },
+    {
+      "ingredient": "nifedipine",
+      "rxcui_in": "7417",
+      "rxcuis": ["198029", "311987"],
+      "brands": ["Procardia", "Adalat"],
+      "atc_code": "C08CA05",
+      "atc_class_code": "C08CA",
+      "atc_class_name": "Dihydropyridine calcium channel blocker",
+      "pharm_group": "calcium_channel_blocker"
+    },
+    {
+      "ingredient": "nitroglycerin",
+      "rxcui_in": "4917",
+      "rxcuis": ["705129", "316365"],
+      "brands": ["Nitrostat"],
+      "atc_code": "C01DA02",
+      "atc_class_code": "C01DA",
+      "atc_class_name": "Organic nitrate vasodilator",
+      "pharm_group": "nitrate"
+    },
+    {
+      "ingredient": "empagliflozin",
+      "rxcui_in": "1545653",
+      "rxcuis": ["1545658", "1545663", "1545659"],
+      "brands": ["Jardiance"],
+      "atc_code": "A10BK03",
+      "atc_class_code": "A10BK",
+      "atc_class_name": "SGLT2 inhibitor",
+      "pharm_group": "sglt2_inhibitor"
+    },
+    {
+      "ingredient": "dapagliflozin",
+      "rxcui_in": "1488564",
+      "rxcuis": ["1488574", "1488576"],
+      "brands": ["Farxiga"],
+      "atc_code": "A10BK01",
+      "atc_class_code": "A10BK",
+      "atc_class_name": "SGLT2 inhibitor",
+      "pharm_group": "sglt2_inhibitor"
+    },
+    {
+      "ingredient": "metformin",
+      "rxcui_in": "6809",
+      "rxcuis": ["860975", "860978", "861004", "861007"],
+      "brands": ["Glucophage", "Fortamet", "Glumetza"],
+      "atc_code": "A10BA02",
+      "atc_class_code": "A10BA",
+      "atc_class_name": "Biguanide antihyperglycemic",
+      "pharm_group": "biguanide"
+    },
+    {
+      "ingredient": "glipizide",
+      "rxcui_in": "4821",
+      "rxcuis": ["310490", "310489", "197735"],
+      "brands": ["Glucotrol"],
+      "atc_code": "A10BB07",
+      "atc_class_code": "A10BB",
+      "atc_class_name": "Sulfonylurea insulin secretagogue",
+      "pharm_group": "sulfonylurea"
+    },
+    {
+      "ingredient": "glimepiride",
+      "rxcui_in": "25789",
+      "rxcuis": ["199246", "199247"],
+      "brands": ["Amaryl"],
+      "atc_code": "A10BB12",
+      "atc_class_code": "A10BB",
+      "atc_class_name": "Sulfonylurea insulin secretagogue",
+      "pharm_group": "sulfonylurea"
+    },
+    {
+      "ingredient": "insulin glargine",
+      "rxcui_in": "274783",
+      "rxcuis": ["847232", "311041", "261551"],
+      "brands": ["Lantus", "Basaglar", "Toujeo"],
+      "atc_code": "A10AE04",
+      "atc_class_code": "A10AE",
+      "atc_class_name": "Long-acting basal insulin analog",
+      "pharm_group": "insulin"
+    },
+    {
+      "ingredient": "insulin lispro",
+      "rxcui_in": "86009",
+      "rxcuis": ["311036", "1652640"],
+      "brands": ["Humalog"],
+      "atc_code": "A10AB04",
+      "atc_class_code": "A10AB",
+      "atc_class_name": "Rapid-acting mealtime insulin analog",
+      "pharm_group": "insulin"
+    },
+    {
+      "ingredient": "insulin isophane / regular human",
+      "rxcui_in": "214555",
+      "rxcuis": ["106892"],
+      "brands": ["Humulin", "Novolin"],
+      "atc_code": "A10AD01",
+      "atc_class_code": "A10AD",
+      "atc_class_name": "Intermediate- and short-acting premixed human insulin",
+      "pharm_group": "insulin"
+    },
+    {
+      "ingredient": "semaglutide",
+      "rxcui_in": "1991302",
+      "rxcuis": ["1991306", "1991316", "2200644"],
+      "brands": ["Ozempic", "Wegovy", "Rybelsus"],
+      "atc_code": "A10BJ06",
+      "atc_class_code": "A10BJ",
+      "atc_class_name": "GLP-1 receptor agonist",
+      "pharm_group": "glp1_agonist"
+    },
+    {
+      "ingredient": "lorazepam",
+      "rxcui_in": "6470",
+      "rxcuis": ["197901", "197900", "197902", "206373"],
+      "brands": ["Ativan"],
+      "atc_code": "N05BA06",
+      "atc_class_code": "N05BA",
+      "atc_class_name": "Benzodiazepine anxiolytic/sedative",
+      "pharm_group": "cns_sedative_hypnotic"
+    },
+    {
+      "ingredient": "diazepam",
+      "rxcui_in": "3322",
+      "rxcuis": ["197591", "197592", "205825"],
+      "brands": ["Valium"],
+      "atc_code": "N05BA01",
+      "atc_class_code": "N05BA",
+      "atc_class_name": "Benzodiazepine anxiolytic/sedative",
+      "pharm_group": "cns_sedative_hypnotic"
+    },
+    {
+      "ingredient": "alprazolam",
+      "rxcui_in": "596",
+      "rxcuis": ["308047", "197321", "205126"],
+      "brands": ["Xanax"],
+      "atc_code": "N05BA12",
+      "atc_class_code": "N05BA",
+      "atc_class_name": "Benzodiazepine anxiolytic/sedative",
+      "pharm_group": "cns_sedative_hypnotic"
+    },
+    {
+      "ingredient": "clonazepam",
+      "rxcui_in": "2598",
+      "rxcuis": ["197527", "197528"],
+      "brands": ["Klonopin"],
+      "atc_code": "N03AE01",
+      "atc_class_code": "N03AE",
+      "atc_class_name": "Benzodiazepine derivative",
+      "pharm_group": "cns_sedative_hypnotic"
+    },
+    {
+      "ingredient": "zolpidem",
+      "rxcui_in": "39993",
+      "rxcuis": ["854873", "854876", "199282"],
+      "brands": ["Ambien"],
+      "atc_code": "N05CF02",
+      "atc_class_code": "N05CF",
+      "atc_class_name": "Z-drug non-benzodiazepine sedative-hypnotic",
+      "pharm_group": "cns_sedative_hypnotic"
+    },
+    {
+      "ingredient": "trazodone",
+      "rxcui_in": "10737",
+      "rxcuis": ["856847", "198342"],
+      "brands": ["Desyrel"],
+      "atc_code": "N06AX05",
+      "atc_class_code": "N06AX",
+      "atc_class_name": "Serotonin antagonist and reuptake inhibitor (sedating antidepressant)",
+      "pharm_group": "cns_sedative_hypnotic"
+    },
+    {
+      "ingredient": "gabapentin",
+      "rxcui_in": "25480",
+      "rxcuis": ["310431", "199184", "310432"],
+      "brands": ["Neurontin"],
+      "atc_code": "N03AX12",
+      "atc_class_code": "N03AX",
+      "atc_class_name": "Gabapentinoid anticonvulsant/neuropathic analgesic",
+      "pharm_group": "gabapentinoid"
+    },
+    {
+      "ingredient": "oxycodone",
+      "rxcui_in": "7804",
+      "rxcuis": ["1049502", "1049621", "1049543"],
+      "brands": ["Roxicodone", "OxyContin"],
+      "atc_code": "N02AA05",
+      "atc_class_code": "N02AA",
+      "atc_class_name": "Opioid analgesic",
+      "pharm_group": "opioid"
+    },
+    {
+      "ingredient": "ibuprofen",
+      "rxcui_in": "5640",
+      "rxcuis": ["197806", "310965", "197807", "206106"],
+      "brands": ["Advil", "Motrin"],
+      "atc_code": "M01AE01",
+      "atc_class_code": "M01AE",
+      "atc_class_name": "Propionic acid NSAID",
+      "pharm_group": "nsaid"
+    },
+    {
+      "ingredient": "naproxen",
+      "rxcui_in": "7258",
+      "rxcuis": ["849574", "198013", "198014", "849431"],
+      "brands": ["Aleve", "Naprosyn", "Anaprox"],
+      "atc_code": "M01AE02",
+      "atc_class_code": "M01AE",
+      "atc_class_name": "Propionic acid NSAID",
+      "pharm_group": "nsaid"
+    },
+    {
+      "ingredient": "meloxicam",
+      "rxcui_in": "41493",
+      "rxcuis": ["152698", "152699"],
+      "brands": ["Mobic"],
+      "atc_code": "M01AC06",
+      "atc_class_code": "M01AC",
+      "atc_class_name": "Oxicam NSAID",
+      "pharm_group": "nsaid"
+    },
+    {
+      "ingredient": "acetaminophen",
+      "rxcui_in": "161",
+      "rxcuis": ["198440", "313782"],
+      "brands": ["Tylenol"],
+      "atc_code": "N02BE01",
+      "atc_class_code": "N02BE",
+      "atc_class_name": "Anilide non-opioid analgesic/antipyretic",
+      "pharm_group": "analgesic_non_nsaid"
+    },
+    {
+      "ingredient": "pembrolizumab",
+      "rxcui_in": "1547545",
+      "rxcuis": ["1547551", "1791562"],
+      "brands": ["Keytruda"],
+      "atc_code": "L01FF02",
+      "atc_class_code": "L01FF",
+      "atc_class_name": "PD-1 immune checkpoint inhibitor",
+      "pharm_group": "ici_oncology"
+    },
+    {
+      "ingredient": "levothyroxine",
+      "rxcui_in": "10582",
+      "rxcuis": ["966222", "966247", "892246"],
+      "brands": ["Synthroid", "Levoxyl"],
+      "atc_code": "H03AA01",
+      "atc_class_code": "H03AA",
+      "atc_class_name": "Thyroid hormone replacement",
+      "pharm_group": "thyroid_hormone"
+    },
+    {
+      "ingredient": "albuterol",
+      "rxcui_in": "435",
+      "rxcuis": ["745679", "2123111"],
+      "brands": ["ProAir", "Ventolin"],
+      "atc_code": "R03AC02",
+      "atc_class_code": "R03AC",
+      "atc_class_name": "Short-acting beta-2 agonist bronchodilator (SABA)",
+      "pharm_group": "bronchodilator"
+    },
+    {
+      "ingredient": "fluticasone",
+      "rxcui_in": "41126",
+      "rxcuis": ["895994", "1797907"],
+      "brands": ["Flovent", "Flonase"],
+      "atc_code": "R03BA05",
+      "atc_class_code": "R03BA",
+      "atc_class_name": "Inhaled/intranasal corticosteroid",
+      "pharm_group": "inhaled_steroid"
+    },
+    {
+      "ingredient": "omeprazole",
+      "rxcui_in": "7646",
+      "rxcuis": ["198051", "200329"],
+      "brands": ["Prilosec"],
+      "atc_code": "A02BC01",
+      "atc_class_code": "A02BC",
+      "atc_class_name": "Proton pump inhibitor",
+      "pharm_group": "ppi"
+    },
+    {
+      "ingredient": "pantoprazole",
+      "rxcui_in": "40790",
+      "rxcuis": ["314153", "261657"],
+      "brands": ["Protonix"],
+      "atc_code": "A02BC02",
+      "atc_class_code": "A02BC",
+      "atc_class_name": "Proton pump inhibitor",
+      "pharm_group": "ppi"
+    },
+    {
+      "ingredient": "sertraline",
+      "rxcui_in": "36437",
+      "rxcuis": ["312940", "312941"],
+      "brands": ["Zoloft"],
+      "atc_code": "N06AB06",
+      "atc_class_code": "N06AB",
+      "atc_class_name": "Selective serotonin reuptake inhibitor (SSRI)",
+      "pharm_group": "ssri"
+    },
+    {
+      "ingredient": "escitalopram",
+      "rxcui_in": "321988",
+      "rxcuis": ["352741", "349332"],
+      "brands": ["Lexapro"],
+      "atc_code": "N06AB10",
+      "atc_class_code": "N06AB",
+      "atc_class_name": "Selective serotonin reuptake inhibitor (SSRI)",
+      "pharm_group": "ssri"
+    },
+    {
+      "ingredient": "potassium chloride",
+      "rxcui_in": "8591",
+      "rxcuis": ["628958", "628953"],
+      "brands": ["K-Dur", "Klor-Con"],
+      "atc_code": "A12BA01",
+      "atc_class_code": "A12BA",
+      "atc_class_name": "Potassium supplement",
+      "pharm_group": "potassium_supplement"
+    },
+    {
+      "ingredient": "ferrous sulfate",
+      "rxcui_in": "24947",
+      "rxcuis": ["310325", "197696"],
+      "brands": ["Feosol"],
+      "atc_code": "B03AA07",
+      "atc_class_code": "B03AA",
+      "atc_class_name": "Oral iron supplement",
+      "pharm_group": "iron_supplement"
+    },
+    {
+      "ingredient": "prenatal multivitamin with folic acid",
+      "rxcui_in": "4511",
+      "rxcuis": ["315966", "89905"],
+      "brands": ["Prenatal"],
+      "atc_code": "B03BB01",
+      "atc_class_code": "B03BB",
+      "atc_class_name": "Folic acid and prenatal vitamin supplement",
+      "pharm_group": "prenatal_vitamin"
+    }
+  ]
+}
