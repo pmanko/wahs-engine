@@ -178,7 +178,11 @@ def prepare_upstream_messages(
     enrichment_tokens = 0
     enrichment_text = ""
 
-    active_ids = ctx.active_enrichers or (pipeline.enabled_ids if pipeline is not None else ())
+    active_ids = (
+        ctx.active_enrichers
+        if ctx.enrichment_resolved
+        else (ctx.active_enrichers or (pipeline.enabled_ids if pipeline is not None else ()))
+    )
     if pipeline is not None and active_ids:
         counter = get_exact_token_counter(spec.tokenizer_family)
         min_toks = count_chat_messages_tokens([messages[0], messages[-1]], tokenizer_family=spec.tokenizer_family)
