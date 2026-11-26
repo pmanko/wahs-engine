@@ -237,3 +237,81 @@ def test_ollama_provider_prefix_does_not_misclassify_gemma_as_llama() -> None:
     assert cfg.resolve_model_spec("llamacpp/medgemma-27b").tokenizer_family == "gemma4"
     assert WahsEngineSettings(model_map={"custom-default": "ollama/gemma4:12b"}).resolve_model_spec("custom-default").tokenizer_family == "gemma4"
     assert cfg.resolve_model_spec("ollama/llama3.1:8b").tokenizer_family == "o200k_base"
+
+
+def test_dynamic_ollama_num_ctx_avoids_128k_overallocation_and_scales_on_large_prompts() -> None:
+    from wahs_engine.upstream import resolve_ollama_num_ctx
+
+    # Small / 16k prompts under a 128k ceiling stay pinned to warm 32768 bucket (no 128k reload)
+    assert resolve_ollama_num_ctx(exact_prompt_tokens=4500, effective_max_tokens=1024, context_window=131072) == 32768
+    assert resolve_ollama_num_ctx(exact_prompt_tokens=18000, effective_max_tokens=1024, context_window=131072) == 32768
+    # Prompts exceeding 32k step up to 65536 and 131072 cleanly
+    assert resolve_ollama_num_ctx(exact_prompt_tokens=42000, effective_max_tokens=1024, context_window=131072) == 65536
+    assert resolve_ollama_num_ctx(exact_prompt_tokens=72000, effective_max_tokens=1024, context_window=131072) == 131072
+    # Respects smaller physical ceilings
+    assert resolve_ollama_num_ctx(exact_prompt_tokens=6000, effective_max_tokens=1024, context_window=16384) == 16384
+
+    captured: List[Dict[str, Any]] = []
+
+    def llm_handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/chat/completions"):
+            body = json.loads(req.content.decode("utf-8"))
+            captured.append(body)
+            return httpx.Response(
+                200,
+                json={
+                    "id": "cmpl-numctx",
+                    "object": "chat.completion",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "OK [1]."}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 120, "completion_tokens": 3},
+                },
+            )
+        return httpx.Response(200, json={"object": "list", "data": []})
+
+    settings = WahsEngineSettings(
+        fhir_auth_base_url="http://fhir-auth:8080/fhir",
+        llm_base_url="http://llm-mock:8079/v1",
+        allow_local_bundle_mode=True,
+        default_context_window=131072,
+    )
+    app = create_app(settings, llm_http_client=httpx.AsyncClient(transport=httpx.MockTransport(llm_handler)))
+    with TestClient(app) as client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "wahs-26b",
+                "stream": False,
+                "messages": [{"role": "user", "content": "What medicines am I taking?"}],
+                "wahs": {"fhir_bundle": _bundle_with_two_records(), "target_budget_tokens": 16384},
+            },
+        )
+        assert resp.status_code == 200
+        assert captured[-1]["num_ctx"] == 32768
+        assert resp.json()["x_wahs"]["condensation"]["upstream_num_ctx"] == 32768
+        assert resp.json()["x_wahs"]["condensation"]["context_window"] == 131072
+
+
+def test_sse_stream_surfaces_upstream_http_error_as_structured_error_chunk() -> None:
+    def failing_llm_handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="upstream overloaded")
+
+    settings = WahsEngineSettings(
+        fhir_auth_base_url="http://fhir-auth:8080/fhir",
+        llm_base_url="http://llm-mock:8079/v1",
+        allow_local_bundle_mode=True,
+    )
+    app = create_app(settings, llm_http_client=httpx.AsyncClient(transport=httpx.MockTransport(failing_llm_handler)))
+    with TestClient(app) as client:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "wahs-26b",
+                "stream": True,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "wahs": {"fhir_bundle": _bundle_with_two_records()},
+            },
+        )
+        assert resp.status_code == 200
+        assert '"event": "context_ready"' in resp.text
+        assert "Southbound LLM stream returned HTTP 503." in resp.text
+        assert "data: [DONE]" in resp.text

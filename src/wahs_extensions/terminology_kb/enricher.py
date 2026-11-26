@@ -363,7 +363,7 @@ class TerminologyConceptEnricher:
             at_s = ", ".join(f"{x[0].display}{(' ' + x[2]) if x[2] else ''} ({x[1]['ingredient']})" for x in antithrombotics)
             ns_s = ", ".join(f"{x[0].display}{(' ' + x[2]) if x[2] else ''} ({x[1]['ingredient']})" for x in nsaids)
             overlap_lines.append(
-                f"- Concurrent Active Antithrombotic + NSAID Classes: antithrombotic [{at_s}] co-listed with systemic NSAID [{ns_s}]."
+                f"- Concurrent Active Antithrombotic + NSAID Classes: antithrombotic ({at_s}) co-listed with systemic NSAID ({ns_s})."
             )
 
         for it, drow, cit in active_meds:
