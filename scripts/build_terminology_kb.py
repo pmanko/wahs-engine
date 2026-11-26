@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import hashlib
+import html
 import json
 from pathlib import Path
 import re
@@ -48,7 +49,7 @@ SOURCE_TAG_MAP: Dict[str, str] = {
 def _clean_text(raw: Optional[str]) -> str:
     if not raw:
         return ""
-    s = str(raw).replace("\u2014", " - ").replace("\u2013", "-").replace("&mdash;", " - ").replace("&#8212;", " - ")
+    s = html.unescape(str(raw)).replace(chr(8212), " - ").replace(chr(8211), "-")
     return re.sub(r"\s+", " ", s).strip()
 
 
