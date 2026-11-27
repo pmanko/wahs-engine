@@ -16,6 +16,7 @@ import uvicorn
 
 from .assembler import WAHSBundleAssembler, normalize_conversation_turns
 from .config import WahsEngineSettings
+from .demo_bundles import DemoBundleRegistry
 from .jwt_claims import VerifiedCallerIdentity, decode_and_bind_jwt, extract_bearer_token
 from .pipeline import EnricherPipeline
 from .profile_registry import load_profile_registry, serialize_profiles_catalog
@@ -24,10 +25,14 @@ from .tokenizers_registry import count_chat_messages_tokens, get_exact_token_cou
 from .upstream import SouthboundOpenAIClient, build_x_wahs_envelope
 
 
+def _is_local_bundle_request(options: WahsRequestOptions, settings: WahsEngineSettings) -> bool:
+    return bool(settings.allow_local_bundle_mode and (options.fhir_bundle is not None or bool((options.bundle_id or "").strip())))
+
+
 def _resolve_caller_identity(request: Request, options: WahsRequestOptions, settings: WahsEngineSettings) -> Optional[VerifiedCallerIdentity]:
     raw_token = extract_bearer_token(request.headers)
-    if not raw_token or (raw_token == "local-demo-token" and settings.allow_local_bundle_mode and options.fhir_bundle is not None):
-        if settings.allow_local_bundle_mode and options.fhir_bundle is not None:
+    if not raw_token or (raw_token == "local-demo-token" and _is_local_bundle_request(options, settings)):
+        if _is_local_bundle_request(options, settings):
             return None
         return decode_and_bind_jwt("")
     trusted_sub = request.headers.get(settings.trusted_sub_header) if settings.trusted_sub_header else None
@@ -48,6 +53,11 @@ def create_app(
     pipeline = EnricherPipeline(cfg.enabled_enrichers, max_enrichment_tokens=cfg.max_enrichment_tokens)
     assembler = WAHSBundleAssembler(cfg, http_client=fhir_http_client)
     southbound = SouthboundOpenAIClient(cfg, http_client=llm_http_client, pipeline=pipeline)
+    demo_registry: Optional[DemoBundleRegistry] = (
+        DemoBundleRegistry(cfg.demo_bundles_dir)
+        if (cfg.allow_local_bundle_mode and cfg.demo_bundles_dir)
+        else None
+    )
 
     @asynccontextmanager
     async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -67,6 +77,7 @@ def create_app(
     application.state.assembler = assembler
     application.state.southbound = southbound
     application.state.pipeline = pipeline
+    application.state.demo_registry = demo_registry
 
     async def _assemble_request(req: Any, request: Request):
         options = req.resolved_wahs_options()
@@ -74,6 +85,15 @@ def create_app(
         requested_model = (req.model or cfg.default_model).strip()
         force_refresh = "no-cache" in request.headers.get("cache-control", "").lower()
         conv_msgs = [{"role": m.role, "content": m.content} for m in (getattr(req, "messages", None) or ())]
+        precomputed_fp: Optional[str] = None
+        bundle_src_label: Optional[str] = None
+        if options.bundle_id and options.fhir_bundle is None:
+            if not cfg.allow_local_bundle_mode or demo_registry is None:
+                raise HTTPException(status_code=403, detail="Demo bundle_id lookup is disabled on this wahs-engine instance.")
+            loaded = await asyncio.to_thread(demo_registry.get, options.bundle_id)
+            options = options.model_copy(update={"fhir_bundle": loaded.bundle})
+            precomputed_fp = loaded.sha256
+            bundle_src_label = f"Demo Bundle ({loaded.filename})"
         ctx = await assembler.assemble(
             options=options,
             identity=identity,
@@ -81,6 +101,8 @@ def create_app(
             conversation_messages=conv_msgs,
             requested_max_tokens=getattr(req, "max_tokens", None),
             force_refresh=force_refresh,
+            precomputed_bundle_fingerprint=precomputed_fp,
+            bundle_source_label=bundle_src_label,
         )
         return options, requested_model, ctx
 
@@ -105,6 +127,7 @@ def create_app(
             "context_window": cfg.default_context_window,
             "enabled_enrichers": list(cfg.enabled_enrichers),
             "allow_local_bundle_mode": cfg.allow_local_bundle_mode,
+            "demo_bundles_enabled": bool(demo_registry is not None),
         }
 
     @application.get("/v1/models")
@@ -117,6 +140,34 @@ def create_app(
             return serialize_profiles_catalog(cfg)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @application.get("/v1/wahs/demo-bundles")
+    async def list_demo_bundles() -> Dict[str, Any]:
+        if demo_registry is None:
+            raise HTTPException(status_code=404, detail="Demo bundles are not enabled on this wahs-engine instance.")
+        bundles = await asyncio.to_thread(demo_registry.list_summaries)
+        return {"bundles": bundles, "count": len(bundles)}
+
+    @application.get("/v1/wahs/demo-bundles/{bundle_id}/resources")
+    async def list_demo_bundle_resources(
+        bundle_id: str,
+        resource_type: Optional[str] = None,
+        q: Optional[str] = None,
+        offset: int = 0,
+        limit: int = 100,
+        resource_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if demo_registry is None:
+            raise HTTPException(status_code=404, detail="Demo bundles are not enabled on this wahs-engine instance.")
+        return await asyncio.to_thread(
+            demo_registry.query_resources,
+            bundle_id,
+            resource_type=resource_type,
+            q=q,
+            offset=offset,
+            limit=limit,
+            resource_id=resource_id,
+        )
 
     @application.post("/v1/wahs/context/preview")
     async def preview_context(req: WahsContextPreviewRequest, request: Request, response: Response) -> Dict[str, Any]:
@@ -147,6 +198,7 @@ def create_app(
             "patient_id": ctx.patient_id, "patient_name": ctx.patient_name, "birth_date": ctx.birth_date,
             "prefix_cache_key_hash": ctx.prefix_cache_key_hash, "security_audit": ctx.security_audit,
             "chart_text": ctx.condensed.chart_text,
+            "system_prompt": ctx.system_prompt,
             "x_wahs": build_x_wahs_envelope(
                 ctx=ctx, requested_model=requested_model, upstream_model=spec.upstream_model,
                 options=options, engine_version=cfg.engine_version, enrichers=enrichers_meta,
