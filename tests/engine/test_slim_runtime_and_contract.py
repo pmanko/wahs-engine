@@ -406,7 +406,7 @@ def test_demo_bundles_registry_preview_system_prompt_and_disabled_default(tmp_pa
             },
         )
         assert prev2.status_code == 200
-        assert prev2.json()["x_wahs"]["cache"]["hit"] is True
+        assert prev2.json()["x_wahs"]["condensation"]["cache_hit"] is True
 
         # Chat completion via bundle_id works without inline fhir_bundle upload
         chat = client.post(
