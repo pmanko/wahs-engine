@@ -31,6 +31,7 @@ class WahsRequestOptions(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     master_patient_id: Optional[str] = None
+    bundle_id: Optional[str] = None
     fhir_bundle: Optional[Dict[str, Any]] = None
     chart_scope: ChartScope = Field(default_factory=ChartScope)
     overlay_resources: List[Dict[str, Any]] = Field(default_factory=list)

@@ -502,6 +502,8 @@ class WAHSBundleAssembler:
         conversation_messages: Sequence[Any] = (),
         requested_max_tokens: Optional[int] = None,
         force_refresh: bool = False,
+        precomputed_bundle_fingerprint: Optional[str] = None,
+        bundle_source_label: Optional[str] = None,
     ) -> AssembledWahsContext:
         if options.overlay_resources:
             rb = len(json.dumps(list(options.overlay_resources), separators=(",", ":"), default=str).encode("utf-8"))
@@ -529,10 +531,12 @@ class WAHSBundleAssembler:
             if not isinstance(options.fhir_bundle, dict) or options.fhir_bundle.get("resourceType") != "Bundle":
                 raise HTTPException(status_code=400, detail="wahs.fhir_bundle must be a FHIR R4 Bundle.")
             pat_id = str(options.master_patient_id or "").strip() or next((str((e.get("resource") or {}).get("id") or "local-patient") for e in (options.fhir_bundle.get("entry") or []) if isinstance(e, Mapping) and (e.get("resource") or {}).get("resourceType") == "Patient"), "local-patient")
+            ds_fp = precomputed_bundle_fingerprint or _canonical_sha256(options.fhir_bundle)
+            src_label = bundle_source_label or "Inline Bundle"
             return await asyncio.to_thread(
                 self._scope_and_condense_bundle, raw_bundle=options.fhir_bundle, verified_sub=identity.sub if identity else "local-harness",
-                authorized_patient_id=pat_id, allowed_patient_refs={pat_id}, datasets_included=[{"dataset_id": pat_id, "source": "Inline Bundle", "category": "local"}],
-                datasets_fingerprint=_canonical_sha256(options.fhir_bundle), scope_only_hash=scope_only_hash, options=options, spec=spec,
+                authorized_patient_id=pat_id, allowed_patient_refs={pat_id}, datasets_included=[{"dataset_id": pat_id, "source": src_label, "category": "local"}],
+                datasets_fingerprint=ds_fp, scope_only_hash=scope_only_hash, options=options, spec=spec,
                 profile_cfg=profile_cfg,
                 conversation_messages=conversation_messages, requested_max_tokens=requested_max_tokens,
                 dataset_cache_hits=0, dataset_fetches=0, cacheable=True, force_refresh=refresh, partial_fetch=False, partial_datasets=[],

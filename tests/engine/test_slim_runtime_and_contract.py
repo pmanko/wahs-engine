@@ -317,3 +317,107 @@ def test_sse_stream_surfaces_upstream_http_error_as_structured_error_chunk() -> 
         assert '"event": "context_ready"' in resp.text
         assert "Southbound LLM stream returned HTTP 503." in resp.text
         assert "data: [DONE]" in resp.text
+
+
+def test_demo_bundles_registry_preview_system_prompt_and_disabled_default(tmp_path: Path) -> None:
+    def llm_handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/chat/completions"):
+            return httpx.Response(
+                200,
+                json={
+                    "id": "cmpl-demo",
+                    "object": "chat.completion",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "Active Metformin [1]."}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 90, "completion_tokens": 5},
+                },
+            )
+        return httpx.Response(200, json={"object": "list", "data": []})
+
+    # 1. Production default (demo_bundles_dir unset) keeps demo endpoints disabled
+    prod_app = create_app(
+        WahsEngineSettings(allow_local_bundle_mode=False),
+        llm_http_client=httpx.AsyncClient(transport=httpx.MockTransport(llm_handler)),
+    )
+    with TestClient(prod_app) as client:
+        assert client.get("/health").json()["demo_bundles_enabled"] is False
+        assert client.get("/v1/wahs/demo-bundles").status_code == 404
+        assert client.get("/v1/wahs/demo-bundles/sam-patel/resources").status_code == 404
+
+    # 2. Sandbox mode with mounted demo_bundles_dir serves list, resources, preview system_prompt, and chat via bundle_id
+    bundle_file = tmp_path / "Margaret_Chen_Polypharmacy.json"
+    bundle_file.write_text(json.dumps(_bundle_with_two_records()), encoding="utf-8")
+
+    sandbox_app = create_app(
+        WahsEngineSettings(
+            allow_local_bundle_mode=True,
+            demo_bundles_dir=str(tmp_path),
+            default_context_window=65536,
+            default_ollama_num_ctx=65536,
+        ),
+        llm_http_client=httpx.AsyncClient(transport=httpx.MockTransport(llm_handler)),
+    )
+    with TestClient(sandbox_app) as client:
+        assert client.get("/health").json()["demo_bundles_enabled"] is True
+
+        listed = client.get("/v1/wahs/demo-bundles")
+        assert listed.status_code == 200
+        ldata = listed.json()
+        assert ldata["count"] == 1
+        assert ldata["bundles"][0]["id"] == "margaret-chen-polypharmacy"
+        assert ldata["bundles"][0]["patient_name"] == "Sam Patel"
+        assert ldata["bundles"][0]["clinical_resources"] == 2
+
+        res_list = client.get("/v1/wahs/demo-bundles/margaret-chen-polypharmacy/resources?resource_type=MedicationRequest")
+        assert res_list.status_code == 200
+        rdata = res_list.json()
+        assert rdata["total_matching"] == 1
+        assert rdata["items"][0]["id"] == "m-1"
+
+        raw_res = client.get("/v1/wahs/demo-bundles/margaret-chen-polypharmacy/resources?resource_id=MedicationRequest/m-1")
+        assert raw_res.status_code == 200
+        assert raw_res.json()["resource"]["resourceType"] == "MedicationRequest"
+
+        # Path traversal and unknown IDs are rejected cleanly
+        assert client.get("/v1/wahs/demo-bundles/..%2Fetc%2Fpasswd/resources").status_code in {400, 404}
+        assert client.get("/v1/wahs/demo-bundles/does-not-exist/resources").status_code == 404
+
+        # Context preview via bundle_id returns system_prompt and caches cleanly
+        prev = client.post(
+            "/v1/wahs/context/preview",
+            json={
+                "model": "wahs-26b",
+                "messages": [{"role": "user", "content": "What diabetes meds am I taking?"}],
+                "wahs": {"bundle_id": "margaret-chen-polypharmacy", "target_budget_tokens": 16384},
+            },
+        )
+        assert prev.status_code == 200
+        pdata = prev.json()
+        assert "=== CONDENSED CLINICAL RECORD" in pdata["system_prompt"]
+        assert "Metformin 500 MG Oral Tablet" in pdata["chart_text"]
+        assert pdata["x_wahs"]["condensation"]["budget_effective"] == 16384
+
+        # Second call hits prefix cache without re-condensing
+        prev2 = client.post(
+            "/v1/wahs/context/preview",
+            json={
+                "model": "wahs-26b",
+                "messages": [{"role": "user", "content": "What diabetes meds am I taking?"}],
+                "wahs": {"bundle_id": "margaret-chen-polypharmacy", "target_budget_tokens": 16384},
+            },
+        )
+        assert prev2.status_code == 200
+        assert prev2.json()["x_wahs"]["cache"]["hit"] is True
+
+        # Chat completion via bundle_id works without inline fhir_bundle upload
+        chat = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "wahs-26b",
+                "stream": False,
+                "messages": [{"role": "user", "content": "What diabetes meds am I taking?"}],
+                "wahs": {"bundle_id": "margaret-chen-polypharmacy"},
+            },
+        )
+        assert chat.status_code == 200
+        assert chat.json()["choices"][0]["message"]["content"] == "Active Metformin [1]."
+
